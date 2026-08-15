@@ -91,6 +91,17 @@ def _registration_password_value(row: dict) -> str:
     return ""
 
 
+def _generic_api_pickup_address(row: dict) -> str:
+    """只为通用 API 邮箱解析取件地址，避免其他来源误暴露字段。"""
+    if str(row.get("email_source") or "").strip().lower() != "generic_api":
+        return ""
+    saved = str(row.get("pickup_address") or "").strip()
+    if saved:
+        return saved
+    pool_row = db.get_generic_api_email_by_email(str(row.get("email") or "").strip())
+    return str((pool_row or {}).get("code_url") or "").strip()
+
+
 def _compact_account_for_list(row: dict) -> dict:
     """账号列表轻量对象：只返回当前表格渲染和按钮判断必需字段。
 
@@ -99,15 +110,10 @@ def _compact_account_for_list(row: dict) -> dict:
     - 时间戳、错误原因、提链详情等只在前端确实要展示时返回；空值不返回。
     - 复制/下载敏感内容时再通过 /secret 接口按需读取。
     """
-    pickup_address = str(row.get("pickup_address") or "").strip()
-    if not pickup_address and str(row.get("email_source") or "").strip().lower() == "generic_api":
-        pool_row = db.get_generic_api_email_by_email(str(row.get("email") or "").strip())
-        pickup_address = str((pool_row or {}).get("code_url") or "").strip()
-
     out = {
         "id": row.get("id"),
         "email": row.get("email"),
-        "pickup_address": pickup_address,
+        "pickup_address_available": bool(_generic_api_pickup_address(row)),
         "has_access_token": bool(str(row.get("access_token") or "").strip()),
         "registration_password_set": bool(_registration_password_value(row)),
         "totp_enabled": bool(row.get("totp_secret")),
@@ -116,7 +122,7 @@ def _compact_account_for_list(row: dict) -> dict:
 
     # 这些是列表固定列直接展示字段。
     for key in (
-        "user_name", "email_source", "pickup_address", "note", "archived", "archived_at",
+        "user_name", "email_source", "note", "archived", "archived_at",
         "archived_reason", "archived_source", "created_at",
         "plan_type", "current_plan_type", "plus_trial_eligible",
         "plan_check_status", "codex_status", "codex_agent_status",
@@ -190,7 +196,9 @@ def _account_secret_value(row: dict, field: str) -> str:
         return str(row.get("codex_agent_token") or "")
     if field == "registration_password":
         return _registration_password_value(row)
-    raise ValueError("field 仅支持 access_token/copy_line/codex_agent_token/registration_password")
+    if field == "pickup_address":
+        return _generic_api_pickup_address(row)
+    raise ValueError("field 仅支持 access_token/copy_line/codex_agent_token/registration_password/pickup_address")
 
 
 def _compact_job_for_list(row: dict) -> dict:
