@@ -882,6 +882,23 @@
       background: #ecf5ff; color: #1677ff; font-size: 14px; font-weight: 800;
       white-space: nowrap;
     }
+    #accountsSelectionFloatV2 {
+      position: fixed; right: 24px; bottom: 20px; z-index: 1200;
+      display: none; align-items: center; gap: 8px; flex-wrap: wrap;
+      max-width: calc(100vw - 48px); padding: 10px 12px;
+      border: 1px solid #b3d8ff; border-radius: 10px;
+      background: rgba(255,255,255,.96); box-shadow: 0 10px 28px rgba(15,23,42,.18);
+      backdrop-filter: blur(8px);
+    }
+    #accountsSelectionFloatV2.is-visible { display: flex; }
+    #accountsSelectionFloatV2 .accounts-selection-float-count {
+      color: #1677ff; font-size: 14px; font-weight: 800; white-space: nowrap;
+    }
+    #accountsSelectionFloatV2 .jobs-tb-btn { min-height: 32px; padding: 0 12px; }
+    @media (max-width: 700px) {
+      #accountsSelectionFloatV2 { right: 12px; bottom: 12px; left: 12px; max-width: none; }
+      #accountsSelectionFloatV2 .accounts-selection-float-count { flex-basis: 100%; }
+    }
     #accountsToolbarV2 .jobs-tb-btn {
       min-height: 32px; padding: 0 12px; font-size: 13px;
     }
@@ -2139,6 +2156,12 @@
       </div>
       <div class="jobs-v2-pager" id="pager-accounts-v2"></div>
     </section>
+    <div id="accountsSelectionFloatV2" aria-hidden="true">
+      <span id="accountsSelectionFloatHintV2" class="accounts-selection-float-count">已选择 0 个账号</span>
+      <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnFloatPasswordSetupV2" disabled>设置密码</button>
+      <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnFloatNoteSelectedV2" disabled>备注</button>
+      <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnFloatCopySelectedLinesV2" disabled>复制行</button>
+    </div>
     <div class="body hidden" id="retryLogPanel">
       <h3>补跑日志：<span id="retryLogEmail" style="font-size:13px;font-weight:400;color:var(--muted);"></span>
         <button class="btn" id="btnCloseRetryLog" style="float:right;min-height:28px;">关闭</button>
@@ -3512,6 +3535,13 @@ function updateAccountSelectionUi(pageRows = null) {
   const none = ACCOUNT_SELECTED.size === 0;
   const hintV2 = $('#accountsSelectedHintV2');
   if (hintV2) hintV2.textContent = `已选择 ${ACCOUNT_SELECTED.size} 个账号`;
+  const floatHint = $('#accountsSelectionFloatHintV2');
+  if (floatHint) floatHint.textContent = `已选择 ${ACCOUNT_SELECTED.size} 个账号`;
+  const floatBar = $('#accountsSelectionFloatV2');
+  if (floatBar) {
+    floatBar.classList.toggle('is-visible', !none);
+    floatBar.setAttribute('aria-hidden', none ? 'true' : 'false');
+  }
 
   const archiveLabel = SHOW_ARCHIVED_ACCOUNTS ? '恢复选中' : '归档选中';
   const archiveTitle = SHOW_ARCHIVED_ACCOUNTS ? '把选中的归档账号恢复到默认账号列表' : '归档选中的账号；默认账号列表将不再查询/显示这些账号';
@@ -3521,6 +3551,7 @@ function updateAccountSelectionUi(pageRows = null) {
     'btnRetrySelectedCodexV2', 'btnDownloadSelectedCpaV2', 'btnStopSelectedCodexV2',
     'btnPasswordSetupSelectedV2', 'btnNoteSelectedAccountsV2', 'btnCopySelectedLinesV2',
     'btnDownloadSelectedTxtV2', 'btnArchiveSelectedAccountsV2',
+    'btnFloatPasswordSetupV2', 'btnFloatNoteSelectedV2', 'btnFloatCopySelectedLinesV2',
   ];
   v2Ids.forEach(id => {
     const el = document.getElementById(id);
@@ -4774,6 +4805,9 @@ async function copySelectedAccountTokens() {
   bind('btnPasswordSetupSelectedV2', setPasswordForSelectedAccounts);
   bind('btnNoteSelectedAccountsV2', noteSelectedAccounts);
   bind('btnCopySelectedLinesV2', copySelectedAccountLines);
+  bind('btnFloatPasswordSetupV2', setPasswordForSelectedAccounts);
+  bind('btnFloatNoteSelectedV2', noteSelectedAccounts);
+  bind('btnFloatCopySelectedLinesV2', copySelectedAccountLines);
   bind('btnCopyAllTokensV2', copyCurrentPageTokens);
   bind('btnCopyAllLinesV2', copyCurrentPageLines);
   bind('btnDownloadSelectedTxtV2', downloadSelectedAccountTxt);

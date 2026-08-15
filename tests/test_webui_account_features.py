@@ -280,6 +280,20 @@ class WebUiAccountFeatureTests(unittest.TestCase):
         self.assertLess(badge, bulk_title)
         self.assertLess(badge, group_end)
 
+    def test_account_template_has_floating_selection_action_bar(self):
+        template = (
+            Path(__file__).resolve().parents[1]
+            / "webui" / "templates" / "index.html"
+        ).read_text(encoding="utf-8")
+        self.assertIn('id="accountsSelectionFloatV2"', template)
+        self.assertIn("position: fixed", template)
+        self.assertIn('id="accountsSelectionFloatHintV2"', template)
+        self.assertIn('id="btnFloatPasswordSetupV2"', template)
+        self.assertIn('id="btnFloatNoteSelectedV2"', template)
+        self.assertIn('id="btnFloatCopySelectedLinesV2"', template)
+        self.assertIn("floatBar.classList.toggle('is-visible', !none)", template)
+        self.assertIn("floatBar.setAttribute('aria-hidden', none ? 'true' : 'false')", template)
+
     def test_account_template_displays_password_queue_position_and_summary(self):
         template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"
         html = template.read_text(encoding="utf-8")
