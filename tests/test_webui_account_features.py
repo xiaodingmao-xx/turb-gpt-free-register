@@ -262,6 +262,24 @@ class WebUiAccountFeatureTests(unittest.TestCase):
         self.assertIn("registration_ip", template)
         self.assertIn("注册IP:", template)
 
+    def test_account_template_places_prominent_selection_badge_in_bulk_toolbar(self):
+        template = (
+            Path(__file__).resolve().parents[1]
+            / "webui" / "templates" / "index.html"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'id="accountsSelectedHintV2" class="acc-v2-selection-badge"',
+            template,
+        )
+        self.assertIn("已选择 ${ACCOUNT_SELECTED.size} 个账号", template)
+        bulk_title = template.index('<span class="acc-v2-btn-group-title">批量</span>')
+        group_start = template.rfind('<div class="acc-v2-btn-group">', 0, bulk_title)
+        group_end = template.index("</div>", bulk_title)
+        badge = template.index('id="accountsSelectedHintV2"')
+        self.assertGreaterEqual(badge, group_start)
+        self.assertLess(badge, bulk_title)
+        self.assertLess(badge, group_end)
+
     def test_account_template_displays_password_queue_position_and_summary(self):
         template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"
         html = template.read_text(encoding="utf-8")

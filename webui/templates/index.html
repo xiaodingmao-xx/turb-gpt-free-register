@@ -876,6 +876,12 @@
       color: #909399; font-size: 12px; font-weight: 600;
       padding: 0 4px; white-space: nowrap;
     }
+    #accountsToolbarV2 .acc-v2-selection-badge {
+      display: inline-flex; align-items: center; min-height: 32px;
+      padding: 0 12px; border: 1px solid #b3d8ff; border-radius: 6px;
+      background: #ecf5ff; color: #1677ff; font-size: 14px; font-weight: 800;
+      white-space: nowrap;
+    }
     #accountsToolbarV2 .jobs-tb-btn {
       min-height: 32px; padding: 0 12px; font-size: 13px;
     }
@@ -2050,7 +2056,6 @@
         </div>
 
         <div class="acc-v2-btn-group">
-          <span class="acc-v2-selected" id="accountsSelectedHintV2">已选 0</span>
           <span class="acc-v2-selected" id="passwordSetupQueueStatusV2" title="设置密码后台队列状态">设置密码队列：空闲</span>
           <label class="acc-v2-inline" title="批量补跑 Codex 的并发线程数">线程
             <span class="el-input-number">
@@ -2090,6 +2095,7 @@
           <button type="button" class="jobs-tb-btn jobs-tb-btn--danger" id="btnStopSelectedCodexV2" disabled title="停止选中账号中正在补跑的 Codex 授权">停止</button>
         </div>
         <div class="acc-v2-btn-group">
+          <span id="accountsSelectedHintV2" class="acc-v2-selection-badge" title="当前批量操作选中的账号数量">已选择 0 个账号</span>
           <span class="acc-v2-btn-group-title">批量</span>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnPasswordSetupSelectedV2" disabled title="给选中账号批量添加或重设密码">设置密码</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnNoteSelectedAccountsV2" disabled title="给选中的账号统一设置备注，留空可清空备注">备注</button>
@@ -3505,7 +3511,7 @@ function renderAccounts() {
 function updateAccountSelectionUi(pageRows = null) {
   const none = ACCOUNT_SELECTED.size === 0;
   const hintV2 = $('#accountsSelectedHintV2');
-  if (hintV2) hintV2.textContent = `已选 ${ACCOUNT_SELECTED.size}`;
+  if (hintV2) hintV2.textContent = `已选择 ${ACCOUNT_SELECTED.size} 个账号`;
 
   const archiveLabel = SHOW_ARCHIVED_ACCOUNTS ? '恢复选中' : '归档选中';
   const archiveTitle = SHOW_ARCHIVED_ACCOUNTS ? '把选中的归档账号恢复到默认账号列表' : '归档选中的账号；默认账号列表将不再查询/显示这些账号';
