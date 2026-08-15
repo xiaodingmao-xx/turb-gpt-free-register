@@ -313,7 +313,7 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "ENABLE_2FA", "file": "twofa.py", "type": "bool", "group": "功能开关",
-        "label": "启用 2FA(TOTP)", "help": "注册完成后自动设置动态口令（会多收一封 OTP 邮件）",
+        "label": "启用 Authenticator 2FA", "help": "注册后自动添加 TOTP 验证器；后续 Roxy 重新登录会用已保存的 secret 自动验证",
     },
     {
         "key": "ENABLE_FLOW_TRIGGER", "file": "flow_trigger.py", "type": "bool", "group": "功能开关",

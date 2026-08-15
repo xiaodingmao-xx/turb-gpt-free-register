@@ -8,6 +8,9 @@ import string
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import urlencode
+
+import pyotp
 
 from config import roxybrowser as _cfg
 from config import twofa as _twofa_cfg
@@ -1586,8 +1589,6 @@ def _build_password_setup_request(
     mode: str,
 ) -> dict:
     """构造与 chatgpt.com 同源执行的密码设置重新认证请求。"""
-    from urllib.parse import urlencode
-
     mode_key = _normalize_password_setup_mode(mode)
     query = {
         "connection": "password",
@@ -1609,6 +1610,26 @@ def _build_password_setup_request(
             "content-type": "application/x-www-form-urlencoded",
             "accept": "*/*",
         },
+    }
+
+
+def _build_twofa_setup_request(email: str, device_id: str, csrf_token: str) -> dict:
+    """构造 Authenticator/TOTP 设置前的重新认证请求。"""
+    query = {
+        "connection": "password",
+        "login_hint": str(email or "").strip(),
+        "reauth": "password",
+        "max_age": "0",
+        "ext-oai-did": str(device_id or "").strip(),
+    }
+    body = {
+        "callbackUrl": "https://chatgpt.com/?action=enable&factor=totp",
+        "csrfToken": str(csrf_token or ""),
+        "json": "true",
+    }
+    return {
+        "url": "https://chatgpt.com/api/auth/signin/openai?" + urlencode(query),
+        "body": urlencode(body),
     }
 
 
@@ -1690,6 +1711,189 @@ def _password_setup_device_id(driver) -> str:
     except Exception:
         pass
     return str(uuid.uuid4())
+
+
+def _fetch_twofa_authorize_url(driver, email: str, device_id: str | None = None) -> tuple[str, str]:
+    """在当前 Roxy 登录态内发起 TOTP 设置所需的邮箱重新认证。"""
+    current_url = str(getattr(driver, "current_url", "") or "").lower()
+    if "chatgpt.com" not in current_url:
+        _safe_get(driver, "https://chatgpt.com/", timeout=35, attempts=2, accept_hosts=("chatgpt.com",))
+
+    csrf_result = driver.execute_async_script(r"""
+    const done = arguments[arguments.length - 1];
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    fetch('/api/auth/csrf', {
+      credentials: 'include',
+      headers: {accept: '*/*'},
+      signal: controller.signal,
+    })
+      .then(async response => {
+        const text = await response.text();
+        let data = {};
+        try { data = JSON.parse(text); } catch (_) {}
+        done({stage: 'csrf', ok: response.ok, status: response.status, data, body: text.slice(0, 500)});
+      })
+      .catch(error => done({stage: 'csrf', ok: false, error: String(error)}))
+      .finally(() => clearTimeout(timer));
+    """) or {}
+    csrf_data = csrf_result.get("data") if isinstance(csrf_result, dict) else None
+    csrf_token = csrf_data.get("csrfToken") if isinstance(csrf_data, dict) else None
+    if not csrf_token:
+        raise RuntimeError(f"2FA 设置获取 CSRF 失败: {csrf_result}")
+
+    stable_device_id = str(device_id or _password_setup_device_id(driver))
+    request_data = _build_twofa_setup_request(email, stable_device_id, csrf_token)
+    result = driver.execute_async_script(r"""
+    const url = arguments[0];
+    const body = arguments[1];
+    const done = arguments[arguments.length - 1];
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    fetch(url, {
+      method: 'POST',
+      credentials: 'include',
+      headers: {'content-type': 'application/x-www-form-urlencoded', accept: '*/*'},
+      body,
+      signal: controller.signal,
+    })
+      .then(async response => {
+        const text = await response.text();
+        let data = {};
+        try { data = JSON.parse(text); } catch (_) {}
+        done({stage: 'signin', ok: response.ok, status: response.status, data, body: text.slice(0, 700)});
+      })
+      .catch(error => done({stage: 'signin', ok: false, error: String(error)}))
+      .finally(() => clearTimeout(timer));
+    """, request_data["url"], request_data["body"]) or {}
+    data = result.get("data") if isinstance(result, dict) else None
+    authorize_url = data.get("url") if isinstance(data, dict) else None
+    if not authorize_url:
+        raise RuntimeError(f"2FA 设置未获取 authorize URL: {result}")
+    return str(authorize_url), stable_device_id
+
+
+def _post_chatgpt_twofa_api(
+    driver,
+    *,
+    path: str,
+    access_token: str,
+    device_id: str,
+    payload: dict,
+    stage: str,
+) -> dict:
+    """从当前 chatgpt.com 页面同源调用 MFA API，保留 Roxy 登录态和出口。"""
+    current_url = str(getattr(driver, "current_url", "") or "").lower()
+    if "chatgpt.com" not in current_url:
+        _safe_get(driver, "https://chatgpt.com/", timeout=35, attempts=2, accept_hosts=("chatgpt.com",))
+
+    result = driver.execute_async_script(r"""
+    const path = arguments[0];
+    const token = arguments[1];
+    const deviceId = arguments[2];
+    const payload = arguments[3];
+    const stage = arguments[4];
+    const done = arguments[arguments.length - 1];
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20000);
+    fetch(path, {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'accept': 'application/json',
+        'content-type': 'application/json',
+        'authorization': `Bearer ${token}`,
+        'oai-device-id': deviceId,
+        'oai-language': navigator.language || 'zh-CN',
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    })
+      .then(async response => {
+        const text = await response.text();
+        let data = {};
+        try { data = JSON.parse(text); } catch (_) {}
+        done({stage, ok: response.ok, status: response.status, data, body: text.slice(0, 900)});
+      })
+      .catch(error => done({stage, ok: false, error: String(error)}))
+      .finally(() => clearTimeout(timer));
+    """, path, access_token, device_id, payload, stage) or {}
+    if not isinstance(result, dict) or not result.get("ok"):
+        raise RuntimeError(f"2FA {stage} 请求失败: {result}")
+    data = result.get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError(f"2FA {stage} 响应不是 JSON 对象: {result}")
+    return data
+
+
+def _run_roxy_twofa_setup(driver, email: str) -> tuple[str, dict]:
+    """为当前 Roxy 注册账号启用 Authenticator/TOTP，返回密钥和刷新后的 session。"""
+    logger.info("%s [2FA] 开始添加 Authenticator 验证器：%s", _log_prefix(driver), email)
+    authorize_url, device_id = _fetch_twofa_authorize_url(driver, email)
+    otp_after_ts = time.time()
+    _safe_get(
+        driver,
+        authorize_url,
+        timeout=min(60, int(getattr(_cfg, "ROXY_SELENIUM_TIMEOUT", 90) or 90)),
+        attempts=2,
+        accept_hosts=("auth.openai.com", "chatgpt.com"),
+    )
+    if not _is_email_verification_page(driver):
+        raise RuntimeError(f"2FA 设置未进入邮箱验证码页面: url={getattr(driver, 'current_url', '')}")
+
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        _check_manual_stop()
+        logger.info("%s [2FA] 等待邮箱重认证 OTP（%s/%s）", _log_prefix(driver), attempt, max_attempts)
+        code = wait_for_otp(email, after_ts=otp_after_ts)
+        if not _is_email_verification_page(driver):
+            break
+        _clear_otp_inputs(driver)
+        _type_otp(driver, code)
+        try:
+            _click_continue(driver)
+        except Exception:
+            pass
+        outcome = _wait_after_email_otp_submit(driver, timeout=15)
+        if outcome == "accepted" or not _is_email_verification_page(driver):
+            break
+        if attempt >= max_attempts:
+            raise RuntimeError("2FA 设置邮箱验证码连续错误或过期")
+        otp_after_ts = time.time()
+        _click_resend_email_otp(driver, timeout=25)
+
+    _check_manual_stop()
+    session_info = _fetch_chatgpt_session(driver, timeout=90)
+    access_token = str(session_info.get("accessToken") or "")
+    if not access_token:
+        raise RuntimeError("2FA 重认证完成后未拿到 accessToken")
+
+    enrollment = _post_chatgpt_twofa_api(
+        driver,
+        path="/backend-api/accounts/mfa/enroll",
+        access_token=access_token,
+        device_id=device_id,
+        payload={"factor_type": "totp"},
+        stage="enroll",
+    )
+    secret = str(enrollment.get("secret") or "").replace(" ", "").strip()
+    session_id = str(enrollment.get("session_id") or "").strip()
+    if not secret or not session_id:
+        raise RuntimeError(f"2FA enroll 响应字段缺失: {enrollment}")
+
+    totp_code = pyotp.TOTP(secret).now()
+    activation = _post_chatgpt_twofa_api(
+        driver,
+        path="/backend-api/accounts/mfa/user/activate_enrollment",
+        access_token=access_token,
+        device_id=device_id,
+        payload={"code": totp_code, "factor_type": "totp", "session_id": session_id},
+        stage="activate",
+    )
+    if not activation.get("success"):
+        raise RuntimeError(f"2FA activate 返回 success=false: {activation}")
+    logger.info("%s [2FA] Authenticator 验证器添加并激活成功：%s", _log_prefix(driver), email)
+    return secret, session_info
 
 
 def _fill_password_setup_page(driver, password: str, timeout: int = 120) -> None:
@@ -1796,6 +2000,11 @@ def _run_roxy_password_setup(
         progress(f"[设置密码] OTP 无效或过期，重新发送 attempt={attempt + 1}/{max_attempts}")
         _click_resend_email_otp(driver, timeout=25)
 
+    # 已启用 2FA 的历史账号在邮箱重认证后会先进入 Authenticator challenge。
+    # 注册阶段首次设置密码时尚未启用 2FA，此调用会直接返回 False。
+    from core.roxy_codex_oauth import _submit_totp_challenge_if_present
+    progress("[设置密码] 检查是否需要 Authenticator 2FA")
+    _submit_totp_challenge_if_present(driver, email)
     progress("[设置密码] 进入新密码页面并提交")
     _fill_password_setup_page(
         driver,
@@ -2377,6 +2586,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
         _check_manual_stop()
         session_info = _fetch_chatgpt_session(driver, timeout=120)
         access_token = session_info["accessToken"]
+        create_acknowledged = True
         logger.info("[Roxy注册] 已拿到 accessToken：%s", email)
         _check_manual_stop()
 
@@ -2396,9 +2606,12 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
                 openai_password = None
                 logger.info("[Roxy注册] ChatGPT 已确认密码设置过，跳过设置密码任务并继续保存账号")
 
-        if _twofa_cfg.ENABLE_2FA:
-            logger.warning("[Roxy注册] 当前 Roxy 自动化路径暂不执行 2FA 设置，已跳过")
         totp_secret = None
+        if _twofa_cfg.ENABLE_2FA:
+            _check_manual_stop()
+            totp_secret, refreshed_session = _run_roxy_twofa_setup(driver, email)
+            access_token = refreshed_session.get("accessToken") or access_token
+            session_info = refreshed_session or session_info
 
         codex_result = {
             "status": "skipped",
@@ -2420,6 +2633,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
                     existing_opened=opened,
                     force=True,
                     clear_existing_state=True,
+                    totp_secret=totp_secret,
                 )
             else:
                 logger.info("[Roxy注册][Codex] ENABLE_CODEX_AUTO=False，注册后跳过 Codex OAuth")

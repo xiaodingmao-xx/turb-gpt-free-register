@@ -33,7 +33,9 @@ class RoxyPasswordSetupTests(unittest.TestCase):
             "core.roxy_registration.wait_for_otp", return_value="123456"
         ), patch("core.roxy_registration._type_otp") as type_otp, patch(
             "core.roxy_registration._fill_password_setup_page"
-        ) as fill_password:
+        ) as fill_password, patch(
+            "core.roxy_codex_oauth._submit_totp_challenge_if_present", return_value=False
+        ):
             result = _run_roxy_password_setup(
                 driver,
                 "user@example.com",

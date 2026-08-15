@@ -8,10 +8,12 @@ import time
 from contextvars import ContextVar
 from urllib.parse import urlparse
 
+import pyotp
+
 from config import roxybrowser as _roxy_cfg
 from core.email_provider import wait_for_otp
 from core.humanize import delay as human_delay
-from core import sms_provider
+from core import db, sms_provider
 from core.openai_auth import AccountUnusableError, detect_account_unusable_response_body
 from core.roxybrowser_client import RoxyBrowserClient
 from core.roxy_registration import (
@@ -239,6 +241,184 @@ def _wait_for_otp_input(driver, timeout: int = 30) -> None:
         str(state.get("text") or "")[:300],
     )
     raise RuntimeError("等待 OTP 输入框超时，页面未出现验证码输入框")
+
+
+def _totp_challenge_state(driver) -> dict:
+    """读取 Authenticator/TOTP 验证页的技术特征，不返回输入值。"""
+    try:
+        return driver.execute_script(r"""
+        const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+          && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none';
+        const inputs = [...document.querySelectorAll('input')].map(el => ({
+          type: el.getAttribute('type') || '',
+          name: el.getAttribute('name') || '',
+          id: el.id || '',
+          autocomplete: el.getAttribute('autocomplete') || '',
+          inputmode: el.getAttribute('inputmode') || '',
+          ariaLabel: el.getAttribute('aria-label') || '',
+          placeholder: el.getAttribute('placeholder') || '',
+          maxLength: Number(el.maxLength || 0),
+          visible: visible(el),
+          disabled: !!el.disabled,
+        })).slice(0, 30);
+        const errors = [...document.querySelectorAll('[role="alert"], [aria-live="assertive"], [data-error], .error')]
+          .filter(visible)
+          .map(el => (el.innerText || el.textContent || '').trim())
+          .filter(Boolean)
+          .slice(0, 8);
+        return {
+          url: location.href,
+          title: document.title || '',
+          bodyText: (document.body?.innerText || '').slice(0, 2400),
+          inputs,
+          errors,
+        };
+        """) or {}
+    except Exception as exc:
+        return {"url": str(getattr(driver, "current_url", "") or ""), "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _is_totp_challenge_state(state: dict) -> bool:
+    """识别登录流程中的 Authenticator/TOTP challenge，排除邮箱和短信 OTP。"""
+    url = str(state.get("url") or "").lower()
+    if any(marker in url for marker in ("email-verification", "phone-verification", "add-phone")):
+        return False
+
+    inputs = [item for item in (state.get("inputs") or []) if isinstance(item, dict)]
+    visible_inputs = [item for item in inputs if item.get("visible") and not item.get("disabled")]
+    attrs = " ".join(
+        " ".join(str(item.get(key) or "") for key in (
+            "type", "name", "id", "autocomplete", "inputmode", "ariaLabel", "placeholder",
+        ))
+        for item in visible_inputs
+    ).lower()
+    body = " ".join((
+        str(state.get("title") or ""),
+        str(state.get("bodyText") or ""),
+    )).lower()
+    has_code_input = bool(visible_inputs) and (
+        "one-time-code" in attrs
+        or "totp" in attrs
+        or "mfa" in attrs
+        or "code" in attrs
+        or any(1 <= int(item.get("maxLength") or 0) <= 8 for item in visible_inputs)
+    )
+    path_hint = any(marker in url for marker in (
+        "/mfa", "mfa-", "mfa_", "/totp", "authenticator", "two-factor", "multi-factor",
+    ))
+    technical_hint = any(marker in attrs for marker in ("totp", "authenticator", "mfa"))
+    text_hint = any(marker in body for marker in (
+        "authenticator app",
+        "authentication app",
+        "verification app",
+        "two-factor authentication",
+        "multi-factor authentication",
+        "code from your authenticator",
+        "验证器应用",
+        "身份验证器",
+        "双重验证",
+        "两步验证",
+        "認証アプリ",
+        "2段階認証",
+    ))
+    email_or_phone_hint = any(marker in body for marker in (
+        "check your email",
+        "sent to your email",
+        "code we sent to your email",
+        "text message",
+        "check your phone",
+        "sent to your phone",
+        "code we sent to your phone",
+        "sms code",
+        "sent to +",
+        "电子邮件",
+        "郵箱",
+        "短信",
+        "手机验证码",
+        "携帯電話",
+        "ショートメッセージ",
+    ))
+    if email_or_phone_hint and not (technical_hint or text_hint):
+        return False
+    return bool(has_code_input and (path_hint or technical_hint or text_hint))
+
+
+def _resolve_totp_secret(email: str, explicit_secret: str | None = None) -> str:
+    secret = str(explicit_secret or "").replace(" ", "").strip()
+    if secret:
+        return secret
+    account = db.get_account_by_email(str(email or "").strip()) or {}
+    return str(account.get("totp_secret") or "").replace(" ", "").strip()
+
+
+def _submit_totp_challenge_if_present(
+    driver,
+    email: str,
+    *,
+    totp_secret: str | None = None,
+    detect_timeout: int = 15,
+) -> bool:
+    """若登录出现 Authenticator 验证页，则生成并提交当前 TOTP；没有该页面返回 False。"""
+    detect_end = time.time() + max(1, int(detect_timeout or 15))
+    state = {}
+    while time.time() < detect_end:
+        state = _totp_challenge_state(driver)
+        if _is_totp_challenge_state(state):
+            break
+        url = str(state.get("url") or "").lower()
+        if _is_callback_url(url) or any(marker in url for marker in (
+            "phone-verification", "add-phone", "consent", "workspace", "localhost:1455",
+            "reset-password", "new-password", "authorize",
+        )):
+            return False
+        time.sleep(0.4)
+    else:
+        return False
+
+    secret = _resolve_totp_secret(email, totp_secret)
+    if not secret:
+        raise RuntimeError(f"登录需要 Authenticator 2FA，但账号未保存 totp_secret: {email}")
+
+    logger.info("[Codex][Browser] 检测到 Authenticator 2FA 页面，准备提交动态验证码：%s", email)
+    last_code = ""
+    for attempt in range(1, 3):
+        code = pyotp.TOTP(secret).now()
+        if code == last_code:
+            wait_end = time.time() + 35
+            while code == last_code and time.time() < wait_end:
+                time.sleep(0.5)
+                code = pyotp.TOTP(secret).now()
+        last_code = code
+
+        _clear_otp_inputs(driver)
+        _type_otp(driver, code)
+        human_delay("otp_input")
+        clicked = _click_if_present(driver, [
+            "button[type='submit']",
+            "form button:not([type='button'])",
+            "//button[contains(., 'Continue')]",
+            "//button[contains(., 'Verify')]",
+            "//button[contains(., '继续')]",
+            "//button[contains(., '验证')]",
+            "//button[contains(., '確認')]",
+        ], timeout=8)
+        if not clicked:
+            _click_continue(driver)
+
+        wait_end = time.time() + 15
+        while time.time() < wait_end:
+            next_state = _totp_challenge_state(driver)
+            if not _is_totp_challenge_state(next_state):
+                logger.info("[Codex][Browser] Authenticator 2FA 验证成功：%s", email)
+                return True
+            time.sleep(0.5)
+        logger.warning(
+            "[Codex][Browser] Authenticator 2FA 提交后仍停留在验证页，准备重试（%s/2）：errors=%s",
+            attempt,
+            next_state.get("errors") or [],
+        )
+
+    raise RuntimeError(f"Authenticator 2FA 验证连续失败: {email}")
 
 
 def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None:
@@ -1232,6 +1412,7 @@ def _run_roxy_codex_oauth_once(
     existing_opened=None,
     reuse_existing_profile: bool = False,
     clear_existing_state: bool = True,
+    totp_secret: str | None = None,
 ) -> dict:
     """指纹浏览器 Codex OAuth 入口。
 
@@ -1283,6 +1464,7 @@ def _run_roxy_codex_oauth_once(
 
         _fill_email_and_otp(driver, email, otp_provider, auth_url)
         human_delay("api")
+        _submit_totp_challenge_if_present(driver, email, totp_secret=totp_secret)
         logger.info("[Codex][Browser] 检查是否需要手机号验证")
         _do_phone_verification_if_present(driver)
         logger.info("[Codex][Browser] 手机验证处理完成/无需处理，等待授权确认和 callback")
@@ -1384,6 +1566,7 @@ def run_roxy_codex_oauth(
     existing_opened=None,
     reuse_existing_profile: bool = False,
     clear_existing_state: bool = True,
+    totp_secret: str | None = None,
 ) -> dict:
     """指纹浏览器 Codex OAuth 入口；CPA callback 409 timeout 时重新开启一轮授权。"""
     from core import codex_oauth as proto
@@ -1405,6 +1588,7 @@ def run_roxy_codex_oauth(
             existing_opened=existing_opened,
             reuse_existing_profile=reuse_existing_profile,
             clear_existing_state=clear_existing_state,
+            totp_secret=totp_secret,
         )
         last_result = result
         if result.get("ok"):

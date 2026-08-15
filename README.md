@@ -31,6 +31,7 @@ ChatGPT / OpenAI 账号自动注册与 Codex OAuth 授权工具。当前项目�
   - `REGISTRATION_DRIVER = "skyvern"`
 - 支持 RoxyBrowser 一号一环境：自动创建、打开、关闭、删除 Roxy Profile。
 - 支持 Roxy 无头启动：`ROXY_OPEN_HEADLESS=True`。
+- Roxy 注册完成后可自动添加 Authenticator/TOTP 验证器并保存 TOTP secret；后续 Roxy Codex 授权和设置密码重新登录时会自动填写当前 TOTP。
 - 支持 CloakBrowser：免费 binary、无头模式、humanize、固定 fingerprint seed、按出口 IP 自动匹配语言/时区/WebRTC。
 - Roxy / Cloak 浏览器注册已兼容：
   - 填邮箱后直接进入邮箱验证码页；
@@ -609,7 +610,7 @@ ROXY_PASSWORD_SETUP_QUEUE_LIMIT="100"
 | `config/email.py` | 邮箱来源、OTP 轮询、QQ IMAP、域名邮箱、Cloudflare Worker 临时邮箱 |
 | `config/proxy.py` | 代理池 |
 | `config/register.py` | 默认邮箱、密码、显示名 |
-| `config/twofa.py` | 2FA 开关 |
+| `config/twofa.py` | 注册后自动添加 Authenticator/TOTP 验证器开关 |
 | `config/humanize.py` | 随机停顿/人工节奏 |
 | `config/flow_trigger.py` | 注册成功后触发 Flow |
 | `config/browser.py` | 协议模式浏览器指纹 |
