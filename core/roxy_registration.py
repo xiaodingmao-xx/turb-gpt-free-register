@@ -14,6 +14,7 @@ from config import twofa as _twofa_cfg
 from core.account_export import save_account_data
 from core.email_provider import wait_for_otp, resolve_email_source
 from core.humanize import delay as human_delay
+from core.registration_network import detect_selenium_exit_ip
 from core.roxybrowser_client import RoxyBrowserClient, RoxyOpenResult
 
 logger = logging.getLogger(__name__)
@@ -1747,6 +1748,7 @@ def _run_roxy_password_setup(
     *,
     mode: str | None = None,
     password: str | None = None,
+    previous_otp: str | None = None,
     progress_callback=None,
 ) -> str:
     """在当前 Roxy 环境完成添加密码或重设密码，返回实际保存的密码。"""
@@ -1769,10 +1771,16 @@ def _run_roxy_password_setup(
     if not _is_email_verification_page(driver):
         raise RuntimeError(f"密码设置未进入邮箱验证码页面: url={getattr(driver, 'current_url', '')}")
 
+    previous_otp = str(previous_otp or "").strip()
+    excluded_codes = {previous_otp} if previous_otp else set()
+    if previous_otp:
+        progress("[设置密码] 已有注册验证码，重新发送密码设置验证码并排除旧码")
+        _click_resend_email_otp(driver, timeout=25)
+
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
         progress(f"[设置密码] 等待邮箱 OTP attempt={attempt}/{max_attempts}")
-        code = wait_for_otp(email, after_ts=otp_after_ts)
+        code = wait_for_otp(email, after_ts=otp_after_ts, exclude_codes=excluded_codes or None)
         # OTP 等待期间页面可能已经自动推进到新密码页；不要再把新密码页当成验证码页处理。
         if not _is_email_verification_page(driver):
             progress(f"[设置密码] OTP 页面已自动跳转，跳过重复输入 attempt={attempt}")
@@ -1807,13 +1815,17 @@ def _run_roxy_password_setup(
     return password
 
 
-def _run_password_setup_with_gate(driver, email: str) -> str:
+def _run_password_setup_with_gate(driver, email: str, previous_otp: str | None = None) -> str:
     """在当前注册线程中执行密码设置，仅由共享门控限制同时运行数量。"""
     from core.password_setup_service import run_password_setup
 
+    if previous_otp:
+        runner = lambda: _run_roxy_password_setup(driver, email, previous_otp=previous_otp)
+    else:
+        runner = lambda: _run_roxy_password_setup(driver, email)
     return run_password_setup(
         email,
-        lambda: _run_roxy_password_setup(driver, email),
+        runner,
     )
 
 
@@ -2377,12 +2389,13 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
         _check_manual_stop()
         session_info = _fetch_chatgpt_session(driver, timeout=120)
         access_token = session_info["accessToken"]
+        registration_ip = detect_selenium_exit_ip(driver)
         logger.info("[Roxy注册] 已拿到 accessToken：%s", email)
         _check_manual_stop()
 
         if bool(getattr(_cfg, "ROXY_PASSWORD_SETUP_ENABLED", False)):
             try:
-                openai_password = _run_password_setup_with_gate(driver, email)
+                openai_password = _run_password_setup_with_gate(driver, email, previous_otp=current_otp)
                 _check_manual_stop()
                 # 密码重设可能刷新会话令牌；能读取到新令牌时优先保存新值。
                 try:
@@ -2443,6 +2456,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
             totp_secret=totp_secret,
             email_source=resolve_email_source(email),
             proxy_used=proxy or None,
+            registration_ip=registration_ip,
             batch_dir=batch_dir,
             extra=account_extra,
         )

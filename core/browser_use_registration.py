@@ -25,6 +25,7 @@ from core.account_export import save_account_data
 from core.browser_use_client import BrowserUseClient
 from core.email_provider import resolve_email_source, wait_for_otp
 from core.humanize import delay as human_delay
+from core.registration_network import detect_playwright_exit_ip
 
 logger = logging.getLogger(__name__)
 
@@ -1848,6 +1849,7 @@ def run_browser_use_registration(
             access_token = session_info.get("accessToken")
             if not access_token:
                 raise RuntimeError("注册流程结束但未拿到 accessToken")
+            registration_ip = detect_playwright_exit_ip(page)
             create_acknowledged = True
             logger.info("[BrowserUse] 已拿到 accessToken：%s", email)
 
@@ -1899,6 +1901,7 @@ def run_browser_use_registration(
                 totp_secret=totp_secret,
                 email_source=resolve_email_source(email),
                 proxy_used=proxy or f"{provider_prefix}:{session_info_open.proxy_country_code or 'default'}",
+                registration_ip=registration_ip,
                 batch_dir=batch_dir,
                 extra={
                     "user": session_info.get("user"),

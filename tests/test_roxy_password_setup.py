@@ -44,6 +44,35 @@ class RoxyPasswordSetupTests(unittest.TestCase):
         type_otp.assert_not_called()
         fill_password.assert_called_once()
 
+    def test_password_setup_resends_and_excludes_previous_registration_otp(self):
+        from core.roxy_registration import _run_roxy_password_setup
+
+        driver = object()
+        with patch("core.roxy_registration._fetch_password_setup_authorize_url", return_value="https://auth.openai.com/email-verification"), patch(
+            "core.roxy_registration._safe_get"
+        ), patch(
+            "core.roxy_registration._is_email_verification_page", return_value=True
+        ), patch(
+            "core.roxy_registration._click_resend_email_otp"
+        ) as resend, patch(
+            "core.roxy_registration.wait_for_otp", return_value="222222"
+        ) as wait_otp, patch("core.roxy_registration._type_otp") as type_otp, patch(
+            "core.roxy_registration._click_continue"
+        ), patch(
+            "core.roxy_registration._wait_after_email_otp_submit", return_value="accepted"
+        ), patch("core.roxy_registration._fill_password_setup_page"):
+            result = _run_roxy_password_setup(
+                driver,
+                "user@example.com",
+                password="valid-password-123",
+                previous_otp="111111",
+            )
+
+        self.assertEqual(result, "valid-password-123")
+        resend.assert_called_once()
+        self.assertEqual(wait_otp.call_args.kwargs["exclude_codes"], {"111111"})
+        type_otp.assert_called_once_with(driver, "222222")
+
     def test_add_password_request_uses_same_origin_authorize_flow(self):
         request = _build_password_setup_request(
             email="user+test@example.com",

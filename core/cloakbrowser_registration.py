@@ -12,6 +12,7 @@ from core.account_export import save_account_data
 from core.cloakbrowser_driver import build_cloak_driver
 from core.email_provider import wait_for_otp, resolve_email_source
 from core.humanize import delay as human_delay
+from core.registration_network import detect_selenium_exit_ip
 
 # 复用 Roxy 注册流程里已维护好的页面操作函数。
 from core.roxy_registration import (  # noqa: F401
@@ -94,6 +95,7 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
 
         session_info = _fetch_chatgpt_session(driver, timeout=120)
         access_token = session_info["accessToken"]
+        registration_ip = detect_selenium_exit_ip(driver)
         logger.info("[Cloak注册] 已拿到 accessToken：%s", email)
 
         if _twofa_cfg.ENABLE_2FA:
@@ -130,6 +132,7 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
             totp_secret=totp_secret,
             email_source=resolve_email_source(email),
             proxy_used=((opened.raw or {}).get("proxy") if opened else None) or proxy or None,
+            registration_ip=registration_ip,
             batch_dir=batch_dir,
             extra={
                 "user": session_info.get("user"),

@@ -71,6 +71,7 @@ def _append_batch_archive(
     totp_secret: str | None,
     email_source: str | None,
     proxy_used: str | None,
+    registration_ip: str | None,
     extra: dict,
     batch_dir: Path | None,
 ) -> Path:
@@ -87,6 +88,7 @@ def _append_batch_archive(
         "email": email,
         "email_source": email_source,
         "proxy_used": proxy_used,
+        "registration_ip": registration_ip,
         "access_token": access_token,
         "totp_secret": totp_secret,
         "material_line": material_line,
@@ -387,6 +389,7 @@ def save_account_data(
     output_path: Path | None = None,  # 兼容老接口，已废弃
     email_source: str | None = None,
     proxy_used: str | None = None,
+    registration_ip: str | None = None,
     batch_dir: Path | None = None,
 ) -> int:
     """
@@ -414,6 +417,7 @@ def save_account_data(
         expires_at=extra.get("expires"),
         device_id=extra.get("device_id"),
         proxy_used=proxy_used,
+        registration_ip=registration_ip,
         email_source=email_source,
         extra=extra,
         codex_status=codex_status,
@@ -426,6 +430,7 @@ def save_account_data(
         totp_secret=totp_secret,
         email_source=email_source,
         proxy_used=proxy_used,
+        registration_ip=registration_ip,
         extra=extra,
         batch_dir=batch_dir,
     )

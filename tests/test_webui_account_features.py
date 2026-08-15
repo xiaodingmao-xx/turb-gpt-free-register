@@ -254,6 +254,14 @@ class WebUiAccountFeatureTests(unittest.TestCase):
         self.assertIn("pageRows.map(r => Number(r.id))", selection_source)
         self.assertIn("ACCOUNT_SELECTED.has(id)", selection_source)
 
+    def test_account_template_renders_registration_ip_under_plan_region(self):
+        template = (
+            Path(__file__).resolve().parents[1]
+            / "webui" / "templates" / "index.html"
+        ).read_text(encoding="utf-8")
+        self.assertIn("registration_ip", template)
+        self.assertIn("注册IP:", template)
+
     def test_account_template_displays_password_queue_position_and_summary(self):
         template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"
         html = template.read_text(encoding="utf-8")

@@ -146,6 +146,7 @@ def _compact_account_for_list(row: dict) -> dict:
         "plan_eligibility_country", "plan_eligibility_region", "plan_eligibility_region_source",
         "plan_exit_ip", "plan_exit_country", "plan_exit_region", "plan_exit_city",
         "plan_exit_timezone", "plan_exit_geo_source",
+        "registration_ip",
         "token_expired", "token_expires_at",
         # 查活状态。
         "live_check_status", "live_check_error", "live_checked_at",

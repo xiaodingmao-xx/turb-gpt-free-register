@@ -3233,7 +3233,8 @@ function _planRegionDetail(r) {
     .map(v => String(v || '').trim()).filter(Boolean).join(' / ') || '\u672a\u77e5';
   const title = [r.plan_exit_ip ? `IP: ${r.plan_exit_ip}` : '', r.plan_exit_timezone ? `TZ: ${r.plan_exit_timezone}` : '', r.plan_exit_geo_source ? `Source: ${r.plan_exit_geo_source}` : '']
     .filter(Boolean).map(esc).join('; ');
-  return `<div class="plan-region-detail" title="${title}"><div>\u8d44\u683c\u5730\u533a: ${esc(eligibility)}</div><div>\u51fa\u53e3\u5730\u533a: ${esc(exit)}</div></div>`;
+  const registrationIp = r.registration_ip ? `注册IP: ${esc(r.registration_ip)}` : '';
+  return `<div class="plan-region-detail" title="${title}"><div>\u8d44\u683c\u5730\u533a: ${esc(eligibility)}</div><div>\u51fa\u53e3\u5730\u533a: ${esc(exit)}</div>${registrationIp ? `<div>${registrationIp}</div>` : ''}</div>`;
 }
 function _planCell(r) {
   const ok = r.plan_check_ok;

@@ -544,6 +544,7 @@ def fetch_latest_otp(
     max_wait: int | None = None,
     poll_interval: int | None = None,
     settle_seconds: int | None = None,
+    exclude_codes=None,
 ) -> str:
     """
     轮询该邮箱配置的 code_url，直到提取到 6 位验证码或超时。
@@ -559,6 +560,7 @@ def fetch_latest_otp(
     deadline = time.time() + (max_wait or _email_cfg.OTP_MAX_WAIT)
     interval = poll_interval or _email_cfg.OTP_POLL_INTERVAL
     settle = settle_seconds if settle_seconds is not None else _email_cfg.OTP_SETTLE_SECONDS
+    excluded_codes = {str(value).strip() for value in (exclude_codes or ()) if str(value).strip()}
     headers = {
         "Accept": "application/json,text/plain,*/*",
         "User-Agent": "Mozilla/5.0 (compatible; gpt-register/1.0)",
@@ -579,8 +581,15 @@ def fetch_latest_otp(
             yy_result = _fetch_yangyang_otp(session, account.code_url, headers, after_ts=after_ts) if is_yangyang else None
             if yy_result:
                 code, yy_meta = yy_result
-                now_seen = time.time()
-                if not best_otp:
+                if code in excluded_codes:
+                    last_error = f"忽略已使用的旧 OTP: source=yangyang mail_id={yy_meta.get('mail_id')}"
+                    resp = None
+                    text = ""
+                    code = None
+                else:
+                    now_seen = time.time()
+                if code:
+                 if not best_otp:
                     best_otp = code
                     best_seen_at = now_seen
                     settle_until = now_seen + settle
@@ -588,7 +597,7 @@ def fetch_latest_otp(
                         f"[GenericAPI] 首次锁定 OTP={code}, source=yangyang mail_id={yy_meta.get('mail_id')} ts={yy_meta.get('received_at')}, "
                         f"等 {settle}s 看取码接口是否出现更新验证码..."
                     )
-                elif code != best_otp:
+                 elif code != best_otp:
                     logger.info(
                         f"[GenericAPI] 发现更新 OTP={code}, source=yangyang mail_id={yy_meta.get('mail_id')} ts={yy_meta.get('received_at')}，"
                         f"替换之前的 {best_otp}, 重置 settle 计时"
@@ -596,7 +605,7 @@ def fetch_latest_otp(
                     best_otp = code
                     best_seen_at = now_seen
                     settle_until = now_seen + settle
-                else:
+                 else:
                     logger.debug(f"[GenericAPI] 取码接口仍返回候选 OTP={best_otp}")
                 resp = None
                 text = ""
@@ -614,6 +623,9 @@ def fetch_latest_otp(
                 structured = _extract_structured_api_code(text, after_ts=after_ts)
                 structured_meta = structured[1] if structured else {}
                 code = structured[0] if structured else _extract_code(text)
+                if code in excluded_codes:
+                    last_error = "忽略接口返回的旧 OTP"
+                    code = None
                 if code:
                     now_seen = time.time()
                     if not best_otp:

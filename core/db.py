@@ -619,6 +619,7 @@ def insert_account(
     expires_at: str | None = None,
     device_id: str | None = None,
     proxy_used: str | None = None,
+    registration_ip: str | None = None,
     email_source: str | None = None,
     extra: dict | None = None,
     codex_status: str | None = None,   # success / failed / skipped / missing
@@ -653,6 +654,7 @@ def insert_account(
             "expires_at": expires_at if expires_at is not None else row.get("expires_at"),
             "device_id": device_id if device_id is not None else row.get("device_id"),
             "proxy_used": proxy_used if proxy_used is not None else row.get("proxy_used"),
+            "registration_ip": registration_ip if registration_ip is not None else row.get("registration_ip"),
             "email_source": email_source if email_source is not None else row.get("email_source"),
             "extra_json": extra_json if extra_json is not None else row.get("extra_json"),
             "codex_status": codex_status if codex_status is not None else row.get("codex_status"),
