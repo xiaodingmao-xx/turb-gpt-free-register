@@ -219,6 +219,7 @@
     .accounts-table .col-check { width: 34px; }
     .accounts-table .col-id { width: 52px; }
     .accounts-table .col-email { width: 250px; }
+    .accounts-table .col-pickup-address { width: 220px; }
     .accounts-table .col-source { width: 80px; }
     .accounts-table .col-token { width: 92px; }
     .accounts-table .col-plan { width: 300px; }
@@ -1440,14 +1441,30 @@ function renderAccounts() {
       <td>${_codexAgentCell(r)}</td>
       <td class="muted">${esc(r.created_at || '-')}</td>
       <td class="actions actions-cell">
-        <div class="account-row-actions">
+         <div class="account-row-actions">
+           <div class="account-action-group"><button data-account-plan-log="${esc(r.email)}" title="查看该账号最近一次查套餐日志">查套餐日志</button></div>
           <div class="account-action-group"><button class="primary" data-account-copy-secret="access_token" data-account-id="${esc(r.id)}" ${r.has_access_token ? '' : 'disabled'}>复制Token</button> <button class="good" data-account-copy-secret="copy_line" data-account-id="${esc(r.id)}">复制整行</button></div>
-          <div class="account-action-group"><button data-account-note="${esc(r.id)}" title="设置/清空该账号备注">备注</button> <button data-account-live-check="${esc(r.id)}" title="重新登录该账号，成功则刷新最新 AT/accessToken">查活</button> <button data-account-live-log="${esc(r.email)}" title="查看该账号最近一次查活日志">查活日志</button> <button data-account-password-log="${esc(r.email)}" title="查看该账号最近一次设置密码日志">设置密码日志</button> ${_planAction(r)} ${_extractLinkAction(r)}</div>
+          <div class="account-action-group"><button data-account-pickup-address="${esc(r.id)}" title="设置该账号取件地址">取件地址</button> <button data-account-note="${esc(r.id)}" title="设置/清空该账号备注">备注</button> <button data-account-live-check="${esc(r.id)}" title="重新登录该账号，成功则刷新最新 AT/accessToken">查活</button> <button data-account-live-log="${esc(r.email)}" title="查看该账号最近一次查活日志">查活日志</button> <button data-account-password-log="${esc(r.email)}" title="查看该账号最近一次设置密码日志">设置密码日志</button> ${_planAction(r)} ${_extractLinkAction(r)}</div>
           <div class="account-action-group">${_codexAction(r)} <button data-codex-log="${esc(r.email)}" title="查看该账号最近一次 Codex 补跑日志">补跑日志</button></div>
           <div class="account-action-group danger-zone"><button data-account-archive="${esc(r.id)}" data-archived="${r.archived ? '0' : '1'}" title="${r.archived ? '恢复到默认账号列表' : '归档后默认账号列表不再显示'}">${r.archived ? '恢复' : '归档'}</button> <button class="danger" data-account-delete="${esc(r.id)}" data-email="${esc(r.email)}">删除</button></div>
         </div>
       </td>
-    </tr>`).join('') || '<tr><td colspan="12" class="muted">暂无账号</td></tr>';
+    </tr>`).join('') || '<tr><td colspan="13" class="muted">暂无账号</td></tr>';
+  const accountBody = $('#accountsBody');
+  const pickupCopyLabel = String.fromCharCode(22797, 21046, 21462, 20214, 22320, 22336);
+  const pickupMissingLabel = String.fromCharCode(26410, 35774, 32622, 21462, 20214, 22320, 22336);
+  rows.forEach((r, index) => {
+    const emailCell = accountBody.rows[index] && accountBody.rows[index].cells[2];
+    if (!emailCell) return;
+    const pickup = r.pickup_address || '';
+    emailCell.insertAdjacentHTML('beforeend', pickup
+      ? `<div class="sub-cell pickup-address-cell" title="${esc(pickup)}">${esc(pickup)}</div><button type="button" class="pickup-address-copy" data-account-copy-pickup-address="${esc(r.id)}">\\u590d\\u5236\\u53d6\\u4ef6\\u5730\\u5740</button>`
+      : '<div class="sub-cell muted">\\u672a\\u8bbe\\u7f6e\\u53d6\\u4ef6\\u5730\\u5740</div>');
+    const pickupCopy = emailCell.querySelector('.pickup-address-copy');
+    if (pickupCopy) pickupCopy.textContent = pickupCopyLabel;
+    const pickupMissing = emailCell.querySelector('.sub-cell.muted:last-child');
+    if (pickupMissing) pickupMissing.textContent = pickupMissingLabel;
+  });
   updateAccountSelectionUi(rows);
   _renderPager('accounts', total);
 }
@@ -1554,10 +1571,22 @@ function openPasswordSetupLog(email) {
   clearInterval(liveLogTimer);
   liveLogTimer = setInterval(pollLiveLog, 2000);
 }
+function openPlanCheckLog(email) {
+  liveLogEmail = email;
+  liveLogKind = 'plan';
+  $('#liveLogTitle').textContent = '查套餐日志：';
+  $('#liveLogEmail').textContent = email;
+  $('#liveLogPanel').classList.remove('hidden');
+  updateModalScrollLock();
+  $('#liveLogContent').textContent = '加载中…';
+  pollLiveLog();
+  clearInterval(liveLogTimer);
+  liveLogTimer = setInterval(pollLiveLog, 2000);
+}
 async function pollLiveLog() {
   if (!liveLogEmail) return;
   try {
-    const endpoint = liveLogKind === 'password' ? 'password-setup-log' : 'live-check-log';
+    const endpoint = liveLogKind === 'password' ? 'password-setup-log' : liveLogKind === 'plan' ? 'plan-check-log' : 'live-check-log';
     const r = await api(`/api/accounts/${endpoint}?email=${encodeURIComponent(liveLogEmail)}`);
     const c = $('#liveLogContent');
     const atBottom = c.scrollTop + c.clientHeight >= c.scrollHeight - 30;
@@ -1590,6 +1619,16 @@ document.addEventListener('click', async (e) => {
 
 // 账号操作按钮（事件委托）
 $('#accountsBody').addEventListener('click', async (e) => {
+  const pickupCopyBtn = e.target.closest('[data-account-copy-pickup-address]');
+  if (pickupCopyBtn) {
+    const account = ACCOUNTS.find(a => Number(a.id) === Number(pickupCopyBtn.dataset.accountCopyPickupAddress));
+    const pickupAddress = account ? String(account.pickup_address || '') : '';
+    if (!pickupAddress) { showToast('该账号没有取件地址'); return; }
+    copyText(pickupAddress);
+    showToast('取件地址已复制');
+    return;
+  }
+
   const copySecretBtn = e.target.closest('[data-account-copy-secret]');
   if (copySecretBtn) {
     const id = Number(copySecretBtn.dataset.accountId);
@@ -1626,6 +1665,12 @@ $('#accountsBody').addEventListener('click', async (e) => {
     return;
   }
 
+  const planLogBtn = e.target.closest('[data-account-plan-log]');
+  if (planLogBtn) {
+    openPlanCheckLog(planLogBtn.dataset.accountPlanLog);
+    return;
+  }
+
   const passwordLogBtn = e.target.closest('[data-account-password-log]');
   if (passwordLogBtn) {
     openPasswordSetupLog(passwordLogBtn.dataset.accountPasswordLog);
@@ -1647,6 +1692,12 @@ $('#accountsBody').addEventListener('click', async (e) => {
   const noteBtn = e.target.closest('[data-account-note]');
   if (noteBtn) {
     await editAccountNote(Number(noteBtn.dataset.accountNote), noteBtn);
+    return;
+  }
+
+  const pickupAddressBtn = e.target.closest('[data-account-pickup-address]');
+  if (pickupAddressBtn) {
+    await editAccountPickupAddress(Number(pickupAddressBtn.dataset.accountPickupAddress), pickupAddressBtn);
     return;
   }
 
@@ -2302,6 +2353,28 @@ async function editAccountNote(id, btn) {
     loadAccounts();
   } catch(err) {
     showToast('保存备注失败: ' + err.message);
+    btn.disabled = false;
+  }
+}
+
+async function editAccountPickupAddress(id, btn) {
+  const acc = ACCOUNTS.find(a => Number(a.id) === Number(id));
+  if (!acc) { showToast('账号不存在'); return; }
+  const current = acc.pickup_address || '';
+  const pickupAddress = prompt(`设置账号取件地址（请输入收件接口链接）\n\n${acc.email || ('#' + id)}`, current);
+  if (pickupAddress === null) return;
+  if (pickupAddress.length > 320) { showToast('取件地址最多 320 个字符'); return; }
+  btn.disabled = true;
+  try {
+    await api(`/api/accounts/${id}/pickup-address`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({pickup_address: pickupAddress}),
+    });
+    showToast(pickupAddress.trim() ? '取件地址已保存' : '取件地址已清空');
+    loadAccounts();
+  } catch(err) {
+    showToast('保存取件地址失败: ' + err.message);
     btn.disabled = false;
   }
 }

@@ -59,6 +59,11 @@ ROXY_OPEN_EXTRA_PARAMS: dict = {}
 ROXY_SELENIUM_TIMEOUT: int = 90
 ROXY_KEEP_BROWSER_OPEN: bool = False
 
+# 设置密码任务失败后的清理与自动重试。
+# MAX_RETRIES 表示总尝试次数（包含第一次执行）。
+ROXY_PASSWORD_SETUP_MAX_RETRIES: int = 3
+ROXY_PASSWORD_SETUP_DELETE_TEMP_PROFILE_ON_FAILURE: bool = True
+
 # Roxy API transient 错误重试。create 接口默认不重试，避免超时后重复创建孤儿环境；open/close/delete 会重试。
 ROXY_API_RETRIES: int = 3
 ROXY_API_RETRY_DELAY: int = 2

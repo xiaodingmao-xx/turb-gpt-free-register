@@ -1773,6 +1773,10 @@ def _run_roxy_password_setup(
     for attempt in range(1, max_attempts + 1):
         progress(f"[设置密码] 等待邮箱 OTP attempt={attempt}/{max_attempts}")
         code = wait_for_otp(email, after_ts=otp_after_ts)
+        # OTP 等待期间页面可能已经自动推进到新密码页；不要再把新密码页当成验证码页处理。
+        if not _is_email_verification_page(driver):
+            progress(f"[设置密码] OTP 页面已自动跳转，跳过重复输入 attempt={attempt}")
+            break
         _clear_otp_inputs(driver)
         _type_otp(driver, code)
         try:
@@ -1785,6 +1789,9 @@ def _run_roxy_password_setup(
             break
         if attempt >= max_attempts:
             raise RuntimeError("密码设置邮箱验证码连续错误或过期")
+        if not _is_email_verification_page(driver):
+            progress(f"[设置密码] OTP 已通过，页面已进入下一步，跳过重新发送 attempt={attempt}")
+            break
         otp_after_ts = time.time()
         progress(f"[设置密码] OTP 无效或过期，重新发送 attempt={attempt + 1}/{max_attempts}")
         _click_resend_email_otp(driver, timeout=25)

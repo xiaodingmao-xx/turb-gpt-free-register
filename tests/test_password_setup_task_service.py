@@ -9,6 +9,10 @@ from config import roxybrowser as roxy_cfg
 
 
 class PasswordSetupTaskServiceTests(unittest.TestCase):
+    def test_password_setup_retry_defaults_are_bounded(self):
+        self.assertEqual(roxy_cfg.ROXY_PASSWORD_SETUP_MAX_RETRIES, 3)
+        self.assertTrue(roxy_cfg.ROXY_PASSWORD_SETUP_DELETE_TEMP_PROFILE_ON_FAILURE)
+
     def test_service_exports_account_task_entrypoint(self):
         from core import password_setup_task_service
 
@@ -185,6 +189,45 @@ class PasswordSetupTaskServiceTests(unittest.TestCase):
         self.assertIn("[设置密码] 开始后台执行", content)
         self.assertIn("[设置密码] 失败", content)
 
+    def test_requeue_account_password_setup_preserves_failure_and_moves_to_queued(self):
+        from core import db
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "accounts.json").write_text(json.dumps([{
+                "id": 1,
+                "email": "user@example.com",
+                "password_setup_status": "running",
+                "password_setup_attempt": 1,
+            }]), encoding="utf-8")
+            patchers = [
+                patch.object(db, "_ACCOUNTS_JSON", root / "accounts.json"),
+                patch.object(db, "_LEGACY_ACCOUNTS_JSON", root / "legacy.json"),
+                patch.object(db, "_ACCOUNTS_TXT", root / "accounts.txt"),
+                patch.object(db, "_TOKENS_TXT", root / "tokens.txt"),
+                patch.object(db, "_VIEWER_HTML", root / "viewer.html"),
+            ]
+            try:
+                for item in patchers:
+                    item.start()
+                self.assertTrue(db.requeue_account_password_setup(
+                    1,
+                    "TimeoutException: page load timeout",
+                    attempt=2,
+                    max_attempts=3,
+                ))
+                row = db.get_account(1)
+            finally:
+                for item in reversed(patchers):
+                    item.stop()
+
+        self.assertEqual(row["password_setup_status"], "queued")
+        self.assertEqual(row["password_setup_attempt"], 2)
+        self.assertEqual(row["password_setup_max_attempts"], 3)
+        self.assertEqual(row["password_setup_last_error"], "TimeoutException: page load timeout")
+        self.assertIsNone(row.get("password_setup_error"))
+        self.assertTrue(row.get("password_setup_queued_at"))
+
     def test_stale_profile_creates_fresh_environment_and_retries_setup(self):
         from core import db
         from core import password_setup_task_service as service
@@ -299,7 +342,7 @@ class PasswordSetupTaskServiceTests(unittest.TestCase):
         self.assertEqual(len(fake_client.cleaned), 1)
         self.assertIn("new-profile", content)
 
-    def test_failed_setup_keeps_roxy_environment_open_for_debugging(self):
+    def test_failed_setup_closes_existing_roxy_environment_without_deleting_it(self):
         from core import db
         from core import password_setup_task_service as service
         from core.roxybrowser_client import RoxyOpenResult
@@ -347,10 +390,127 @@ class PasswordSetupTaskServiceTests(unittest.TestCase):
             content = (Path(td) / "password-setup-user@example.com.log").read_text(encoding="utf-8")
 
         self.assertFalse(result["ok"])
-        self.assertFalse(fake_driver.quit_called)
+        self.assertTrue(fake_driver.quit_called)
         self.assertFalse(fake_client.cleanup_called)
         self.assertIn("Roxy", content)
-        self.assertIn("WARNING", content)
+        self.assertNotIn("保留当前 Roxy 窗口", content)
+
+    def test_failed_setup_deletes_new_roxy_environment_after_driver_quit(self):
+        from core import db
+        from core import password_setup_task_service as service
+        from core.roxybrowser_client import RoxyOpenResult
+
+        class FakeDriver:
+            def __init__(self):
+                self.quit_called = False
+
+            def quit(self):
+                self.quit_called = True
+
+        class FakeClient:
+            def __init__(self, driver):
+                self.driver = driver
+                self.cleanup_called = False
+                self.driver_quit_before_cleanup = False
+
+            def open_profile(self, profile_id, *, allow_existing_profile=False):
+                return RoxyOpenResult("fresh-profile", {"code": 0}, created_by_run=True)
+
+            def cleanup_profile(self, opened):
+                self.cleanup_called = True
+                self.driver_quit_before_cleanup = self.driver.quit_called
+
+        fake_driver = FakeDriver()
+        fake_client = FakeClient(fake_driver)
+        account = {"id": 1, "email": "user@example.com", "extra_json": "{}"}
+        with tempfile.TemporaryDirectory() as td, patch.object(service, "_LOG_DIR", Path(td)), patch.object(
+            db, "mark_account_password_setup_running", return_value=True
+        ), patch.object(db, "get_account", return_value=account), patch.object(
+            db, "update_account_password_setup", return_value=True
+        ), patch("core.roxybrowser_client.RoxyBrowserClient", return_value=fake_client), patch(
+            "core.roxy_registration._build_driver", return_value=fake_driver
+        ), patch(
+            "core.roxy_registration._run_roxy_password_setup",
+            side_effect=RuntimeError("TimeoutException: page load timeout"),
+        ):
+            result = service._run_password_setup_task(
+                account_id=1,
+                email="user@example.com",
+                mode="post_login_add_password",
+                password="valid-password-123",
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["retryable"])
+        self.assertTrue(fake_driver.quit_called)
+        self.assertTrue(fake_client.cleanup_called)
+        self.assertTrue(fake_client.driver_quit_before_cleanup)
+
+    def test_retry_classifier_rejects_permanent_and_accepts_transient_errors(self):
+        from core.password_setup_task_service import _is_retryable_password_setup_error
+        from core.roxy_registration import PasswordAlreadySetError
+
+        self.assertFalse(_is_retryable_password_setup_error(PasswordAlreadySetError("already set")))
+        self.assertFalse(_is_retryable_password_setup_error(ValueError("password format invalid")))
+        self.assertTrue(_is_retryable_password_setup_error(RuntimeError("TimeoutException: page load timeout")))
+
+    def test_task_wrapper_releases_slot_before_scheduling_retry(self):
+        from core import password_setup_task_service as service
+
+        events = []
+
+        class Slot:
+            def release(self):
+                events.append("release")
+
+        with patch.object(
+            service,
+            "_run_password_setup_task",
+            return_value={
+                "ok": False,
+                "retryable": True,
+                "error": "TimeoutException: page load timeout",
+                "attempt": 1,
+                "max_attempts": 3,
+            },
+        ), patch.object(service, "_QUEUE_SLOTS", Slot()), patch.object(
+            service,
+            "_schedule_password_setup_retry",
+            side_effect=lambda **kwargs: events.append("retry"),
+        ):
+            result = service._run_task_wrapper(
+                account_id=1,
+                email="user@example.com",
+                mode="post_login_add_password",
+                password="valid-password-123",
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(events, ["release", "retry"])
+
+    def test_retry_schedule_does_not_enqueue_after_max_attempts(self):
+        from core import password_setup_task_service as service
+
+        with patch.object(service, "_EXECUTOR") as executor, patch.object(
+            service, "_QUEUE_SLOTS"
+        ) as slots, patch.object(service, "_append_password_setup_log"):
+            scheduled = service._schedule_password_setup_retry(
+                account_id=1,
+                email="user@example.com",
+                mode="post_login_add_password",
+                password="valid-password-123",
+                result={
+                    "ok": False,
+                    "retryable": True,
+                    "error": "TimeoutException: page load timeout",
+                    "attempt": 3,
+                    "max_attempts": 3,
+                },
+            )
+
+        self.assertFalse(scheduled)
+        executor.submit.assert_not_called()
+        slots.acquire.assert_not_called()
 
     def test_empty_password_uses_configured_setup_password(self):
         from core.password_setup_task_service import resolve_password_setup_request

@@ -20,6 +20,30 @@ class RoxyPasswordSetupTests(unittest.TestCase):
         self.assertFalse(_password_already_set_in_text("password updated"))
         self.assertTrue(issubclass(PasswordAlreadySetError, RuntimeError))
 
+    def test_password_setup_stops_otp_retry_when_page_already_advanced(self):
+        from unittest.mock import patch
+        from core.roxy_registration import _run_roxy_password_setup
+
+        driver = object()
+        with patch("core.roxy_registration._fetch_password_setup_authorize_url", return_value="https://auth.openai.com/email-verification"), patch(
+            "core.roxy_registration._safe_get"
+        ), patch(
+            "core.roxy_registration._is_email_verification_page", side_effect=[True, False]
+        ), patch(
+            "core.roxy_registration.wait_for_otp", return_value="123456"
+        ), patch("core.roxy_registration._type_otp") as type_otp, patch(
+            "core.roxy_registration._fill_password_setup_page"
+        ) as fill_password:
+            result = _run_roxy_password_setup(
+                driver,
+                "user@example.com",
+                password="valid-password-123",
+            )
+
+        self.assertEqual(result, "valid-password-123")
+        type_otp.assert_not_called()
+        fill_password.assert_called_once()
+
     def test_add_password_request_uses_same_origin_authorize_flow(self):
         request = _build_password_setup_request(
             email="user+test@example.com",

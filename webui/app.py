@@ -99,9 +99,15 @@ def _compact_account_for_list(row: dict) -> dict:
     - 时间戳、错误原因、提链详情等只在前端确实要展示时返回；空值不返回。
     - 复制/下载敏感内容时再通过 /secret 接口按需读取。
     """
+    pickup_address = str(row.get("pickup_address") or "").strip()
+    if not pickup_address and str(row.get("email_source") or "").strip().lower() == "generic_api":
+        pool_row = db.get_generic_api_email_by_email(str(row.get("email") or "").strip())
+        pickup_address = str((pool_row or {}).get("code_url") or "").strip()
+
     out = {
         "id": row.get("id"),
         "email": row.get("email"),
+        "pickup_address": pickup_address,
         "has_access_token": bool(str(row.get("access_token") or "").strip()),
         "registration_password_set": bool(_registration_password_value(row)),
         "totp_enabled": bool(row.get("totp_secret")),
@@ -110,12 +116,14 @@ def _compact_account_for_list(row: dict) -> dict:
 
     # 这些是列表固定列直接展示字段。
     for key in (
-        "user_name", "email_source", "note", "archived", "created_at",
+        "user_name", "email_source", "pickup_address", "note", "archived", "archived_at",
+        "archived_reason", "archived_source", "created_at",
         "plan_type", "current_plan_type", "plus_trial_eligible",
         "plan_check_status", "codex_status", "codex_agent_status",
         "password_setup_status", "password_setup_mode", "password_setup_ok",
         "password_setup_error", "password_setup_queued_at", "password_setup_started_at",
-        "password_setup_completed_at",
+        "password_setup_completed_at", "password_setup_attempt",
+        "password_setup_max_attempts", "password_setup_last_error",
     ):
         if key in row:
             out[key] = row.get(key)
@@ -267,6 +275,9 @@ def create_app(auth_code: str | None = None) -> Flask:
 
     init_auth(app, auth_code=auth_code)
     register_auth_routes(app)
+    recovered_password_setups = db.recover_interrupted_password_setups()
+    if recovered_password_setups:
+        logger.warning("已恢复 %s 个因 WebUI 重启中断的设置密码状态", recovered_password_setups)
     recovered_plan_checks = db.recover_interrupted_plan_checks()
     if recovered_plan_checks:
         logger.warning("已恢复 %s 个因 WebUI 重启中断的套餐查询状态", recovered_plan_checks)
@@ -503,6 +514,43 @@ def create_app(auth_code: str | None = None) -> Flask:
         skipped.extend(db_skipped)
         return jsonify({"ok": True, "updated": updated, "updated_count": len(updated), "archived": archived, "skipped": skipped})
 
+    @app.get("/api/accounts/archive-dead/preview")
+    def api_accounts_archive_dead_preview():
+        """预览当前明确 deactivated 且没有活动任务的废号候选。"""
+        items = db.list_dead_account_candidates()
+        return jsonify({"ok": True, "items": items, "count": len(items)})
+
+    @app.post("/api/accounts/archive-dead-bulk")
+    def api_accounts_archive_dead_bulk():
+        """重新校验并批量归档废号；不会删除本地账号资料。"""
+        data = request.get_json(silent=True) or {}
+        ids = data.get("account_ids") or data.get("ids") or []
+        if not isinstance(ids, list) or not ids:
+            return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
+        if len(ids) > 5000:
+            return jsonify({"ok": False, "error": "单次最多归档 5000 个账号"}), 400
+        account_ids = []
+        skipped = []
+        seen = set()
+        for raw in ids:
+            try:
+                acc_id = int(raw)
+            except (TypeError, ValueError):
+                skipped.append({"id": raw, "reason": "ID 非法"})
+                continue
+            if acc_id in seen:
+                continue
+            seen.add(acc_id)
+            account_ids.append(acc_id)
+        archived, db_skipped = db.archive_dead_accounts(account_ids, reason="dead_account_bulk")
+        skipped.extend(db_skipped)
+        return jsonify({
+            "ok": True,
+            "archived": archived,
+            "archived_count": len(archived),
+            "skipped": skipped,
+        })
+
     @app.post("/api/accounts/<int:acc_id>/delete")
     def api_account_delete(acc_id: int):
         """删除一个已注册账号记录。只删除本地保存的账号/token记录，不改邮箱池状态。"""
@@ -553,6 +601,22 @@ def create_app(auth_code: str | None = None) -> Flask:
         if not updated:
             return jsonify({"ok": False, "error": "账号不存在"}), 404
         return jsonify({"ok": True, "updated": True, "id": acc_id, "note": note})
+
+    @app.post("/api/accounts/<int:acc_id>/pickup-address")
+    def api_account_pickup_address(acc_id: int):
+        """更新账号取件地址；取件地址应为 HTTP(S) 收件接口链接。"""
+        data = request.get_json(silent=True) or {}
+        pickup_address = str(data.get("pickup_address") or "").strip()
+        if len(pickup_address) > 320:
+            return jsonify({"ok": False, "error": "取件地址最多 320 个字符"}), 400
+        if pickup_address:
+            parsed = urlparse(pickup_address)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                return jsonify({"ok": False, "error": "取件地址必须是 HTTP(S) 链接"}), 400
+        updated = db.update_account_pickup_address(acc_id, pickup_address)
+        if not updated:
+            return jsonify({"ok": False, "error": "账号不存在"}), 404
+        return jsonify({"ok": True, "updated": True, "id": acc_id, "pickup_address": pickup_address})
 
     @app.post("/api/accounts/note-bulk")
     def api_accounts_note_bulk():
@@ -2235,6 +2299,31 @@ def create_app(auth_code: str | None = None) -> Flask:
             "ok": True,
             "log": content,
             "running": live_check_service.is_checking(email),
+        })
+
+    @app.get("/api/accounts/plan-check-log")
+    def api_account_plan_check_log():
+        """读取某邮箱最近一次查套餐日志。?email=xxx"""
+        email = (request.args.get("email") or "").strip()
+        if not email:
+            return jsonify({"ok": False, "error": "email 为空"}), 400
+        p = plan_check_service.log_path(email)
+        if not p.exists():
+            row = db.get_account_by_email(email) or {}
+            status = str(row.get("plan_check_status") or "")
+            return jsonify({"ok": True, "log": "", "running": status in {"queued", "running"}})
+        max_bytes = 80_000
+        size = p.stat().st_size
+        with p.open("rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+            content = f.read().decode("utf-8", errors="replace")
+        row = db.get_account_by_email(email) or {}
+        status = str(row.get("plan_check_status") or "")
+        return jsonify({
+            "ok": True,
+            "log": content,
+            "running": status in {"queued", "running"},
         })
 
     @app.get("/api/accounts/password-setup-log")

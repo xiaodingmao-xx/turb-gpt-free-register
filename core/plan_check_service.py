@@ -8,12 +8,29 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from pathlib import Path
 
 from config import proxy as proxy_cfg
 from core import db
 from core.chatgpt_plan import check_account_plan
 
 logger = logging.getLogger(__name__)
+
+_LOG_DIR = Path(__file__).resolve().parent.parent / "注册日志"
+
+
+def log_path(email: str) -> Path:
+    safe = str(email or "").replace("/", "_").replace("\\", "_").replace(":", "_")
+    return _LOG_DIR / f"plan-check-{safe}.log"
+
+
+def _append_log(email: str, line: str, *, clear: bool = False) -> None:
+    path = log_path(email)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%H:%M:%S")
+    mode = "w" if clear else "a"
+    with path.open(mode, encoding="utf-8") as handle:
+        handle.write(f"{stamp} [INFO] {line}\n")
 
 
 def _int_setting(name: str, default: int, lower: int, upper: int) -> int:
@@ -71,6 +88,7 @@ def _run_plan_check(
         if not db.mark_account_plan_check_running(account_id):
             return {"ok": False, "error": "账号已删除或套餐查询状态已被重置"}
 
+        _append_log(email, f"[Plan] 开始后台查询 trigger={trigger}")
         _wait_for_rate_slot()
         result = check_account_plan(
             access_token,
@@ -105,6 +123,17 @@ def _run_plan_check(
                     recheck_result.get("error") or "未知错误",
                 )
 
+        _append_log(
+            email,
+            "[Plan] 请求完成 "
+            f"ok={bool(result.get('ok'))} "
+            f"http_status={result.get('http_status') or '-'} "
+            f"network_route={result.get('network_route') or '-'} "
+            f"proxy_mode={result.get('proxy_mode') or '-'} "
+            f"proxy_used={result.get('proxy_used') or '-'} "
+            f"attempt={result.get('attempt_count') or '-'} "
+            f"error={str(result.get('error') or '-')[:300]}"
+        )
         db.update_account_plan_check(acc_id=account_id, result=result)
         if result.get("ok"):
             logger.info(
@@ -128,6 +157,7 @@ def _run_plan_check(
             "checked_at": datetime.now().isoformat(timespec="seconds"),
             "error": f"{type(exc).__name__}: {str(exc)[:180]}",
         }
+        _append_log(email, f"[Plan] 后台异常 {result['error']}")
         try:
             db.update_account_plan_check(acc_id=account_id, result=result)
         except Exception:
@@ -160,6 +190,7 @@ def enqueue_account_plan_check(
         _QUEUE_SLOTS.release()
         return {"accepted": False, "busy": True, "error": "该账号正在查询套餐"}
 
+    _append_log(email, f"[Plan] 已入队 account_id={account_id} trigger={trigger}", clear=True)
     try:
         _EXECUTOR.submit(
             _run_plan_check,

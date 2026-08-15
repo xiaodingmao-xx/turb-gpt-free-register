@@ -43,6 +43,102 @@ class WebUiAccountFeatureTests(unittest.TestCase):
         self.assertIn("OAICS", html)
         self.assertIn("Stripe cs_", html)
 
+    @patch("webui.app.db.list_accounts_page")
+    def test_account_list_exposes_pickup_address(self, list_page):
+        list_page.return_value = {
+            "items": [{
+                "id": 7,
+                "email": "login@example.com",
+                "pickup_address": "https://icloud-api.top/s/token/mailbox@example.com",
+            }],
+            "total": 1,
+            "sources": [],
+            "revision": "1:now",
+        }
+        response = self.client.get("/api/accounts?paged=1&page=1&page_size=20")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["items"][0]["pickup_address"], "https://icloud-api.top/s/token/mailbox@example.com")
+
+    @patch("webui.app.db.list_accounts_page")
+    def test_account_email_is_not_used_as_pickup_address_fallback(self, list_page):
+        list_page.return_value = {
+            "items": [{"id": 7, "email": "login@example.com"}],
+            "total": 1,
+            "sources": [],
+            "revision": "1:now",
+        }
+        response = self.client.get("/api/accounts?paged=1&page=1&page_size=20")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["items"][0]["pickup_address"], "")
+
+    @patch("webui.app.db.get_generic_api_email_by_email")
+    @patch("webui.app.db.list_accounts_page")
+    def test_account_list_resolves_pickup_address_from_generic_api_pool(self, list_page, get_pool):
+        list_page.return_value = {
+            "items": [{
+                "id": 50,
+                "email": "damsel_radiate.1x@icloud.com",
+                "email_source": "generic_api",
+            }],
+            "total": 1,
+            "sources": [],
+            "revision": "1:now",
+        }
+        get_pool.return_value = {"email": "damsel_radiate.1x@icloud.com", "code_url": "https://icloud-api.top/s/token/damsel_radiate.1x@icloud.com"}
+        response = self.client.get("/api/accounts?paged=1&page=1&page_size=20")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["items"][0]["pickup_address"], "https://icloud-api.top/s/token/damsel_radiate.1x@icloud.com")
+
+    @patch("webui.app.db.update_account_pickup_address")
+    def test_account_pickup_address_can_be_updated(self, update_address):
+        response = self.client.post(
+            "/api/accounts/7/pickup-address",
+            json={"pickup_address": "https://icloud-api.top/s/token/mailbox@example.com"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["updated"])
+        update_address.assert_called_once_with(7, "https://icloud-api.top/s/token/mailbox@example.com")
+
+    @patch("webui.app.db.update_account_pickup_address")
+    def test_account_pickup_address_rejects_overlong_value(self, update_address):
+        response = self.client.post(
+            "/api/accounts/7/pickup-address",
+            json={"pickup_address": "x" * 321},
+        )
+        self.assertEqual(response.status_code, 400)
+        update_address.assert_not_called()
+
+    @patch("webui.app.db.update_account_pickup_address")
+    def test_account_pickup_address_rejects_plain_email(self, update_address):
+        response = self.client.post(
+            "/api/accounts/7/pickup-address",
+            json={"pickup_address": "mailbox@example.com"},
+        )
+        self.assertEqual(response.status_code, 400)
+        update_address.assert_not_called()
+
+    @patch("core.db._save_accounts")
+    @patch("core.db._load_accounts")
+    def test_pickup_address_update_persists_on_account_row(self, load_accounts, save_accounts):
+        from core import db
+
+        rows = [{"id": 7, "email": "login@example.com"}]
+        load_accounts.return_value = rows
+        self.assertTrue(db.update_account_pickup_address(7, "mailbox@example.com"))
+        self.assertEqual(rows[0]["pickup_address"], "mailbox@example.com")
+        save_accounts.assert_called_once_with(rows)
+
+    def test_account_templates_expose_pickup_address_column_and_editor(self):
+        root = Path(__file__).resolve().parents[1] / "webui" / "templates"
+        for name in ("index.html", "index_legacy.html"):
+            html = (root / name).read_text(encoding="utf-8")
+            self.assertIn("取件地址", html)
+            self.assertIn("data-account-pickup-address", html)
+            self.assertIn("data-account-copy-pickup-address", html)
+            self.assertTrue("复制取件地址" in html or "String.fromCharCode(22797, 21046, 21462, 20214, 22320, 22336)" in html)
+            self.assertIn("/api/accounts/", html)
+            self.assertIn("pickup-address", html)
+
     def test_account_template_hides_password_setup_for_completed_accounts(self):
         template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"
         html = template.read_text(encoding="utf-8")
@@ -74,6 +170,75 @@ class WebUiAccountFeatureTests(unittest.TestCase):
         payload = response.get_json()
         self.assertEqual(payload["items"][0]["password_setup_queue_position"], 1)
         self.assertEqual(payload["password_setup_queue"]["waiting"], 1)
+
+    @patch("webui.app.password_setup_task_service.queue_settings")
+    @patch("webui.app.db.list_accounts_page")
+    def test_account_list_exposes_password_retry_fields(self, list_page, queue_settings):
+        list_page.return_value = {
+            "items": [{
+                "id": 7,
+                "email": "user@example.com",
+                "password_setup_status": "queued",
+                "password_setup_attempt": 2,
+                "password_setup_max_attempts": 3,
+                "password_setup_last_error": "TimeoutException: page load timeout",
+            }],
+            "total": 1,
+            "sources": [],
+            "revision": "1:now",
+        }
+        queue_settings.return_value = {"positions": {"7": 1}}
+        response = self.client.get("/api/accounts?paged=1&page=1&page_size=20")
+        row = response.get_json()["items"][0]
+        self.assertEqual(row["password_setup_attempt"], 2)
+        self.assertEqual(row["password_setup_max_attempts"], 3)
+        self.assertEqual(row["password_setup_last_error"], "TimeoutException: page load timeout")
+
+    def test_account_template_displays_password_retry_attempt_and_failure_state(self):
+        template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"
+        html = template.read_text(encoding="utf-8")
+        self.assertIn("password_setup_attempt", html)
+        self.assertIn("password_setup_last_error", html)
+        self.assertIn("失败后已重新排队", html)
+        self.assertIn("最终失败", html)
+
+    @patch("webui.app.db.list_dead_account_candidates")
+    def test_dead_archive_preview_returns_non_sensitive_candidates(self, candidates):
+        candidates.return_value = [{
+            "id": 10,
+            "email": "dead@example.com",
+            "reason": "live_check_status=deactivated",
+            "live_checked_at": "2026-08-13T12:00:00",
+        }]
+        response = self.client.get("/api/accounts/archive-dead/preview")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["items"][0]["id"], 10)
+        self.assertNotIn("access_token", response.get_data(as_text=True))
+
+    @patch("webui.app.db.archive_dead_accounts")
+    def test_dead_archive_bulk_returns_archived_and_skipped_counts(self, archive):
+        archive.return_value = (
+            [{"id": 10, "email": "dead@example.com", "archived": True}],
+            [{"id": 11, "reason": "当前状态已不是明确废号"}],
+        )
+        response = self.client.post(
+            "/api/accounts/archive-dead-bulk",
+            json={"account_ids": [10, 11]},
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["archived_count"], 1)
+        self.assertEqual(len(payload["skipped"]), 1)
+        archive.assert_called_once_with([10, 11], reason="dead_account_bulk")
+
+    def test_account_template_contains_dead_archive_action(self):
+        template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"
+        html = template.read_text(encoding="utf-8")
+        self.assertIn("一键归档废号", html)
+        self.assertIn("/api/accounts/archive-dead/preview", html)
+        self.assertIn("/api/accounts/archive-dead-bulk", html)
 
     @patch("webui.app.password_setup_task_service.enqueue_account_password_setup")
     @patch("webui.app.db.get_account")
@@ -213,6 +378,27 @@ class WebUiAccountFeatureTests(unittest.TestCase):
         payload = response.get_json()
         self.assertTrue(payload["running"])
         self.assertIn("[设置密码] 已入队", payload["log"])
+
+    @patch("webui.app.plan_check_service.log_path")
+    @patch("webui.app.db.get_account_by_email")
+    def test_plan_check_log_endpoint_returns_log_and_running_state(self, get_account, log_path):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "plan-check-user.log"
+            path.write_text("13:00:00 [INFO] [Plan] queued\n", encoding="utf-8")
+            log_path.return_value = path
+            get_account.return_value = {"id": 7, "email": "user@example.com", "plan_check_status": "running"}
+            response = self.client.get("/api/accounts/plan-check-log?email=user%40example.com")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["running"])
+        self.assertIn("[Plan] queued", payload["log"])
+
+    def test_account_templates_expose_plan_check_log_action(self):
+        root = Path(__file__).resolve().parents[1] / "webui" / "templates"
+        for name in ("index.html", "index_legacy.html"):
+            html = (root / name).read_text(encoding="utf-8")
+            self.assertIn("data-account-plan-log", html)
+            self.assertIn("plan-check-log", html)
 
     def test_password_setup_request_does_not_send_plaintext_password_from_browser(self):
         template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"

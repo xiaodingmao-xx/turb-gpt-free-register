@@ -654,6 +654,7 @@
     }
     .accounts-table-v2 .col-id { width: 72px; }
     .accounts-table-v2 .col-email { width: 240px; }
+    .accounts-table-v2 .col-pickup-address { width: 220px; }
     .accounts-table-v2 .col-source { width: 90px; }
     .accounts-table-v2 .col-token { width: 100px; }
     .accounts-table-v2 .col-password { width: 170px; }
@@ -705,6 +706,14 @@
     .accounts-table-v2 .acc-v2-sub {
       margin-top: 2px; color: #909399; font-size: 12px; line-height: 1.3;
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .accounts-table-v2 .acc-v2-pickup {
+      margin-top: 3px; color: #667085; font-size: 11px; line-height: 1.35;
+      white-space: normal; overflow-wrap: anywhere;
+    }
+    .accounts-table-v2 .acc-v2-pickup-copy {
+      min-height: 24px; margin-top: 4px; border: 1px solid #bdd0ff; border-radius: 999px;
+      padding: 0 9px; background: #f3f7ff; color: #1d4ed8; font-size: 11px; font-weight: 800; cursor: pointer;
     }
     .accounts-table-v2 .acc-v2-muted { color: #c0c4cc; }
     .accounts-table-v2 .pill {
@@ -2087,7 +2096,7 @@
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnCopySelectedLinesV2" disabled title="复制选中账号的完整整行，每个账号一行">复制行</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnDownloadSelectedTxtV2" disabled title="把选中账号的完整整行保存为 TXT 文件，每个账号一行">下载TXT</button>
           <button type="button" class="jobs-tb-btn" id="btnArchiveSelectedAccountsV2" disabled title="归档选中的账号；默认账号列表将不再查询/显示这些账号">归档选中</button>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--danger" id="btnDeleteSelectedAccountsV2" disabled title="删除选中的本地账号/token记录">删除</button>
+          <button type="button" class="jobs-tb-btn jobs-tb-btn--danger" id="btnArchiveDeadAccountsV2" title="预览并归档明确判定为 deactivated 的废号，不删除账号数据">一键归档废号</button>
         </div>
         <div class="acc-v2-btn-group">
           <span class="acc-v2-btn-group-title">全部</span>
@@ -3372,6 +3381,9 @@ function _tokenCellV2(r) {
 }
 function _registrationPasswordCell(r) {
   const setupStatus = String(r.password_setup_status || '');
+  const setupAttempt = Number(r.password_setup_attempt || 1);
+  const setupMaxAttempts = Number(r.password_setup_max_attempts || 3);
+  const setupLastError = r.password_setup_last_error || '';
   const passwordDone = Boolean(r.registration_password_set) || ['success', 'already_set'].includes(setupStatus);
   if (passwordDone) {
     if (!r.registration_password_set) {
@@ -3385,13 +3397,17 @@ function _registrationPasswordCell(r) {
   }
   if (setupStatus === 'queued') {
     const position = Number(r.password_setup_queue_position || 0);
-    const label = position > 0 ? `设置密码排队中（第 ${position} 位）` : '设置密码排队中';
-    return `<span class="pill status-running" title="队列位置：第 ${position || '?'} 位">${label}</span>`;
+    const retryLabel = setupAttempt > 1 ? `失败后已重新排队（第 ${setupAttempt}/${setupMaxAttempts} 次）` : '设置密码排队中';
+    const label = position > 0 ? `${retryLabel} · 队列第 ${position} 位` : retryLabel;
+    const title = setupLastError ? `上次失败：${esc(setupLastError)}` : `队列位置：第 ${position || '?'} 位`;
+    return `<span class="pill status-running" title="${title}">${label}</span>`;
   }
   if (setupStatus === 'running') return '<span class="pill status-running">设置密码执行中</span>';
   if (setupStatus === 'failed') {
-    const err = r.password_setup_error ? ` title="${esc(r.password_setup_error)}"` : '';
-    return `<span class="pill status-failed"${err}>设置失败</span>`;
+    const error = r.password_setup_error || setupLastError;
+    const err = error ? ` title="${esc(error)}"` : '';
+    const label = setupAttempt >= setupMaxAttempts ? `最终失败（已尝试 ${setupAttempt}/${setupMaxAttempts} 次）` : '设置失败';
+    return `<span class="pill status-failed"${err}>${label}</span>`;
   }
   if (!r.registration_password_set) {
     return '<span class="acc-v2-muted">未设置</span>';
@@ -3404,9 +3420,11 @@ function _accountsV2MoreMenu(r) {
     `<button type="button" data-account-copy-secret="copy_line" data-account-id="${esc(r.id)}">复制整行</button>`,
     !passwordDone ? `<button type="button" data-account-password-setup="${esc(r.id)}" title="为该账号添加或重设密码">设置密码</button>` : '',
     `<button type="button" data-account-password-log="${esc(r.email)}" title="查看该账号最近一次设置密码日志">设置密码日志</button>`,
+    `<button type="button" data-account-pickup-address="${esc(r.id)}" title="设置该账号取件地址">取件地址</button>`,
     `<button type="button" data-account-note="${esc(r.id)}" title="设置/清空该账号备注">备注</button>`,
     `<button type="button" onclick="checkSelectedLive([Number('${esc(r.id)}')], this); return false;" title="重新登录该账号，成功则刷新最新 AT/accessToken">查活刷新AT</button>`,
     `<button type="button" data-account-live-log="${esc(r.email)}" title="查看该账号最近一次查活日志">查活日志</button>`,
+    `<button type="button" data-account-plan-log="${esc(r.email)}" title="查看该账号最近一次查套餐日志">查套餐日志</button>`,
     _planAction(r),
     _extractLinkAction(r),
     _codexAction(r),
@@ -3447,6 +3465,7 @@ function renderAccounts() {
       <td class="col-email" title="${esc(r.email || '')}">
         <div class="acc-v2-email">${esc(r.email)}${r.archived ? ' <span class="pill status-used" title="该账号已归档">归档</span>' : ''}</div>
         <div class="acc-v2-sub">${esc(r.user_name || '-')}</div>
+        ${r.pickup_address ? `<div class="acc-v2-pickup" title="${esc(r.pickup_address)}">${esc(r.pickup_address)}</div><button type="button" class="acc-v2-pickup-copy" data-account-copy-pickup-address="${esc(r.id)}">复制取件地址</button>` : '<div class="acc-v2-pickup acc-v2-muted">未设置取件地址</div>'}
       </td>
       <td class="col-source">${esc(r.email_source || '-')}</td>
       <td class="col-token">${_tokenCellV2(r)}</td>
@@ -3493,7 +3512,7 @@ function updateAccountSelectionUi(pageRows = null) {
     'btnGenerateSelectedAgentV2', 'btnDownloadSelectedAgentV2', 'btnUploadSelectedAgentSub2V2',
     'btnRetrySelectedCodexV2', 'btnDownloadSelectedCpaV2', 'btnStopSelectedCodexV2',
     'btnPasswordSetupSelectedV2', 'btnNoteSelectedAccountsV2', 'btnCopySelectedLinesV2',
-    'btnDownloadSelectedTxtV2', 'btnArchiveSelectedAccountsV2', 'btnDeleteSelectedAccountsV2',
+    'btnDownloadSelectedTxtV2', 'btnArchiveSelectedAccountsV2',
   ];
   v2Ids.forEach(id => {
     const el = document.getElementById(id);
@@ -3550,8 +3569,9 @@ let liveLogEmail = null, liveLogTimer = null, liveLogKind = 'live', accountLogPe
 
 function openAccountLog(email, kind = 'live', pending = false) {
   liveLogEmail = email;
-  liveLogKind = kind === 'password' ? 'password' : 'live';
+  liveLogKind = ['password', 'plan'].includes(kind) ? kind : 'live';
   accountLogPending = !!pending;
+  if (liveLogKind === 'plan') $('#liveLogTitle').textContent = '查套餐日志：';
   $('#liveLogTitle').textContent = liveLogKind === 'password' ? '设置密码日志：' : '查活日志：';
   $('#liveLogEmail').textContent = email;
   $('#liveLogPanel').classList.remove('hidden');
@@ -3563,10 +3583,11 @@ function openAccountLog(email, kind = 'live', pending = false) {
 }
 function openLiveLog(email) { openAccountLog(email, 'live', false); }
 function openPasswordSetupLog(email, pending = false) { openAccountLog(email, 'password', pending); }
+function openPlanCheckLog(email) { openAccountLog(email, 'plan', false); }
 async function pollAccountLog() {
   if (!liveLogEmail) return;
   try {
-    const endpoint = liveLogKind === 'password' ? 'password-setup-log' : 'live-check-log';
+    const endpoint = liveLogKind === 'password' ? 'password-setup-log' : liveLogKind === 'plan' ? 'plan-check-log' : 'live-check-log';
     const r = await api(`/api/accounts/${endpoint}?email=${encodeURIComponent(liveLogEmail)}`);
     const c = $('#liveLogContent');
     const atBottom = c.scrollTop + c.clientHeight >= c.scrollHeight - 30;
@@ -3786,6 +3807,16 @@ async function onAccountsBodyClick(e) {
     return;
   }
 
+  const pickupCopyBtn = e.target.closest('[data-account-copy-pickup-address]');
+  if (pickupCopyBtn) {
+    const account = ACCOUNTS.find(a => Number(a.id) === Number(pickupCopyBtn.dataset.accountCopyPickupAddress));
+    const pickupAddress = account ? String(account.pickup_address || '') : '';
+    if (!pickupAddress) { showToast('该账号没有取件地址'); return; }
+    copyText(pickupAddress);
+    showToast('取件地址已复制');
+    return;
+  }
+
   const copySecretBtn = e.target.closest('[data-account-copy-secret]');
   if (copySecretBtn) {
     const id = Number(copySecretBtn.dataset.accountId);
@@ -3822,6 +3853,12 @@ async function onAccountsBodyClick(e) {
     return;
   }
 
+  const planLogBtn = e.target.closest('[data-account-plan-log]');
+  if (planLogBtn) {
+    openPlanCheckLog(planLogBtn.dataset.accountPlanLog);
+    return;
+  }
+
   const delBtn = e.target.closest('[data-account-delete]');
   if (delBtn) {
     await deleteAccount(Number(delBtn.dataset.accountDelete), delBtn.dataset.email, delBtn);
@@ -3837,6 +3874,12 @@ async function onAccountsBodyClick(e) {
   const noteBtn = e.target.closest('[data-account-note]');
   if (noteBtn) {
     await editAccountNote(Number(noteBtn.dataset.accountNote), noteBtn);
+    return;
+  }
+
+  const pickupAddressBtn = e.target.closest('[data-account-pickup-address]');
+  if (pickupAddressBtn) {
+    await editAccountPickupAddress(Number(pickupAddressBtn.dataset.accountPickupAddress), pickupAddressBtn);
     return;
   }
 
@@ -4515,6 +4558,37 @@ async function deleteSelectedAccounts() {
   }
 }
 
+async function archiveDeadAccounts(btn = $('#btnArchiveDeadAccountsV2')) {
+  if (btn) btn.disabled = true;
+  try {
+    const preview = await api('/api/accounts/archive-dead/preview');
+    const items = preview.items || [];
+    if (!items.length) {
+      showToast('没有可归档的明确废号');
+      return;
+    }
+    const sample = items.slice(0, 5).map(item => `${item.email || ('#' + item.id)}（${item.reason || 'deactivated'}）`).join('\\n');
+    const suffix = items.length > 5 ? `\\n……等 ${items.length} 个账号` : '';
+    if (!confirm(`发现 ${items.length} 个明确废号，是否归档？\\n\\n${sample}${suffix}\\n\\n只会修改本地归档状态，不删除账号资料、Token、邮箱或 Roxy 环境。`)) return;
+    const result = await api('/api/accounts/archive-dead-bulk', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({account_ids: items.map(item => item.id)}),
+    });
+    const skippedCount = (result.skipped || []).length;
+    showToast(skippedCount
+      ? `已归档 ${result.archived_count || 0} 个，跳过 ${skippedCount} 个`
+      : `已归档 ${result.archived_count || 0} 个废号`);
+    ACCOUNT_SELECTED.clear();
+    await loadAccounts();
+    loadSummary();
+  } catch (err) {
+    showToast('一键归档废号失败: ' + err.message);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 async function editAccountNote(id, btn) {
   const acc = ACCOUNTS.find(a => Number(a.id) === Number(id));
   if (!acc) { showToast('账号不存在'); return; }
@@ -4532,6 +4606,28 @@ async function editAccountNote(id, btn) {
     loadAccounts();
   } catch(err) {
     showToast('保存备注失败: ' + err.message);
+    btn.disabled = false;
+  }
+}
+
+async function editAccountPickupAddress(id, btn) {
+  const acc = ACCOUNTS.find(a => Number(a.id) === Number(id));
+  if (!acc) { showToast('账号不存在'); return; }
+  const current = acc.pickup_address || '';
+  const pickupAddress = prompt(`设置账号取件地址（请输入收件接口链接）\n\n${acc.email || ('#' + id)}`, current);
+  if (pickupAddress === null) return;
+  if (pickupAddress.length > 320) { showToast('取件地址最多 320 个字符'); return; }
+  btn.disabled = true;
+  try {
+    await api(`/api/accounts/${id}/pickup-address`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({pickup_address: pickupAddress}),
+    });
+    showToast(pickupAddress.trim() ? '取件地址已保存' : '取件地址已清空');
+    loadAccounts();
+  } catch(err) {
+    showToast('保存取件地址失败: ' + err.message);
     btn.disabled = false;
   }
 }
@@ -4667,7 +4763,7 @@ async function copySelectedAccountTokens() {
   bind('btnCopyAllLinesV2', copyCurrentPageLines);
   bind('btnDownloadSelectedTxtV2', downloadSelectedAccountTxt);
   bind('btnArchiveSelectedAccountsV2', archiveSelectedAccounts);
-  bind('btnDeleteSelectedAccountsV2', deleteSelectedAccounts);
+  bind('btnArchiveDeadAccountsV2', archiveDeadAccounts);
 })();
 
 // ---------- 邮箱池 ----------

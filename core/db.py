@@ -519,6 +519,7 @@ def _decorate_account(row: dict) -> dict:
     out = dict(row)
     out["note"] = out.get("note") or ""
     out["note_updated_at"] = out.get("note_updated_at") or ""
+    out["pickup_address"] = str(out.get("pickup_address") or "")
     plan_status = out.get("plan_check_status")
     if plan_status in {"queued", "running"}:
         try:
@@ -707,6 +708,8 @@ def claim_account_codex_agent(acc_id: int, trigger: str = "manual") -> bool:
         row = next((r for r in accounts if int(r.get("id") or 0) == int(acc_id)), None)
         if row is None:
             return False
+        if bool(row.get("archived")):
+            return False
         current_status = row.get("codex_agent_status")
         if current_status in {"queued", "running"}:
             try:
@@ -829,6 +832,8 @@ def claim_account_plan_check(
             or (target_email and (r.get("email") or "").lower() == target_email)
         ), None)
         if row is None:
+            return False
+        if bool(row.get("archived")):
             return False
 
         current_status = row.get("plan_check_status")
@@ -992,6 +997,8 @@ def claim_account_extract(acc_id: int, trigger: str = "manual", link_type: str =
         accounts = _load_accounts()
         row = next((r for r in accounts if int(r.get("id") or 0) == int(acc_id)), None)
         if row is None:
+            return False
+        if bool(row.get("archived")):
             return False
         current_status = row.get("extract_link_status")
         if current_status in {"queued", "running"}:
@@ -1359,17 +1366,27 @@ def get_account_by_email(email: str) -> dict | None:
         return _decorate_account(row) if row else None
 
 
-def claim_account_password_setup(acc_id: int, mode: str = "post_login_add_password", trigger: str = "manual") -> bool:
+def claim_account_password_setup(
+    acc_id: int,
+    mode: str = "post_login_add_password",
+    trigger: str = "manual",
+    max_attempts: int = 3,
+) -> bool:
     """原子占用账号设置密码任务，避免同一账号被重复提交。"""
     with _LOCK:
         rows = _load_accounts()
         row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
         if row is None:
             return False
+        if bool(row.get("archived")):
+            return False
         if str(row.get("password_setup_status") or "") in {"queued", "running"}:
             return False
         now = _now()
         row["password_setup_status"] = "queued"
+        row["password_setup_attempt"] = 1
+        row["password_setup_max_attempts"] = max(1, int(max_attempts))
+        row["password_setup_last_error"] = None
         row["password_setup_mode"] = str(mode or "post_login_add_password")
         row["password_setup_trigger"] = str(trigger or "manual")
         row["password_setup_queued_at"] = now
@@ -1377,6 +1394,34 @@ def claim_account_password_setup(acc_id: int, mode: str = "post_login_add_passwo
         row["password_setup_completed_at"] = None
         row["password_setup_ok"] = None
         row["password_setup_error"] = None
+        row["updated_at"] = now
+        _save_accounts(rows)
+        return True
+
+
+def requeue_account_password_setup(
+    acc_id: int,
+    error: str,
+    *,
+    attempt: int,
+    max_attempts: int,
+) -> bool:
+    """设置密码临时失败后重新排队；新的 queued_at 保证任务进入队尾。"""
+    with _LOCK:
+        rows = _load_accounts()
+        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        if row is None:
+            return False
+        now = _now()
+        row["password_setup_status"] = "queued"
+        row["password_setup_attempt"] = max(1, int(attempt))
+        row["password_setup_max_attempts"] = max(1, int(max_attempts))
+        row["password_setup_last_error"] = str(error or "")[:500]
+        row["password_setup_error"] = None
+        row["password_setup_queued_at"] = now
+        row["password_setup_started_at"] = None
+        row["password_setup_completed_at"] = None
+        row["password_setup_ok"] = None
         row["updated_at"] = now
         _save_accounts(rows)
         return True
@@ -1411,6 +1456,7 @@ def update_account_password_setup(acc_id: int, result: dict | None = None) -> bo
         row["password_setup_ok"] = ok
         row["password_setup_completed_at"] = now
         row["password_setup_error"] = None if ok else str(result.get("error") or "设置密码失败")[:500]
+        row["password_setup_last_error"] = None if ok else row["password_setup_error"]
         if ok and str(result.get("password") or "").strip():
             raw = row.get("extra_json")
             if isinstance(raw, dict):
@@ -1431,6 +1477,28 @@ def update_account_password_setup(acc_id: int, result: dict | None = None) -> bo
         return True
 
 
+def recover_interrupted_password_setups() -> int:
+    """服务重启后清理没有进程内密码可继续执行的设置密码任务。"""
+    with _LOCK:
+        rows = _load_accounts()
+        recovered = 0
+        now = _now()
+        message = "WebUI 重启导致设置密码任务中断，请手动重新提交"
+        for row in rows:
+            if str(row.get("password_setup_status") or "") not in {"queued", "running"}:
+                continue
+            row["password_setup_status"] = "failed"
+            row["password_setup_ok"] = False
+            row["password_setup_error"] = message
+            row["password_setup_last_error"] = message
+            row["password_setup_completed_at"] = now
+            row["updated_at"] = now
+            recovered += 1
+        if recovered:
+            _save_accounts(rows)
+        return recovered
+
+
 def update_account_note(acc_id: int, note: str) -> bool:
     """更新单个已注册账号备注。note 为空字符串时表示清空备注。"""
     with _LOCK:
@@ -1441,6 +1509,20 @@ def update_account_note(acc_id: int, note: str) -> bool:
         now = _now()
         row["note"] = str(note or "")
         row["note_updated_at"] = now
+        row["updated_at"] = now
+        _save_accounts(rows)
+        return True
+
+
+def update_account_pickup_address(acc_id: int, pickup_address: str) -> bool:
+    """更新账号取件地址；清空后列表显示为空。"""
+    with _LOCK:
+        rows = _load_accounts()
+        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        if row is None:
+            return False
+        now = _now()
+        row["pickup_address"] = str(pickup_address or "").strip()
         row["updated_at"] = now
         _save_accounts(rows)
         return True
@@ -1500,6 +1582,8 @@ def claim_account_live_check(acc_id: int, trigger: str = "manual") -> bool:
         rows = _load_accounts()
         row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
         if row is None:
+            return False
+        if bool(row.get("archived")):
             return False
         if row.get("live_check_status") in {"queued", "running"}:
             try:
@@ -1598,6 +1682,12 @@ def archive_account(acc_id: int, archived: bool = True) -> bool:
         now = _now()
         row["archived"] = bool(archived)
         row["archived_at"] = now if archived else None
+        if archived:
+            row["archived_reason"] = row.get("archived_reason") or "manual"
+            row["archived_source"] = row.get("archived_source") or "manual"
+        else:
+            row["archived_reason"] = None
+            row["archived_source"] = None
         row["updated_at"] = now
         _save_accounts(rows)
         return True
@@ -1618,6 +1708,12 @@ def archive_accounts(account_ids: list[int] | None, archived: bool = True) -> tu
                 continue
             row["archived"] = bool(archived)
             row["archived_at"] = now if archived else None
+            if archived:
+                row["archived_reason"] = row.get("archived_reason") or "manual"
+                row["archived_source"] = row.get("archived_source") or "manual"
+            else:
+                row["archived_reason"] = None
+                row["archived_source"] = None
             row["updated_at"] = now
             updated.append({"id": row_id, "email": row.get("email"), "archived": bool(archived), "archived_at": row.get("archived_at")})
             seen_ids.add(row_id)
@@ -1626,6 +1722,106 @@ def archive_accounts(account_ids: list[int] | None, archived: bool = True) -> tu
         if updated:
             _save_accounts(rows)
     return updated, skipped
+
+
+def is_dead_account_candidate(row: dict | None) -> bool:
+    """只接受明确 deactivated，代理/网络失败不算废号。"""
+    row = row or {}
+    return (
+        str(row.get("live_check_status") or "").lower() == "deactivated"
+        or str(row.get("codex_status") or "").lower() == "deactivated"
+    )
+
+
+def has_running_account_task(row: dict | None) -> bool:
+    row = row or {}
+    task_statuses = (
+        "password_setup_status",
+        "live_check_status",
+        "plan_check_status",
+        "extract_link_status",
+        "codex_agent_status",
+    )
+    return any(str(row.get(key) or "").lower() in {"queued", "running"} for key in task_statuses) or (
+        str(row.get("codex_status") or "").lower() == "retrying"
+    )
+
+
+def _dead_account_reason(row: dict) -> str:
+    reasons = []
+    if str(row.get("live_check_status") or "").lower() == "deactivated":
+        reasons.append("live_check_status=deactivated")
+    if str(row.get("codex_status") or "").lower() == "deactivated":
+        reasons.append("codex_status=deactivated")
+    return ",".join(reasons)
+
+
+def list_dead_account_candidates(account_ids: list[int] | None = None) -> list[dict]:
+    """返回不含敏感字段的、当前可归档的废号候选。"""
+    ids = None if account_ids is None else {int(x) for x in account_ids}
+    with _LOCK:
+        rows = _load_accounts()
+        candidates = []
+        for row in rows:
+            row_id = int(row.get("id") or 0)
+            if ids is not None and row_id not in ids:
+                continue
+            if bool(row.get("archived")) or not is_dead_account_candidate(row) or has_running_account_task(row):
+                continue
+            candidates.append({
+                "id": row_id,
+                "email": row.get("email"),
+                "reason": _dead_account_reason(row),
+                "live_checked_at": row.get("live_checked_at"),
+            })
+        return candidates
+
+
+def archive_dead_accounts(
+    account_ids: list[int] | None = None,
+    *,
+    reason: str = "dead_account_bulk",
+) -> tuple[list[dict], list[dict]]:
+    """原子复核并归档明确废号；正在执行的账号只跳过，不强停任务。"""
+    ids = None if account_ids is None else {int(x) for x in account_ids}
+    archived_rows: list[dict] = []
+    skipped: list[dict] = []
+    with _LOCK:
+        rows = _load_accounts()
+        seen_ids: set[int] = set()
+        now = _now()
+        for row in rows:
+            row_id = int(row.get("id") or 0)
+            if ids is not None and row_id not in ids:
+                continue
+            seen_ids.add(row_id)
+            if bool(row.get("archived")):
+                skipped.append({"id": row_id, "reason": "账号已经归档"})
+                continue
+            if not is_dead_account_candidate(row):
+                skipped.append({"id": row_id, "reason": "当前状态已不是明确废号"})
+                continue
+            if has_running_account_task(row):
+                skipped.append({"id": row_id, "reason": "账号仍有任务执行中"})
+                continue
+            row["archived"] = True
+            row["archived_at"] = now
+            row["archived_reason"] = str(reason or "dead_account_bulk")[:100]
+            row["archived_source"] = "live_or_codex_deactivated"
+            row["updated_at"] = now
+            archived_rows.append({
+                "id": row_id,
+                "email": row.get("email"),
+                "archived": True,
+                "archived_at": now,
+                "reason": _dead_account_reason(row),
+            })
+        if ids is not None:
+            for item in ids - seen_ids:
+                skipped.append({"id": item, "reason": "账号不存在"})
+        if archived_rows:
+            _save_accounts(rows)
+    return archived_rows, skipped
 
 
 def count_accounts() -> int:

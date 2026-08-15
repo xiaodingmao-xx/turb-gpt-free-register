@@ -98,6 +98,50 @@ def redact_password(message: str, password: str) -> str:
     return text[:500]
 
 
+def _is_retryable_password_setup_error(error: Exception) -> bool:
+    """判断设置密码错误是否适合重新排到队尾重试。"""
+    if error is None:
+        return False
+    if error.__class__.__name__ == "PasswordAlreadySetError":
+        return False
+    if isinstance(error, (ValueError, TypeError, KeyError, AttributeError)):
+        return False
+    text = str(error or "").lower()
+    permanent_markers = (
+        "password format",
+        "密码长度",
+        "密码格式",
+        "模式无效",
+        "邮箱为空",
+        "账号不存在",
+        "password_already_set",
+        "already set",
+    )
+    if any(marker.lower() in text for marker in permanent_markers):
+        return False
+    transient_markers = (
+        "timeout",
+        "time out",
+        "aborterror",
+        "roxy api",
+        "http 5",
+        "connection",
+        "network",
+        "proxyerror",
+        "otp",
+        "验证码",
+        "页面",
+        "browser/open",
+    )
+    return isinstance(error, (TimeoutError, ConnectionError, RuntimeError)) or any(
+        marker.lower() in text for marker in transient_markers
+    )
+
+
+def _max_password_setup_attempts() -> int:
+    return _bounded_int("ROXY_PASSWORD_SETUP_MAX_RETRIES", 3, 1, 10)
+
+
 def _stored_registration_password(account: dict | None) -> str:
     account = account or {}
     direct = str(account.get("registration_password") or "").strip()
@@ -253,12 +297,22 @@ def _run_password_setup_task(*, account_id: int, email: str, mode: str, password
     opened = None
     client = None
     succeeded = False
+    attempt = 1
+    max_attempts = _max_password_setup_attempts()
     try:
         _append_password_setup_log(email, f"[设置密码] 开始后台执行 account_id={account_id} mode={mode}")
         if not db.mark_account_password_setup_running(account_id):
             _append_password_setup_log(email, "[设置密码] 任务状态已失效，取消执行", level="WARNING")
             raise RuntimeError("设置密码任务状态已失效")
         account = db.get_account(account_id)
+        try:
+            attempt = max(1, int((account or {}).get("password_setup_attempt") or 1))
+            max_attempts = max(
+                1,
+                int((account or {}).get("password_setup_max_attempts") or max_attempts),
+            )
+        except (TypeError, ValueError):
+            attempt = 1
         profile_id = _profile_id(account or {})
         _append_password_setup_log(email, "[设置密码] 已读取账号配置")
         if not profile_id:
@@ -281,7 +335,14 @@ def _run_password_setup_task(*, account_id: int, email: str, mode: str, password
             password=password,
             progress_callback=lambda message: _append_password_setup_log(email, message),
         )
-        result = {"ok": True, "password": saved, "completed_at": datetime.now().isoformat(timespec="seconds")}
+        result = {
+            "ok": True,
+            "password": saved,
+            "retryable": False,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "completed_at": datetime.now().isoformat(timespec="seconds"),
+        }
         db.update_account_password_setup(account_id, result)
         succeeded = True
         _append_password_setup_log(email, f"[设置密码] 完成：密码已设置 mode={mode}")
@@ -290,6 +351,9 @@ def _run_password_setup_task(*, account_id: int, email: str, mode: str, password
         result = {
             "ok": True,
             "already_set": True,
+            "retryable": False,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
             "completed_at": datetime.now().isoformat(timespec="seconds"),
         }
         db.update_account_password_setup(account_id, result)
@@ -300,6 +364,9 @@ def _run_password_setup_task(*, account_id: int, email: str, mode: str, password
         error_text = redact_password(f"{type(exc).__name__}: {exc}", password)
         result = {
             "ok": False,
+            "retryable": _is_retryable_password_setup_error(exc),
+            "attempt": attempt,
+            "max_attempts": max_attempts,
             "completed_at": datetime.now().isoformat(timespec="seconds"),
             "error": error_text,
         }
@@ -324,21 +391,23 @@ def _run_password_setup_task(*, account_id: int, email: str, mode: str, password
             logger.exception("设置密码失败状态写回失败 account_id=%s", account_id)
         return result
     finally:
-        if driver is not None and succeeded:
+        if driver is not None:
             try:
                 driver.quit()
             except Exception:
-                pass
-        elif driver is not None and not succeeded:
-            _append_password_setup_log(
-                email,
-                "[设置密码] 任务失败，保留当前 Roxy 窗口和页面用于排查；成功后才会自动关闭环境",
-                level="WARNING",
+                logger.exception("关闭 Roxy 浏览器失败 profile_id=%s", getattr(opened, "profile_id", ""))
+        should_cleanup = bool(opened is not None and opened.profile_id and (
+            succeeded
+            or (
+                bool(getattr(opened, "created_by_run", False))
+                and bool(getattr(roxy_cfg, "ROXY_PASSWORD_SETUP_DELETE_TEMP_PROFILE_ON_FAILURE", True))
             )
-        if opened is not None and opened.profile_id and succeeded:
+        ))
+        if should_cleanup:
             try:
                 client.cleanup_profile(opened)
-                _append_password_setup_log(email, "[设置密码] 已关闭 Roxy 环境")
+                action = "已关闭并清理 Roxy 临时环境" if not succeeded else "已关闭 Roxy 环境"
+                _append_password_setup_log(email, f"[设置密码] {action} profile_id={opened.profile_id}")
             except Exception:
                 logger.exception("关闭 Roxy 环境失败 profile_id=%s", opened.profile_id)
 
@@ -377,7 +446,13 @@ def enqueue_account_password_setup(
         }
     if not _QUEUE_SLOTS.acquire(blocking=False):
         return {"accepted": False, "busy": False, "queue_full": True, "error": "设置密码队列已满，请稍后重试"}
-    if not db.claim_account_password_setup(int(account_id), mode=mode, trigger=trigger):
+    max_attempts = _max_password_setup_attempts()
+    if not db.claim_account_password_setup(
+        int(account_id),
+        mode=mode,
+        trigger=trigger,
+        max_attempts=max_attempts,
+    ):
         _QUEUE_SLOTS.release()
         return {"accepted": False, "busy": True, "error": "该账号正在设置密码"}
     _append_password_setup_log(
@@ -411,15 +486,79 @@ def enqueue_account_password_setup(
     }
 
 
+def _schedule_password_setup_retry(
+    *, account_id: int, email: str, mode: str, password: str, result: dict
+) -> bool:
+    attempt = max(1, int(result.get("attempt") or 1))
+    max_attempts = max(1, int(result.get("max_attempts") or _max_password_setup_attempts()))
+    if not result.get("retryable") or attempt >= max_attempts:
+        return False
+
+    next_attempt = attempt + 1
+    error = str(result.get("error") or "设置密码失败")[:500]
+    if not db.requeue_account_password_setup(
+        account_id,
+        error,
+        attempt=next_attempt,
+        max_attempts=max_attempts,
+    ):
+        return False
+
+    # 当前 wrapper 已经释放自己的槽位，重试重新占用一个槽位后再提交。
+    _QUEUE_SLOTS.acquire()
+    try:
+        future = _EXECUTOR.submit(
+            _run_task_wrapper,
+            account_id=account_id,
+            email=email,
+            mode=mode,
+            password=password,
+        )
+    except Exception as exc:
+        _QUEUE_SLOTS.release()
+        db.update_account_password_setup(
+            account_id,
+            {"ok": False, "error": f"重试入队失败: {type(exc).__name__}: {exc}"},
+        )
+        _append_password_setup_log(
+            email,
+            f"[设置密码] 自动重试入队失败：{type(exc).__name__}: {exc}",
+            level="ERROR",
+        )
+        return False
+
+    _append_password_setup_log(
+        email,
+        f"[设置密码] 失败后已重新排队 attempt={next_attempt}/{max_attempts} "
+        f"queue_tail=true error={error}",
+        level="WARNING",
+    )
+    # 仅保持 Future 的可追踪性，任务状态仍由账号记录和日志提供。
+    return future is not None
+
+
 def _run_task_wrapper(*, account_id: int, email: str, mode: str, password: str) -> dict:
     with _LOCK:
         _ACTIVE.add(int(account_id))
+    result = {}
     try:
-        return _run_password_setup_task(account_id=account_id, email=email, mode=mode, password=password)
+        result = _run_password_setup_task(account_id=account_id, email=email, mode=mode, password=password)
+        return result
     finally:
         with _LOCK:
             _ACTIVE.discard(int(account_id))
         _QUEUE_SLOTS.release()
+        if result and not result.get("ok"):
+            try:
+                _schedule_password_setup_retry(
+                    account_id=account_id,
+                    email=email,
+                    mode=mode,
+                    password=password,
+                    result=result,
+                )
+            except Exception:
+                logger.exception("设置密码自动重试调度失败 account_id=%s", account_id)
 
 
 def queue_settings() -> dict:
