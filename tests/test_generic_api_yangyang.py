@@ -1,8 +1,16 @@
 # -*- coding: utf-8 -*-
 import base64
 import unittest
+from unittest.mock import patch
 
-from core.generic_api_mail_client import _decode_data_uri, _fetch_yangyang_otp, _parse_yangyang_code_url
+from core.generic_api_mail_client import (
+    GenericApiEmailAccount,
+    GenericApiMailError,
+    _decode_data_uri,
+    _fetch_yangyang_otp,
+    _parse_yangyang_code_url,
+    fetch_latest_otp,
+)
 
 
 class FakeResponse:
@@ -60,6 +68,16 @@ Please ignore this email.</pre>
         """)
 
 
+class FakeChangingCodeSession:
+    def __init__(self):
+        self.calls = 0
+
+    def get(self, _url, **_kwargs):
+        self.calls += 1
+        code = "111111" if self.calls == 1 else "222222"
+        return FakeResponse(text=f"Your OpenAI verification code is {code}")
+
+
 class GenericApiYangyangTests(unittest.TestCase):
     def test_parse_yangyang_url(self):
         self.assertEqual(
@@ -101,6 +119,44 @@ class GenericApiYangyangTests(unittest.TestCase):
         code, meta = result
         self.assertEqual(code, "541409")
         self.assertEqual(meta["mail_id"], "inline-0")
+
+    def test_fetch_latest_otp_skips_excluded_plain_response_code(self):
+        session = FakeChangingCodeSession()
+        account = GenericApiEmailAccount(
+            email="user@example.com",
+            code_url="https://mail.example/code",
+        )
+        with patch("core.generic_api_mail_client.get_account_context", return_value=account), patch(
+            "core.generic_api_mail_client.requests.Session", return_value=session
+        ), patch("core.generic_api_mail_client.time.sleep"):
+            code = fetch_latest_otp(
+                account.email,
+                max_wait=2,
+                poll_interval=1,
+                settle_seconds=0,
+                exclude_codes={"111111"},
+            )
+
+        self.assertEqual(code, "222222")
+        self.assertEqual(session.calls, 2)
+
+    def test_fetch_latest_otp_times_out_when_yangyang_only_returns_excluded_code(self):
+        account = GenericApiEmailAccount(
+            email="user@example.com",
+            code_url="https://yangyang.website/messages/tok/user@example.com",
+        )
+        with patch("core.generic_api_mail_client.get_account_context", return_value=account), patch(
+            "core.generic_api_mail_client._fetch_yangyang_otp",
+            return_value=("111111", {"mail_id": 1, "received_at": "now"}),
+        ), patch("core.generic_api_mail_client.time.sleep"):
+            with self.assertRaises(GenericApiMailError):
+                fetch_latest_otp(
+                    account.email,
+                    max_wait=0.01,
+                    poll_interval=1,
+                    settle_seconds=0,
+                    exclude_codes={"111111"},
+                )
 
 
 if __name__ == "__main__":

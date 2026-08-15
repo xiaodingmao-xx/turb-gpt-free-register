@@ -486,6 +486,7 @@ def run_registration(
             totp_secret=totp_secret,
             email_source=resolve_email_source(email),
             proxy_used=session.proxy or None,
+            registration_ip=(session.exit_geo or {}).get("ip"),
             batch_dir=batch_dir,
             extra={
                 "user": session_info.get("user"),

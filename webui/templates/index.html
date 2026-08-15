@@ -748,7 +748,7 @@
       opacity: .55; cursor: not-allowed;
     }
     .accounts-table-v2 .account-password-cell {
-      display: flex; align-items: center; gap: 6px; white-space: nowrap;
+      display: flex; flex-direction: column; align-items: flex-start; gap: 4px; white-space: normal;
     }
     .accounts-table-v2 .account-password-value {
       min-width: 74px; color: #344054; font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
@@ -3233,7 +3233,8 @@ function _planRegionDetail(r) {
     .map(v => String(v || '').trim()).filter(Boolean).join(' / ') || '\u672a\u77e5';
   const title = [r.plan_exit_ip ? `IP: ${r.plan_exit_ip}` : '', r.plan_exit_timezone ? `TZ: ${r.plan_exit_timezone}` : '', r.plan_exit_geo_source ? `Source: ${r.plan_exit_geo_source}` : '']
     .filter(Boolean).map(esc).join('; ');
-  return `<div class="plan-region-detail" title="${title}"><div>\u8d44\u683c\u5730\u533a: ${esc(eligibility)}</div><div>\u51fa\u53e3\u5730\u533a: ${esc(exit)}</div></div>`;
+  const registrationIp = r.registration_ip ? `注册IP: ${esc(r.registration_ip)}` : '';
+  return `<div class="plan-region-detail" title="${title}"><div>\u8d44\u683c\u5730\u533a: ${esc(eligibility)}</div><div>\u51fa\u53e3\u5730\u533a: ${esc(exit)}</div>${registrationIp ? `<div>${registrationIp}</div>` : ''}</div>`;
 }
 function _planCell(r) {
   const ok = r.plan_check_ok;
@@ -3393,6 +3394,7 @@ function _registrationPasswordCell(r) {
       <span class="pill status-success">已设置</span>
       <code class="account-password-value" data-account-password-value="${esc(r.id)}">••••••••</code>
       <button type="button" class="account-password-toggle" data-account-password-toggle="${esc(r.id)}" data-password-visible="0">显示</button>
+      <button type="button" class="account-password-toggle" data-account-copy-secret="registration_password" data-account-id="${esc(r.id)}">复制密码</button>
     </div>`;
   }
   if (setupStatus === 'queued') {
@@ -3465,7 +3467,7 @@ function renderAccounts() {
       <td class="col-email" title="${esc(r.email || '')}">
         <div class="acc-v2-email">${esc(r.email)}${r.archived ? ' <span class="pill status-used" title="该账号已归档">归档</span>' : ''}</div>
         <div class="acc-v2-sub">${esc(r.user_name || '-')}</div>
-        ${r.pickup_address ? `<div class="acc-v2-pickup" title="${esc(r.pickup_address)}">${esc(r.pickup_address)}</div><button type="button" class="acc-v2-pickup-copy" data-account-copy-pickup-address="${esc(r.id)}">复制取件地址</button>` : '<div class="acc-v2-pickup acc-v2-muted">未设置取件地址</div>'}
+        ${r.pickup_address_available ? `<button type="button" class="acc-v2-pickup-copy" data-account-copy-pickup-address="${esc(r.id)}">复制取件地址</button>` : '<div class="acc-v2-pickup acc-v2-muted">未设置取件地址</div>'}
       </td>
       <td class="col-source">${esc(r.email_source || '-')}</td>
       <td class="col-token">${_tokenCellV2(r)}</td>
@@ -3809,11 +3811,18 @@ async function onAccountsBodyClick(e) {
 
   const pickupCopyBtn = e.target.closest('[data-account-copy-pickup-address]');
   if (pickupCopyBtn) {
-    const account = ACCOUNTS.find(a => Number(a.id) === Number(pickupCopyBtn.dataset.accountCopyPickupAddress));
-    const pickupAddress = account ? String(account.pickup_address || '') : '';
-    if (!pickupAddress) { showToast('该账号没有取件地址'); return; }
-    copyText(pickupAddress);
-    showToast('取件地址已复制');
+    const id = Number(pickupCopyBtn.dataset.accountCopyPickupAddress);
+    pickupCopyBtn.disabled = true;
+    try {
+      const pickupAddress = await fetchOneAccountSecret(id, 'pickup_address');
+      if (!pickupAddress) { showToast('该账号没有取件地址'); return; }
+      await copyText(pickupAddress);
+      showToast('取件地址已复制');
+    } catch(err) {
+      showToast('复制取件地址失败: ' + err.message);
+    } finally {
+      pickupCopyBtn.disabled = false;
+    }
     return;
   }
 
@@ -3826,7 +3835,7 @@ async function onAccountsBodyClick(e) {
       const value = await fetchOneAccountSecret(id, field);
       if (!value) { showToast('可复制内容为空'); return; }
       copyText(value);
-      showToast(field === 'access_token' ? 'Token 已复制' : field === 'codex_agent_token' ? 'Agent Token 已复制' : '账号整行已复制');
+      showToast(field === 'access_token' ? 'Token 已复制' : field === 'codex_agent_token' ? 'Agent Token 已复制' : field === 'registration_password' ? '密码已复制' : field === 'pickup_address' ? '取件地址已复制' : '账号整行已复制');
     } catch(err) {
       showToast('复制失败: ' + err.message);
     } finally {

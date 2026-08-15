@@ -124,6 +124,7 @@ def wait_for_otp(
     max_wait: int | None = None,
     poll_interval: int | None = None,
     settle_seconds: int | None = None,
+    exclude_codes: Iterable[str] | None = None,
 ) -> str:
     """等待并返回该邮箱最新的 ChatGPT OTP（6 位数字字符串）。
 
@@ -168,6 +169,8 @@ def wait_for_otp(
         return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
     if source == "generic_api":
         from core.generic_api_mail_client import fetch_latest_otp
+        if exclude_codes:
+            extra_kwargs["exclude_codes"] = exclude_codes
         return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
     if source == "mailnest":
         from core.mailnest_client import fetch_latest_otp

@@ -57,7 +57,8 @@ class WebUiAccountFeatureTests(unittest.TestCase):
         }
         response = self.client.get("/api/accounts?paged=1&page=1&page_size=20")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json()["items"][0]["pickup_address"], "https://icloud-api.top/s/token/mailbox@example.com")
+        self.assertFalse(response.get_json()["items"][0]["pickup_address_available"])
+        self.assertNotIn("pickup_address", response.get_json()["items"][0])
 
     @patch("webui.app.db.list_accounts_page")
     def test_account_email_is_not_used_as_pickup_address_fallback(self, list_page):
@@ -69,7 +70,77 @@ class WebUiAccountFeatureTests(unittest.TestCase):
         }
         response = self.client.get("/api/accounts?paged=1&page=1&page_size=20")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json()["items"][0]["pickup_address"], "")
+        row = response.get_json()["items"][0]
+        self.assertFalse(row["pickup_address_available"])
+        self.assertNotIn("pickup_address", row)
+
+    @patch("webui.app.db.get_generic_api_email_by_email")
+    @patch("webui.app.db.list_accounts_page")
+    def test_generic_api_pickup_address_is_available_but_not_in_compact_row(
+        self, list_page, get_pool
+    ):
+        list_page.return_value = {
+            "items": [{
+                "id": 8,
+                "email": "pool@example.com",
+                "email_source": "generic_api",
+            }],
+            "total": 1,
+            "sources": [],
+            "revision": "1:now",
+        }
+        get_pool.return_value = {
+            "email": "pool@example.com",
+            "code_url": "https://mail.example/messages/token",
+        }
+
+        response = self.client.get("/api/accounts?paged=1&page=1&page_size=20")
+
+        self.assertEqual(response.status_code, 200)
+        row = response.get_json()["items"][0]
+        self.assertTrue(row["pickup_address_available"])
+        self.assertNotIn("pickup_address", row)
+        self.assertNotIn(
+            "https://mail.example/messages/token",
+            response.get_data(as_text=True),
+        )
+
+    @patch("webui.app.db.get_generic_api_email_by_email")
+    @patch("webui.app.db.get_account")
+    def test_pickup_address_secret_is_only_available_for_generic_api(
+        self, get_account, get_pool
+    ):
+        get_account.return_value = {
+            "id": 8,
+            "email": "pool@example.com",
+            "email_source": "generic_api",
+        }
+        get_pool.return_value = {
+            "email": "pool@example.com",
+            "code_url": "https://mail.example/messages/token",
+        }
+
+        response = self.client.get("/api/accounts/8/secret?field=pickup_address")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json()["value"],
+            "https://mail.example/messages/token",
+        )
+
+    @patch("webui.app.db.get_account")
+    def test_pickup_address_secret_rejects_non_generic_api_account(self, get_account):
+        get_account.return_value = {
+            "id": 9,
+            "email": "outlook@example.com",
+            "email_source": "outlook",
+            "pickup_address": "https://should-not-be-exposed.example/otp",
+        }
+
+        response = self.client.get("/api/accounts/9/secret?field=pickup_address")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["value"], "")
 
     @patch("webui.app.db.get_generic_api_email_by_email")
     @patch("webui.app.db.list_accounts_page")
@@ -87,7 +158,9 @@ class WebUiAccountFeatureTests(unittest.TestCase):
         get_pool.return_value = {"email": "damsel_radiate.1x@icloud.com", "code_url": "https://icloud-api.top/s/token/damsel_radiate.1x@icloud.com"}
         response = self.client.get("/api/accounts?paged=1&page=1&page_size=20")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json()["items"][0]["pickup_address"], "https://icloud-api.top/s/token/damsel_radiate.1x@icloud.com")
+        row = response.get_json()["items"][0]
+        self.assertTrue(row["pickup_address_available"])
+        self.assertNotIn("pickup_address", row)
 
     @patch("webui.app.db.update_account_pickup_address")
     def test_account_pickup_address_can_be_updated(self, update_address):
@@ -144,6 +217,50 @@ class WebUiAccountFeatureTests(unittest.TestCase):
         html = template.read_text(encoding="utf-8")
         self.assertIn("'already_set'", html)
         self.assertIn("passwordDone", html)
+
+    def test_account_template_has_vertical_password_actions_and_copy_secret(self):
+        template = (
+            Path(__file__).resolve().parents[1]
+            / "webui" / "templates" / "index.html"
+        ).read_text(encoding="utf-8")
+        self.assertIn("flex-direction: column", template)
+        self.assertIn("data-account-password-toggle", template)
+        self.assertIn('data-account-copy-secret="registration_password"', template)
+        self.assertIn("复制密码", template)
+
+    def test_account_template_uses_lazy_pickup_copy_without_rendering_full_address(self):
+        template = (
+            Path(__file__).resolve().parents[1]
+            / "webui" / "templates" / "index.html"
+        ).read_text(encoding="utf-8")
+        render_start = template.index("function renderAccounts()")
+        render_end = template.index("function updateAccountSelectionUi", render_start)
+        render_source = template[render_start:render_end]
+        self.assertIn("pickup_address_available", render_source)
+        self.assertIn("data-account-copy-pickup-address", render_source)
+        self.assertIn("复制取件地址", render_source)
+        self.assertNotIn("r.pickup_address ?", render_source)
+        self.assertIn("fetchOneAccountSecret(id, 'pickup_address')", template)
+
+    def test_account_selection_count_uses_global_selected_set_across_pages(self):
+        template = (
+            Path(__file__).resolve().parents[1]
+            / "webui" / "templates" / "index.html"
+        ).read_text(encoding="utf-8")
+        selection_start = template.index("function updateAccountSelectionUi")
+        selection_end = template.index("function toggleAccountSort", selection_start)
+        selection_source = template[selection_start:selection_end]
+        self.assertIn("ACCOUNT_SELECTED.size", selection_source)
+        self.assertIn("pageRows.map(r => Number(r.id))", selection_source)
+        self.assertIn("ACCOUNT_SELECTED.has(id)", selection_source)
+
+    def test_account_template_renders_registration_ip_under_plan_region(self):
+        template = (
+            Path(__file__).resolve().parents[1]
+            / "webui" / "templates" / "index.html"
+        ).read_text(encoding="utf-8")
+        self.assertIn("registration_ip", template)
+        self.assertIn("注册IP:", template)
 
     def test_account_template_displays_password_queue_position_and_summary(self):
         template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"
