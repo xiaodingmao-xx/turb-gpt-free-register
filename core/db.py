@@ -550,6 +550,9 @@ def _account_matches_plan_filter(row: dict, plan_filter: str | None = None) -> b
         return "plus" in plan and "free" not in plan
     if f == "free":
         return plan == "free"
+    if f == "plus_trial_eligible":
+        # 试用资格由套餐查询接口写入；缺失或明确为 False 都不算可试用。
+        return bool(row.get("plus_trial_eligible"))
     return plan == f
 
 
@@ -2542,6 +2545,7 @@ def update_job(
 
 
 def list_jobs(limit: int = 100) -> list[dict]:
+    """按创建顺序返回注册任务。"""
     with _LOCK:
         rows = sorted(_load_jobs(), key=lambda x: int(x.get("id") or 0), reverse=True)
         return [dict(r) for r in rows[:limit]]

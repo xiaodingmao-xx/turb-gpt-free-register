@@ -294,6 +294,16 @@ class WebUiAccountFeatureTests(unittest.TestCase):
         self.assertIn("floatBar.classList.toggle('is-visible', !none)", template)
         self.assertIn("floatBar.setAttribute('aria-hidden', none ? 'true' : 'false')", template)
 
+    def test_account_template_has_trial_filter_and_clear_selection_action(self):
+        template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"
+        html = template.read_text(encoding="utf-8")
+        self.assertIn('id="showTrialEligibleAccountsV2"', html)
+        self.assertIn("SHOW_TRIAL_ELIGIBLE_ACCOUNTS", html)
+        self.assertIn('id="btnFloatClearSelectedV2"', html)
+        self.assertIn("function clearSelectedAccounts()", html)
+        self.assertIn("left: 50%", html)
+        self.assertIn("transform: translateX(-50%)", html)
+
     def test_account_template_displays_password_queue_position_and_summary(self):
         template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"
         html = template.read_text(encoding="utf-8")
@@ -495,6 +505,15 @@ class WebUiAccountFeatureTests(unittest.TestCase):
         self.assertEqual(kwargs["source_filter"], "outlook")
         self.assertEqual(kwargs["sort_key"], "created_at")
         self.assertEqual(kwargs["sort_order"], "asc")
+
+    @patch("webui.app.db.list_accounts_page")
+    def test_account_query_forwards_trial_eligibility_filter(self, list_page):
+        list_page.return_value = {"items": [], "total": 0, "sources": [], "revision": "0:"}
+        response = self.client.get(
+            "/api/accounts?paged=1&page=1&page_size=20&plan=plus_trial_eligible"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(list_page.call_args.kwargs["plan_filter"], "plus_trial_eligible")
 
     def test_password_setup_is_direct_and_has_no_password_modal(self):
         template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"

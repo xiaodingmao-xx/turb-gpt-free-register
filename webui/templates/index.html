@@ -883,7 +883,8 @@
       white-space: nowrap;
     }
     #accountsSelectionFloatV2 {
-      position: fixed; right: 24px; bottom: 20px; z-index: 1200;
+      position: fixed; left: 50%; bottom: 24px; z-index: 1400;
+      transform: translateX(-50%);
       display: none; align-items: center; gap: 8px; flex-wrap: wrap;
       max-width: calc(100vw - 48px); padding: 10px 12px;
       border: 1px solid #b3d8ff; border-radius: 10px;
@@ -896,7 +897,7 @@
     }
     #accountsSelectionFloatV2 .jobs-tb-btn { min-height: 32px; padding: 0 12px; }
     @media (max-width: 700px) {
-      #accountsSelectionFloatV2 { right: 12px; bottom: 12px; left: 12px; max-width: none; }
+      #accountsSelectionFloatV2 { right: 12px; bottom: 12px; left: 12px; max-width: none; transform: none; }
       #accountsSelectionFloatV2 .accounts-selection-float-count { flex-basis: 100%; }
     }
     #accountsToolbarV2 .jobs-tb-btn {
@@ -2007,6 +2008,13 @@
         <button type="button" class="jobs-tb-btn jobs-tb-btn--danger" id="btnDeleteSelectedJobsV2" disabled title="删除选中的非运行中任务，并同时删除对应日志">删除选中</button>
         <button type="button" class="jobs-tb-btn" id="btnCancelPendingV2" title="把所有排队任务标记为已取消">取消全部排队</button>
         <button type="button" class="jobs-tb-btn" id="btnRefreshJobsV2" title="手动刷新任务列表">刷新</button>
+        <label class="jobs-tb-field">任务状态
+          <select id="jobStatusFilterV2" title="筛选注册任务列表状态">
+            <option value="">全部</option>
+            <option value="available">可用</option>
+            <option value="failed">失败</option>
+          </select>
+        </label>
         <label class="jobs-tb-field">注册数量
           <span class="el-input-number">
             <input id="regCountV2" type="number" min="1" max="200" value="1" inputmode="numeric">
@@ -2087,6 +2095,7 @@
           </label>
           <button type="button" class="acc-v2-toggle" id="showArchivedAccountsV2" aria-pressed="false" title="默认只显示未归档账号；开启后单独查看归档账号">查看归档</button>
           <button type="button" class="acc-v2-toggle" id="showPlusAccountsOnlyV2" aria-pressed="false" title="只查询/显示已开通 Plus 的账号">已开通Plus</button>
+          <button type="button" class="acc-v2-toggle" id="showTrialEligibleAccountsV2" aria-pressed="false" title="只查询/显示具有 Plus 试用资格的账号">可Plus试用</button>
           <button type="button" class="jobs-tb-btn" id="btnRefreshAccountsV2" title="重新加载当前筛选条件和当前页账号列表">刷新账号</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedLiveTopV2" onclick="checkSelectedLive()" title="重新登录选中账号；成功且未封号则标记正常，并刷新最新 AT/accessToken">查活</button>
 
@@ -2161,6 +2170,7 @@
       <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnFloatPasswordSetupV2" disabled>设置密码</button>
       <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnFloatNoteSelectedV2" disabled>备注</button>
       <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnFloatCopySelectedLinesV2" disabled>复制行</button>
+      <button type="button" class="jobs-tb-btn jobs-tb-btn--danger" id="btnFloatClearSelectedV2" disabled title="清空当前已选择的全部账号">取消选择</button>
     </div>
     <div class="body hidden" id="retryLogPanel">
       <h3>补跑日志：<span id="retryLogEmail" style="font-size:13px;font-weight:400;color:var(--muted);"></span>
@@ -2433,6 +2443,7 @@ let ACCOUNTS_TOTAL = 0;
 let OUTLOOK_TOTAL = 0;
 let SHOW_ARCHIVED_ACCOUNTS = false;
 let SHOW_PLUS_ACCOUNTS_ONLY = false;
+let SHOW_TRIAL_ELIGIBLE_ACCOUNTS = false;
 let ACCOUNTS_SORT_KEY = 'id';
 let ACCOUNTS_SORT_ORDER = 'desc';
 let ACCOUNT_PASSWORD_SETUP_IDS = [];
@@ -2444,6 +2455,7 @@ const OUTLOOK_SELECTED = new Set();
 let JOBS = [];
 let JOBS_TOTAL = 0;
 let JOB_STATUS_COUNTS = {};
+let JOB_STATUS_FILTER = '';
 let jobsRenderSignature = '';
 const JOB_SELECTED = new Set();
 let activeLogJob = null, logTimer = null, jobsTimer = null;
@@ -2771,6 +2783,14 @@ function bindJobsBodyEvents(bodyEl) {
   if (cancelV2) cancelV2.addEventListener('click', () => cancelAllPendingJobs(cancelV2));
   const refreshV2 = $('#btnRefreshJobsV2');
   if (refreshV2) refreshV2.addEventListener('click', refreshJobs);
+  const statusFilterV2 = $('#jobStatusFilterV2');
+  if (statusFilterV2) statusFilterV2.addEventListener('change', () => {
+    JOB_STATUS_FILTER = statusFilterV2.value || '';
+    JOB_SELECTED.clear();
+    PAGERS.jobs.page = 1;
+    jobsRenderSignature = '';
+    refreshJobs();
+  });
 
   function stepInputNumber(inputId, delta) {
     const el = document.getElementById(inputId);
@@ -2853,13 +2873,14 @@ function updateJobsSelectionUi(pageRows = null) {
 async function refreshJobs() {
   try {
     const p = PAGERS.jobs;
-    const res = await api(`/api/jobs?paged=1&page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}`);
+    const res = await api(`/api/jobs?paged=1&page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}&status=${encodeURIComponent(JOB_STATUS_FILTER)}`);
     const nextJobs = res.items || [];
     JOBS_TOTAL = Number(res.total || nextJobs.length || 0);
-    JOB_STATUS_COUNTS = res.status_counts || {};
+    // 任务筛选只影响列表，开始注册前的“已有运行任务”提示仍使用全量统计。
+    JOB_STATUS_COUNTS = res.all_status_counts || res.status_counts || {};
     const totalPages = Math.max(1, Math.ceil(JOBS_TOTAL / p.size));
     if (p.page > totalPages) { p.page = totalPages; return refreshJobs(); }
-    const nextSignature = JSON.stringify({items: nextJobs, total: JOBS_TOTAL, status_counts: JOB_STATUS_COUNTS, page: p.page, size: p.size});
+    const nextSignature = JSON.stringify({items: nextJobs, total: JOBS_TOTAL, status_counts: JOB_STATUS_COUNTS, status_filter: JOB_STATUS_FILTER, page: p.page, size: p.size});
     JOBS = nextJobs;
     if (nextSignature !== jobsRenderSignature) {
       jobsRenderSignature = nextSignature;
@@ -3093,7 +3114,7 @@ function getAccountsQueryParams() {
   return new URLSearchParams({
     paged: '1', page: String(PAGERS.accounts.page), page_size: String(PAGERS.accounts.size),
     archived: SHOW_ARCHIVED_ACCOUNTS ? 'only' : '0',
-    plan: SHOW_PLUS_ACCOUNTS_ONLY ? 'plus' : '', q: getAccountsQuery(),
+    plan: SHOW_TRIAL_ELIGIBLE_ACCOUNTS ? 'plus_trial_eligible' : (SHOW_PLUS_ACCOUNTS_ONLY ? 'plus' : ''), q: getAccountsQuery(),
     email: getAccountsEmailFilter(), source: getAccountsSourceFilter(),
     sort: ACCOUNTS_SORT_KEY, order: ACCOUNTS_SORT_ORDER,
   }).toString();
@@ -3551,7 +3572,7 @@ function updateAccountSelectionUi(pageRows = null) {
     'btnRetrySelectedCodexV2', 'btnDownloadSelectedCpaV2', 'btnStopSelectedCodexV2',
     'btnPasswordSetupSelectedV2', 'btnNoteSelectedAccountsV2', 'btnCopySelectedLinesV2',
     'btnDownloadSelectedTxtV2', 'btnArchiveSelectedAccountsV2',
-    'btnFloatPasswordSetupV2', 'btnFloatNoteSelectedV2', 'btnFloatCopySelectedLinesV2',
+    'btnFloatPasswordSetupV2', 'btnFloatNoteSelectedV2', 'btnFloatCopySelectedLinesV2', 'btnFloatClearSelectedV2',
   ];
   v2Ids.forEach(id => {
     const el = document.getElementById(id);
@@ -3572,6 +3593,14 @@ function updateAccountSelectionUi(pageRows = null) {
     cbAll.indeterminate = checkedCount > 0 && checkedCount < pageIds.length;
     cbAll.disabled = pageIds.length === 0;
   }
+}
+
+// 清空跨分页保留的账号选择，并立即同步表格和悬浮操作栏。
+function clearSelectedAccounts() {
+  if (ACCOUNT_SELECTED.size === 0) return;
+  ACCOUNT_SELECTED.clear();
+  renderAccounts();
+  showToast('已取消选择');
 }
 
 // ---------- 补跑日志面板 ----------
@@ -4071,6 +4100,18 @@ async function applyAccountsArchivedFilter(on) {
 }
 async function applyAccountsPlusFilter(on) {
   SHOW_PLUS_ACCOUNTS_ONLY = !!on;
+  if (SHOW_PLUS_ACCOUNTS_ONLY) SHOW_TRIAL_ELIGIBLE_ACCOUNTS = false;
+  setAccountsFilterToggle($('#showPlusAccountsOnlyV2'), SHOW_PLUS_ACCOUNTS_ONLY);
+  setAccountsFilterToggle($('#showTrialEligibleAccountsV2'), SHOW_TRIAL_ELIGIBLE_ACCOUNTS);
+  ACCOUNT_SELECTED.clear();
+  PAGERS.accounts.page = 1;
+  await loadAccounts();
+  await pollAccountPlanStatuses();
+}
+async function applyAccountsTrialFilter(on) {
+  SHOW_TRIAL_ELIGIBLE_ACCOUNTS = !!on;
+  if (SHOW_TRIAL_ELIGIBLE_ACCOUNTS) SHOW_PLUS_ACCOUNTS_ONLY = false;
+  setAccountsFilterToggle($('#showTrialEligibleAccountsV2'), SHOW_TRIAL_ELIGIBLE_ACCOUNTS);
   setAccountsFilterToggle($('#showPlusAccountsOnlyV2'), SHOW_PLUS_ACCOUNTS_ONLY);
   ACCOUNT_SELECTED.clear();
   PAGERS.accounts.page = 1;
@@ -4119,6 +4160,10 @@ async function refreshAccountsList(btn) {
   const plusV2 = $('#showPlusAccountsOnlyV2');
   if (plusV2) plusV2.addEventListener('click', () => {
     applyAccountsPlusFilter(!SHOW_PLUS_ACCOUNTS_ONLY);
+  });
+  const trialV2 = $('#showTrialEligibleAccountsV2');
+  if (trialV2) trialV2.addEventListener('click', () => {
+    applyAccountsTrialFilter(!SHOW_TRIAL_ELIGIBLE_ACCOUNTS);
   });
   const refreshV2 = $('#btnRefreshAccountsV2');
   if (refreshV2) refreshV2.addEventListener('click', () => refreshAccountsList(refreshV2));
@@ -4808,6 +4853,7 @@ async function copySelectedAccountTokens() {
   bind('btnFloatPasswordSetupV2', setPasswordForSelectedAccounts);
   bind('btnFloatNoteSelectedV2', noteSelectedAccounts);
   bind('btnFloatCopySelectedLinesV2', copySelectedAccountLines);
+  bind('btnFloatClearSelectedV2', clearSelectedAccounts);
   bind('btnCopyAllTokensV2', copyCurrentPageTokens);
   bind('btnCopyAllLinesV2', copyCurrentPageLines);
   bind('btnDownloadSelectedTxtV2', downloadSelectedAccountTxt);

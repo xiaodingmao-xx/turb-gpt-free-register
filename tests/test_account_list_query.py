@@ -52,6 +52,24 @@ class AccountListQueryTests(unittest.TestCase):
                 result = db.list_accounts_page(sort_key="created_at", sort_order="desc")
             self.assertEqual([row["id"] for row in result["items"]], [2, 3, 1])
 
+    def test_filters_plus_trial_eligible_accounts_before_pagination(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            rows = [
+                {"id": 1, "email": "eligible@example.com", "plus_trial_eligible": True},
+                {"id": 2, "email": "not-eligible@example.com", "plus_trial_eligible": False},
+                {"id": 3, "email": "missing@example.com"},
+            ]
+            (root / "accounts.json").write_text(json.dumps(rows), encoding="utf-8")
+            with self._stack(*self._db_paths(root)):
+                result = db.list_accounts_page(
+                    limit=1,
+                    offset=0,
+                    plan_filter="plus_trial_eligible",
+                )
+            self.assertEqual(result["total"], 1)
+            self.assertEqual(result["items"][0]["email"], "eligible@example.com")
+
     def test_unknown_sort_key_falls_back_to_id_without_field_access(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

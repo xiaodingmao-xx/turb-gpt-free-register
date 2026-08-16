@@ -231,6 +231,19 @@ def _job_status_counts(rows: list[dict]) -> dict:
     counts["active"] = sum(int(counts.get(s, 0) or 0) for s in ("pending", "running", "stopping"))
     return counts
 
+
+def _job_matches_status_filter(row: dict, status_filter: str | None) -> bool:
+    """按任务列表展示状态筛选；可用包含成功和部分成功任务。"""
+    normalized = str(status_filter or "").strip().lower()
+    if not normalized or normalized in {"all", "any"}:
+        return True
+    display_status = str(row.get("display_status") or row.get("status") or "").strip().lower()
+    if normalized == "available":
+        return display_status in {"success", "partial_success"}
+    if normalized == "failed":
+        return display_status == "failed"
+    return True
+
 def create_app(auth_code: str | None = None) -> Flask:
     app = Flask(__name__, template_folder="templates")
     _prepared_downloads: dict[str, dict] = {}
@@ -2369,6 +2382,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         paged = str(request.args.get("paged", default="") or "").lower() in {"1", "true", "yes"}
         page_arg = request.args.get("page", default=None, type=int)
         page_size_arg = request.args.get("page_size", default=None, type=int)
+        status_filter = str(request.args.get("status", default="") or "").strip().lower()
         fetch_limit = 1_000_000 if (paged or page_arg is not None or page_size_arg is not None) else limit
         from config import email as _email_cfg
         manual_otp_required = not bool(getattr(_email_cfg, "USE_EMAIL_SERVICE", True))
@@ -2376,12 +2390,16 @@ def create_app(auth_code: str | None = None) -> Flask:
         for row in rows:
             row["manual_otp_required"] = manual_otp_required
             row.update(svc.get_retry_info(row))
+        all_status_counts = _job_status_counts(rows)
+        rows = [row for row in rows if _job_matches_status_filter(row, status_filter)]
         if paged or page_arg is not None or page_size_arg is not None:
             page = max(1, int(page_arg or 1))
             page_size = max(1, min(500, int(page_size_arg or limit or 50)))
             result = _paginate_items(rows, page=page, page_size=page_size)
             result["items"] = [_compact_job_for_list(r) for r in (result.get("items") or [])]
             result["status_counts"] = _job_status_counts(rows)
+            result["all_status_counts"] = all_status_counts
+            result["status_filter"] = status_filter or "all"
             result["compact"] = True
             return jsonify(result)
         return jsonify(rows)
