@@ -74,4 +74,4 @@
 - [x] **Step 1: Run the full test suite**：`python -m pytest -q` 已通过 200 项。
 - [x] **Step 2: Restart the local WebUI**：已重启当前项目的 5000 端口进程。
 - [x] **Step 3: Verify HTTP response and key UI text**：`http://127.0.0.1:5000/login` 返回 200，模板测试和 JavaScript 语法检查通过。
-- [ ] **Step 4: Commit with a Chinese message and push**：只提交本次修改文件，不包含已有未跟踪计划文件；推送当前分支到远程。
+- [x] **Step 4: Commit with a Chinese message and push**：已使用中文提交信息提交本次修改文件，并推送到远程 `main`；已有未跟踪计划文件未纳入提交。
