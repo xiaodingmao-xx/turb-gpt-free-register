@@ -21,7 +21,7 @@ from core import codex_retry_service, db
 logger = logging.getLogger(__name__)
 
 # 全局线程池，最大并发数（WebUI 每次提交时可按最新 workers 重建）
-_DEFAULT_MAX_WORKERS = 4
+_DEFAULT_MAX_WORKERS = 1
 _MIN_MAX_WORKERS = 1
 _MAX_MAX_WORKERS = 16
 _executor: ThreadPoolExecutor | None = None
@@ -34,10 +34,22 @@ _STOP_EVENTS: dict[int, threading.Event] = {}
 _ACTIVE_JOBS: set[int] = set()
 _STOP_LOCK = threading.Lock()
 _THREAD_CTX = threading.local()
+_RESOURCE_GUARD_LOCK = threading.RLock()
+_RESOURCE_FAILURE_COUNT = 0
+_RESOURCE_GUARD_PAUSED = False
+_RESOURCE_GUARD_REASON = ""
+_RESOURCE_GUARD_PAUSED_AT = ""
+_RESOURCE_FAILURE_THRESHOLD = 3
+_RESOURCE_EMAIL_COOLDOWN_SECONDS = 600
+_RETRY_CONTEXT = threading.local()
 
 
 class StopRequested(RuntimeError):
     """用户手动停止注册任务。"""
+
+
+class RegistrationResourcePaused(RuntimeError):
+    """Roxy 资源连续失败后暂停创建新的注册任务。"""
 
 
 def _activate_job(job_id: int) -> None:
@@ -74,6 +86,85 @@ def check_stop_requested() -> None:
     job_id = getattr(_THREAD_CTX, "job_id", None)
     if is_stop_requested(job_id):
         raise StopRequested(f"任务 #{job_id} 已被用户手动停止")
+
+
+def classify_registration_error(error: object) -> str:
+    """把注册异常分为资源、邮箱、注册流程三类，供回收和熔断策略使用。"""
+    text = str(error or "").strip()
+    lower = text.lower()
+    if any(
+        marker in lower
+        for marker in (
+            "窗口额度不足",
+            "内存使用率",
+            "memory usage",
+            "memory utilization",
+            "browser/create",
+        )
+    ):
+        return "resource"
+    if any(
+        marker in lower
+        for marker in (
+            "genericapimailerror",
+            "验证码超时",
+            "验证码",
+            "otp",
+            "最近 25 封邮件中没有找到",
+            "最近25封邮件中没有找到",
+        )
+    ):
+        return "mailbox"
+    if text:
+        return "registration"
+    return "unknown"
+
+
+def get_resource_guard_status() -> dict[str, object]:
+    """返回当前 Roxy 资源熔断状态，供任务提交和 WebUI 使用。"""
+    with _RESOURCE_GUARD_LOCK:
+        return {
+            "paused": bool(_RESOURCE_GUARD_PAUSED),
+            "failure_count": int(_RESOURCE_FAILURE_COUNT),
+            "threshold": int(_RESOURCE_FAILURE_THRESHOLD),
+            "reason": _RESOURCE_GUARD_REASON or None,
+            "paused_at": _RESOURCE_GUARD_PAUSED_AT or None,
+        }
+
+
+def record_resource_failure(error: object) -> dict[str, object]:
+    """记录一次 Roxy 资源失败，达到阈值后暂停后续任务。"""
+    global _RESOURCE_FAILURE_COUNT, _RESOURCE_GUARD_PAUSED
+    global _RESOURCE_GUARD_REASON, _RESOURCE_GUARD_PAUSED_AT
+    with _RESOURCE_GUARD_LOCK:
+        _RESOURCE_FAILURE_COUNT += 1
+        _RESOURCE_GUARD_REASON = str(error or "Roxy 资源不足")[:500]
+        if _RESOURCE_FAILURE_COUNT >= _RESOURCE_FAILURE_THRESHOLD:
+            _RESOURCE_GUARD_PAUSED = True
+            _RESOURCE_GUARD_PAUSED_AT = datetime.now().isoformat(timespec="seconds")
+        return get_resource_guard_status()
+
+
+def record_registration_success() -> dict[str, object]:
+    """成功完成注册后清除资源熔断计数。"""
+    global _RESOURCE_FAILURE_COUNT, _RESOURCE_GUARD_PAUSED
+    global _RESOURCE_GUARD_REASON, _RESOURCE_GUARD_PAUSED_AT
+    with _RESOURCE_GUARD_LOCK:
+        _RESOURCE_FAILURE_COUNT = 0
+        _RESOURCE_GUARD_PAUSED = False
+        _RESOURCE_GUARD_REASON = ""
+        _RESOURCE_GUARD_PAUSED_AT = ""
+        return get_resource_guard_status()
+
+
+def ensure_registration_allowed() -> None:
+    """在创建新任务前阻止已进入资源熔断状态的批次继续扩张。"""
+    status = get_resource_guard_status()
+    if status["paused"]:
+        reason = status.get("reason") or "Roxy 资源不足"
+        raise RegistrationResourcePaused(
+            f"Roxy 资源不足，注册任务已暂停：{reason}。释放窗口或内存后再继续。"
+        )
 
 
 def _append_job_log(job_id: int, message: str) -> None:
@@ -129,14 +220,22 @@ def _prepare_registration_args() -> tuple[str, str, str]:
     return email, name, birthday
 
 
-def _release_unconsumed_job_email(email: str | None, reason: str) -> None:
+def _release_unconsumed_job_email(
+    email: str | None,
+    reason: str,
+    cooldown_seconds: int = 0,
+) -> None:
     """任务失败兜底：只回收尚未生成账号、仍处于 used 的邮箱领取。"""
     if not email:
         return
     try:
         from core.email_provider import release_email_if_unconsumed
 
-        release_email_if_unconsumed(email, note=f"任务未消耗，已自动回收: {reason[:180]}")
+        release_email_if_unconsumed(
+            email,
+            note=f"任务未消耗，已自动回收: {reason[:180]}",
+            cooldown_seconds=cooldown_seconds,
+        )
     except Exception:
         logger.exception("[Service] 回收未消耗邮箱失败: %s", email)
 
@@ -354,6 +453,7 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                 log_logger.warning(f"[Job {job_id}] 已按用户请求停止")
                 return
             if isinstance(result, dict) and result.get("success"):
+                record_registration_success()
                 db.update_job(
                     job_id,
                     status="success",
@@ -375,7 +475,15 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                     completed_at=datetime.now().isoformat(timespec="seconds"),
                 )
                 email_to_handle = str(result_email or email or "").strip()
-                if _should_disable_failed_registration_email(err):
+                error_category = classify_registration_error(err)
+                if error_category == "resource":
+                    record_resource_failure(err)
+                    _release_unconsumed_job_email(
+                        email_to_handle,
+                        str(err),
+                        cooldown_seconds=_RESOURCE_EMAIL_COOLDOWN_SECONDS,
+                    )
+                elif _should_disable_failed_registration_email(err):
                     _disable_job_email(email_to_handle, str(err))
                 else:
                     _release_unconsumed_job_email(email_to_handle, str(err))
@@ -391,7 +499,15 @@ def _run_one_job(job_id: int, log_file: str) -> None:
         )
     except Exception as exc:
         err_text = f"{type(exc).__name__}: {exc}"
-        if _should_disable_failed_registration_email(err_text):
+        error_category = classify_registration_error(err_text)
+        if error_category == "resource":
+            record_resource_failure(err_text)
+            _release_unconsumed_job_email(
+                email,
+                err_text,
+                cooldown_seconds=_RESOURCE_EMAIL_COOLDOWN_SECONDS,
+            )
+        elif _should_disable_failed_registration_email(err_text):
             _disable_job_email(email, err_text)
         else:
             _release_unconsumed_job_email(email, err_text)
@@ -480,6 +596,8 @@ def submit_registration(count: int = 1, email_source: str | None = None, workers
         from config import email as _email_cfg
         email_source = _email_cfg.EMAIL_SOURCE
 
+    ensure_registration_allowed()
+
     # 创建/切换线程池和提交本批任务必须整体串行化：否则另一请求在本批提交中途
     # 切换 workers 并 shutdown 旧池，会导致后续 submit 报 cannot schedule new futures after shutdown。
     with _executor_lock:
@@ -504,6 +622,19 @@ def submit_registration(count: int = 1, email_source: str | None = None, workers
 
 
 def _account_for_job(job: dict) -> dict | None:
+    context = getattr(_RETRY_CONTEXT, "value", None)
+    if context is not None:
+        account_id = job.get("account_id")
+        if account_id is not None:
+            try:
+                account = context["accounts_by_id"].get(int(account_id))
+            except (TypeError, ValueError):
+                account = None
+            if account is not None:
+                return account
+        email = str(job.get("email") or "").strip().lower()
+        return context["accounts_by_email"].get(email) if email else None
+
     account_id = job.get("account_id")
     if account_id is not None:
         try:
@@ -514,6 +645,63 @@ def _account_for_job(job: dict) -> dict | None:
             pass
     email = str(job.get("email") or "").strip()
     return db.get_account_by_email(email) if email else None
+
+
+def decorate_retry_info(rows: list[dict]) -> list[dict]:
+    """批量补充任务列表重试信息，避免每条任务重复读取 JSON 文件。"""
+    rows = list(rows or [])
+    successful_by_root: dict[int, dict] = {}
+    for row in rows:
+        if row.get("status") != "success":
+            continue
+        try:
+            root_id = int(row.get("root_job_id") or row.get("id") or 0)
+            job_id = int(row.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        current = successful_by_root.get(root_id)
+        if current is None or int(current.get("id") or 0) < job_id:
+            successful_by_root[root_id] = dict(row)
+
+    successful_by_job_id: dict[int, dict] = {}
+    for row in rows:
+        try:
+            job_id = int(row.get("id") or 0)
+            root_id = int(row.get("root_job_id") or job_id)
+        except (TypeError, ValueError):
+            continue
+        success = successful_by_root.get(root_id)
+        if success is not None and int(success.get("id") or 0) != job_id:
+            successful_by_job_id[job_id] = success
+
+    accounts = db.list_accounts(limit=1_000_000)
+    context = {
+        "successful_by_job_id": successful_by_job_id,
+        "accounts_by_id": {
+            int(account.get("id")): account
+            for account in accounts
+            if account.get("id") is not None
+        },
+        "accounts_by_email": {
+            str(account.get("email") or "").strip().lower(): account
+            for account in accounts
+            if str(account.get("email") or "").strip()
+        },
+    }
+    previous = getattr(_RETRY_CONTEXT, "value", None)
+    _RETRY_CONTEXT.value = context
+    try:
+        for row in rows:
+            row.update(get_retry_info(row))
+    finally:
+        if previous is None:
+            try:
+                delattr(_RETRY_CONTEXT, "value")
+            except AttributeError:
+                pass
+        else:
+            _RETRY_CONTEXT.value = previous
+    return rows
 
 
 def get_retry_info(job: dict) -> dict:
@@ -529,7 +717,11 @@ def get_retry_info(job: dict) -> dict:
     if status not in ("failed", "stopped", "cancelled"):
         return info
 
-    successful_retry = db.get_successful_retry_for_job(int(job.get("id") or 0))
+    context = getattr(_RETRY_CONTEXT, "value", None)
+    if context is None:
+        successful_retry = db.get_successful_retry_for_job(int(job.get("id") or 0))
+    else:
+        successful_retry = context["successful_by_job_id"].get(int(job.get("id") or 0))
     if successful_retry is not None:
         info["retry_reason"] = f"后续重试任务 #{successful_retry.get('id')} 已成功"
         info["successful_retry_job_id"] = successful_retry.get("id")

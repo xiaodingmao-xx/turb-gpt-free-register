@@ -50,7 +50,7 @@ ROXY_CREATE_METHOD: str = "POST"
 # 打开浏览器时是否无头启动：
 #   False = 显示 Roxy 浏览器窗口（便于观察/调试）
 #   True  = 无头启动，不显示窗口（如果当前 Roxy 版本支持 headless）
-ROXY_OPEN_HEADLESS: bool = False
+ROXY_OPEN_HEADLESS: bool = True
 
 # 打开浏览器时附加参数；会合并到 /browser/open 请求体，优先级高于默认值。
 ROXY_OPEN_EXTRA_PARAMS: dict = {}

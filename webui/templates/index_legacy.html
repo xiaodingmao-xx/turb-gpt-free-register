@@ -410,7 +410,7 @@
           </div>
           <div>
             <label class="fld">并发线程数
-              <input id="regWorkers" type="number" min="1" max="16" value="3">
+              <input id="regWorkers" type="number" min="1" max="16" value="1">
             </label>
           </div>
           <div class="action-cell">
@@ -679,7 +679,7 @@ let JOBS_TOTAL = 0;
 let JOB_STATUS_COUNTS = {};
 let jobsRenderSignature = '';
 const JOB_SELECTED = new Set();
-let activeLogJob = null, logTimer = null, jobsTimer = null;
+let activeLogJob = null, logTimer = null, jobsTimer = null, jobsRefreshInFlight = false;
 
 // ---------- 分页状态 ----------
 const PAGERS = {
@@ -791,7 +791,7 @@ async function loadSummary() {
 // ---------- 注册 / 任务 ----------
 $('#btnStart').addEventListener('click', async () => {
   const count = parseInt($('#regCount').value || '1', 10);
-  const workers = parseInt($('#regWorkers').value || '3', 10);
+  const workers = parseInt($('#regWorkers').value || '1', 10);
   const activeCount = Number(JOB_STATUS_COUNTS.active || 0);
   if (activeCount > 0) {
     const ok = confirm(
@@ -886,15 +886,28 @@ function updateJobsSelectionUi(pageRows = null) {
 }
 
 async function refreshJobs() {
+  if (jobsRefreshInFlight) return;
+  jobsRefreshInFlight = true;
   try {
     const p = PAGERS.jobs;
     const res = await api(`/api/jobs?paged=1&page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}`);
     const nextJobs = res.items || [];
     JOBS_TOTAL = Number(res.total || nextJobs.length || 0);
     JOB_STATUS_COUNTS = res.status_counts || {};
+    const guard = res.resource_guard || {};
+    const warnEl = $('#regWarn');
+    if (warnEl) {
+      if (guard.paused) {
+        warnEl.dataset.resourceGuard = '1';
+        warnEl.innerHTML = `<div class="banner warn">Roxy 资源不足，注册任务已暂停。连续失败 ${Number(guard.failure_count || 0)} 次：${esc(guard.reason || '请释放窗口或内存后再继续。')}</div>`;
+      } else if (warnEl.dataset.resourceGuard === '1') {
+        warnEl.dataset.resourceGuard = '';
+        warnEl.innerHTML = '';
+      }
+    }
     const totalPages = Math.max(1, Math.ceil(JOBS_TOTAL / p.size));
     if (p.page > totalPages) { p.page = totalPages; return refreshJobs(); }
-    const nextSignature = JSON.stringify({items: nextJobs, total: JOBS_TOTAL, status_counts: JOB_STATUS_COUNTS, page: p.page, size: p.size});
+    const nextSignature = JSON.stringify({items: nextJobs, total: JOBS_TOTAL, status_counts: JOB_STATUS_COUNTS, page: p.page, size: p.size, resource_guard: guard});
     JOBS = nextJobs;
     if (nextSignature !== jobsRenderSignature) {
       jobsRenderSignature = nextSignature;
@@ -902,6 +915,7 @@ async function refreshJobs() {
     }
     loadSummary();
   } catch(e) {}
+  finally { jobsRefreshInFlight = false; }
 }
 
 let modalScrollY = 0;
@@ -3363,7 +3377,7 @@ document.addEventListener('click', (e) => {
 // ---------- 初始化 ----------
 loadSummary();
 activateTab(localStorage.getItem('gpt_console_active_tab') || 'register', false);
-jobsTimer = setInterval(() => { if (!$('#tab-register').classList.contains('hidden')) refreshJobs(); }, 3000);
+jobsTimer = setInterval(() => { if (!$('#tab-register').classList.contains('hidden')) refreshJobs(); }, 5000);
 setInterval(loadSummary, 5000);
 setInterval(() => { if (!$('#tab-accounts').classList.contains('hidden')) pollAccountPlanStatuses(); }, 2000);
 </script>

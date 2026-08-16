@@ -2389,7 +2389,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         rows = db.list_jobs(limit=fetch_limit)
         for row in rows:
             row["manual_otp_required"] = manual_otp_required
-            row.update(svc.get_retry_info(row))
+        rows = svc.decorate_retry_info(rows)
         all_status_counts = _job_status_counts(rows)
         rows = [row for row in rows if _job_matches_status_filter(row, status_filter)]
         if paged or page_arg is not None or page_size_arg is not None:
@@ -2401,6 +2401,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             result["all_status_counts"] = all_status_counts
             result["status_filter"] = status_filter or "all"
             result["compact"] = True
+            result["resource_guard"] = svc.get_resource_guard_status()
             return jsonify(result)
         return jsonify(rows)
 
@@ -2417,7 +2418,7 @@ def create_app(auth_code: str | None = None) -> Flask:
 
         # workers 控制本次新提交任务使用的线程池；若和上次不同，服务层会为新任务切换到新池。
         try:
-            workers = max(1, min(16, int(data.get("workers", 3))))
+            workers = max(1, min(16, int(data.get("workers", 1))))
         except (TypeError, ValueError):
             return jsonify({"ok": False, "error": "workers 非法"}), 400
 
@@ -2437,7 +2438,10 @@ def create_app(auth_code: str | None = None) -> Flask:
                     "ok": False,
                     "error": "手动模式建议每次只跑 1 个任务（同一 REGISTER_EMAIL）。请把数量设为 1。",
                 }), 400
-            jobs = svc.submit_registration(count=count, workers=workers)
+            try:
+                jobs = svc.submit_registration(count=count, workers=workers)
+            except svc.RegistrationResourcePaused as exc:
+                return jsonify({"ok": False, "error": str(exc)}), 409
             return jsonify({
                 "ok": True,
                 "submitted": len(jobs),
@@ -2522,7 +2526,10 @@ def create_app(auth_code: str | None = None) -> Flask:
             warning = ""
             if pool.get("available", 0) < count:
                 warning = f"可用邮箱仅 {pool.get('available', 0)} 个，少于任务数 {count}，不足的会失败"
-        jobs = svc.submit_registration(count=count, workers=workers)
+        try:
+            jobs = svc.submit_registration(count=count, workers=workers)
+        except svc.RegistrationResourcePaused as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 409
         return jsonify({"ok": True, "submitted": len(jobs), "jobs": jobs, "warning": warning, "workers": workers})
 
     @app.get("/api/manual-otp/waiting")

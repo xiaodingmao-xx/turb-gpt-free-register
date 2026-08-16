@@ -2028,7 +2028,7 @@
         </label>
         <label class="jobs-tb-field">并发线程数
           <span class="el-input-number">
-            <input id="regWorkersV2" type="number" min="1" max="16" value="3" inputmode="numeric">
+            <input id="regWorkersV2" type="number" min="1" max="16" value="1" inputmode="numeric">
             <button type="button" class="el-input-number__increase" data-step-for="regWorkersV2" data-step="1" aria-label="增加">
               <svg viewBox="0 0 24 24"><polyline points="6 14 12 8 18 14"/></svg>
             </button>
@@ -2458,7 +2458,7 @@ let JOB_STATUS_COUNTS = {};
 let JOB_STATUS_FILTER = '';
 let jobsRenderSignature = '';
 const JOB_SELECTED = new Set();
-let activeLogJob = null, logTimer = null, jobsTimer = null;
+let activeLogJob = null, logTimer = null, jobsTimer = null, jobsRefreshInFlight = false;
 
 // ---------- 分页状态 ----------
 const PAGERS = {
@@ -2678,7 +2678,7 @@ async function loadSummary() {
 // ---------- 注册 / 任务 ----------
 async function startRegistrationFromInputs(countEl, workersEl, startBtn) {
   const count = parseInt((countEl?.value || '1'), 10);
-  const workers = parseInt((workersEl?.value || '3'), 10);
+  const workers = parseInt((workersEl?.value || '1'), 10);
   const activeCount = Number(JOB_STATUS_COUNTS.active || 0);
   if (activeCount > 0) {
     const ok = confirm(
@@ -2871,6 +2871,8 @@ function updateJobsSelectionUi(pageRows = null) {
 }
 
 async function refreshJobs() {
+  if (jobsRefreshInFlight) return;
+  jobsRefreshInFlight = true;
   try {
     const p = PAGERS.jobs;
     const res = await api(`/api/jobs?paged=1&page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}&status=${encodeURIComponent(JOB_STATUS_FILTER)}`);
@@ -2880,7 +2882,18 @@ async function refreshJobs() {
     JOB_STATUS_COUNTS = res.all_status_counts || res.status_counts || {};
     const totalPages = Math.max(1, Math.ceil(JOBS_TOTAL / p.size));
     if (p.page > totalPages) { p.page = totalPages; return refreshJobs(); }
-    const nextSignature = JSON.stringify({items: nextJobs, total: JOBS_TOTAL, status_counts: JOB_STATUS_COUNTS, status_filter: JOB_STATUS_FILTER, page: p.page, size: p.size});
+    const guard = res.resource_guard || {};
+    const warnEl = $('#regWarnV2');
+    if (warnEl) {
+      if (guard.paused) {
+        warnEl.dataset.resourceGuard = '1';
+        warnEl.innerHTML = `<div class="banner warn">Roxy 资源不足，注册任务已暂停。连续失败 ${Number(guard.failure_count || 0)} 次：${esc(guard.reason || '请释放窗口或内存后再继续。')}</div>`;
+      } else if (warnEl.dataset.resourceGuard === '1') {
+        warnEl.dataset.resourceGuard = '';
+        warnEl.innerHTML = '';
+      }
+    }
+    const nextSignature = JSON.stringify({items: nextJobs, total: JOBS_TOTAL, status_counts: JOB_STATUS_COUNTS, status_filter: JOB_STATUS_FILTER, page: p.page, size: p.size, resource_guard: guard});
     JOBS = nextJobs;
     if (nextSignature !== jobsRenderSignature) {
       jobsRenderSignature = nextSignature;
@@ -2888,6 +2901,7 @@ async function refreshJobs() {
     }
     loadSummary();
   } catch(e) {}
+  finally { jobsRefreshInFlight = false; }
 }
 
 let modalScrollY = 0;
@@ -6471,7 +6485,7 @@ document.addEventListener('click', (e) => {
 // ---------- 初始化 ----------
 loadSummary();
 activateTab(localStorage.getItem('gpt_console_active_tab') || 'register', false);
-jobsTimer = setInterval(() => { if (!$('#tab-register').classList.contains('hidden')) refreshJobs(); }, 3000);
+jobsTimer = setInterval(() => { if (!$('#tab-register').classList.contains('hidden')) refreshJobs(); }, 5000);
 setInterval(loadSummary, 5000);
 setInterval(() => { if (!$('#tab-accounts').classList.contains('hidden')) pollAccountPlanStatuses(); }, 2000);
 </script>

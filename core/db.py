@@ -14,7 +14,7 @@ import json
 import sqlite3
 import threading
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from html import escape
 from pathlib import Path
 from typing import Any
@@ -49,6 +49,18 @@ _LOCK = threading.RLock()
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _generic_api_email_in_cooldown(row: dict, now: datetime) -> bool:
+    """判断通用 API 邮箱是否仍在临时冷却期内。"""
+    value = str(row.get("cooldown_until") or "").strip()
+    if not value:
+        return False
+    try:
+        return datetime.fromisoformat(value) > now
+    except (TypeError, ValueError):
+        # 历史数据中的非法冷却值不能阻塞邮箱领取。
+        return False
 
 
 def _ensure_storage() -> None:
@@ -2186,13 +2198,25 @@ def import_generic_api_emails(records: list[dict]) -> tuple[int, int]:
 def claim_next_generic_api_email() -> dict | None:
     """原子领取一个可用通用 API 邮箱并标记为 used。"""
     with _LOCK:
+        try:
+            now = datetime.fromisoformat(_now())
+        except (TypeError, ValueError):
+            now = datetime.now()
         rows = sorted(_load_generic_api_emails(), key=lambda x: int(x.get("id") or 0))
-        row = next((r for r in rows if r.get("status") == "available"), None)
+        row = next(
+            (
+                r for r in rows
+                if r.get("status") == "available"
+                and not _generic_api_email_in_cooldown(r, now)
+            ),
+            None,
+        )
         if row is None:
             return None
         row["status"] = "used"
         row["used_at"] = _now()
         row["note"] = None
+        row["cooldown_until"] = None
         _save_generic_api_emails(rows)
         return _decorate_generic_api_email(row)
 
@@ -2207,6 +2231,7 @@ def release_generic_api_email(email: str, status: str = "available", note: str |
         row["status"] = status
         if status == "available":
             row["used_at"] = None
+            row["cooldown_until"] = None
         elif status in ("used", "failed", "disabled"):
             row["used_at"] = row.get("used_at") or _now()
         if note is not None:
@@ -2214,7 +2239,11 @@ def release_generic_api_email(email: str, status: str = "available", note: str |
         _save_generic_api_emails(rows)
 
 
-def release_unconsumed_generic_api_email(email: str, note: str | None = None) -> bool:
+def release_unconsumed_generic_api_email(
+    email: str,
+    note: str | None = None,
+    cooldown_seconds: int = 0,
+) -> bool:
     """原子回收未生成本地账号且仍为 used 的通用 API 邮箱。"""
     with _LOCK:
         if _find_by_email(_load_accounts(), email) is not None:
@@ -2225,6 +2254,16 @@ def release_unconsumed_generic_api_email(email: str, note: str | None = None) ->
             return False
         row["status"] = "available"
         row["used_at"] = None
+        if int(cooldown_seconds or 0) > 0:
+            try:
+                cooldown_start = datetime.fromisoformat(_now())
+            except (TypeError, ValueError):
+                cooldown_start = datetime.now()
+            row["cooldown_until"] = (
+                cooldown_start + timedelta(seconds=int(cooldown_seconds))
+            ).isoformat(timespec="seconds")
+        else:
+            row["cooldown_until"] = None
         if note is not None:
             row["note"] = note
         _save_generic_api_emails(rows)

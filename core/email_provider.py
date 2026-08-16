@@ -209,7 +209,11 @@ def release_email(email: str, status: str = "available", note: str | None = None
     return source
 
 
-def release_email_if_unconsumed(email: str, note: str | None = None) -> bool:
+def release_email_if_unconsumed(
+    email: str,
+    note: str | None = None,
+    cooldown_seconds: int = 0,
+) -> bool:
     """回收仍停留在 used 的任务领取，且绝不覆盖已注册/已判废状态。"""
     if not (email or "").strip():
         return False
@@ -220,7 +224,11 @@ def release_email_if_unconsumed(email: str, note: str | None = None) -> bool:
     if source == "outlook":
         changed = db.release_unconsumed_outlook(email, note=note)
     elif source == "generic_api":
-        changed = db.release_unconsumed_generic_api_email(email, note=note)
+        changed = db.release_unconsumed_generic_api_email(
+            email,
+            note=note,
+            cooldown_seconds=cooldown_seconds,
+        )
     elif source == "cloudflare_domain":
         changed = db.release_unconsumed_domain_email(email, note=note)
     else:
