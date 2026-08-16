@@ -303,6 +303,8 @@ class WebUiAccountFeatureTests(unittest.TestCase):
         self.assertIn("function clearSelectedAccounts()", html)
         self.assertIn("left: 50%", html)
         self.assertIn("transform: translateX(-50%)", html)
+        self.assertIn("top: 16px", html)
+        self.assertIn("bottom: auto", html)
 
     def test_account_template_displays_password_queue_position_and_summary(self):
         template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"
