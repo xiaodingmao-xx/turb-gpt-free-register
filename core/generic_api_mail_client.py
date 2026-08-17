@@ -664,8 +664,9 @@ def fetch_latest_otp(
                         best_seen_at = now_seen
                         settle_until = now_seen + settle
                         if structured_meta:
+                            source = structured_meta.get("source") or "structured_api"
                             logger.info(
-                                f"[GenericAPI] 首次锁定 OTP={code}, source=structured_api "
+                                f"[GenericAPI] 首次锁定 OTP={code}, source={source} "
                                 f"ts={structured_meta.get('received_at')} subject={str(structured_meta.get('subject') or '')[:80]!r}, "
                                 f"等 {settle}s 看取码接口是否出现更新验证码..."
                             )
@@ -676,8 +677,9 @@ def fetch_latest_otp(
                             )
                     elif code != best_otp:
                         if structured_meta:
+                            source = structured_meta.get("source") or "structured_api"
                             logger.info(
-                                f"[GenericAPI] 发现更新 OTP={code}, source=structured_api "
+                                f"[GenericAPI] 发现更新 OTP={code}, source={source} "
                                 f"ts={structured_meta.get('received_at')} subject={str(structured_meta.get('subject') or '')[:80]!r}，"
                                 f"替换之前的 {best_otp}, 重置 settle 计时"
                             )

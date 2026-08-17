@@ -82,6 +82,28 @@ class FakeChangingCodeSession:
         return FakeResponse(text=f"Your OpenAI verification code is {code}")
 
 
+class FakeNotificationThenOtpSession:
+    def __init__(self):
+        self.calls = 0
+
+    def get(self, _url, **_kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            message = '<p style="color: #000000">New sign-in</p>'
+        else:
+            message = (
+                '<div style="color: #000000">'
+                "Enter this temporary verification code to continue: 992669"
+                "</div>"
+            )
+        return FakeResponse(text=json.dumps({
+            "email": "user@example.com",
+            "found": True,
+            "message": message,
+            "ok": True,
+        }))
+
+
 class GenericApiYangyangTests(unittest.TestCase):
     def test_html_visible_text_removes_nonvisible_digits(self):
         source = """
@@ -147,6 +169,28 @@ class GenericApiYangyangTests(unittest.TestCase):
             "992669",
         )
         self.assertIsNone(_extract_code("build identifier 992669"))
+
+    def test_polling_ignores_css_until_visible_otp_arrives(self):
+        session = FakeNotificationThenOtpSession()
+        account = GenericApiEmailAccount(
+            email="user@example.com",
+            code_url="https://mail.example/code",
+        )
+        with patch(
+            "core.generic_api_mail_client.get_account_context",
+            return_value=account,
+        ), patch(
+            "core.generic_api_mail_client.requests.Session",
+            return_value=session,
+        ), patch("core.generic_api_mail_client.time.sleep"):
+            code = fetch_latest_otp(
+                account.email,
+                max_wait=2,
+                poll_interval=1,
+                settle_seconds=0,
+            )
+        self.assertEqual(code, "992669")
+        self.assertEqual(session.calls, 2)
 
     def test_parse_yangyang_url(self):
         self.assertEqual(
