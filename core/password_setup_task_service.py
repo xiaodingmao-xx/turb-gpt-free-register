@@ -8,7 +8,7 @@ import secrets
 import string
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -140,6 +140,16 @@ def _is_retryable_password_setup_error(error: Exception) -> bool:
 
 def _max_password_setup_attempts() -> int:
     return _bounded_int("ROXY_PASSWORD_SETUP_MAX_RETRIES", 3, 1, 10)
+
+
+def _retry_delay_seconds(attempt: int) -> int:
+    """按刚失败的尝试序号返回下一次执行前的退避秒数。"""
+    normalized = max(1, int(attempt or 1))
+    if normalized == 1:
+        return 15
+    if normalized == 2:
+        return 60
+    return 180
 
 
 def _stored_registration_password(account: dict | None) -> str:
@@ -495,46 +505,85 @@ def _schedule_password_setup_retry(
         return False
 
     next_attempt = attempt + 1
-    error = str(result.get("error") or "设置密码失败")[:500]
+    error = redact_password(str(result.get("error") or "设置密码失败")[:500], password)
+    delay = _retry_delay_seconds(attempt)
+    retry_at = (datetime.now() + timedelta(seconds=delay)).isoformat(timespec="seconds")
     if not db.requeue_account_password_setup(
         account_id,
         error,
         attempt=next_attempt,
         max_attempts=max_attempts,
+        next_retry_at=retry_at,
     ):
         return False
 
-    # 当前 wrapper 已经释放自己的槽位，重试重新占用一个槽位后再提交。
-    _QUEUE_SLOTS.acquire()
-    try:
-        future = _EXECUTOR.submit(
-            _run_task_wrapper,
-            account_id=account_id,
-            email=email,
-            mode=mode,
-            password=password,
-        )
-    except Exception as exc:
-        _QUEUE_SLOTS.release()
-        db.update_account_password_setup(
+    def arm_timer(timer_delay: int) -> None:
+        timer = threading.Timer(timer_delay, submit_retry)
+        timer.daemon = True
+        timer.start()
+
+    def submit_retry() -> None:
+        if not _QUEUE_SLOTS.acquire(blocking=False):
+            deferred_at = (datetime.now() + timedelta(seconds=5)).isoformat(timespec="seconds")
+            if db.requeue_account_password_setup(
+                account_id,
+                error,
+                attempt=next_attempt,
+                max_attempts=max_attempts,
+                next_retry_at=deferred_at,
+            ):
+                _append_password_setup_log(
+                    email,
+                    f"[设置密码] 重试等待队列槽 attempt={next_attempt}/{max_attempts} "
+                    f"delay=5 next_retry_at={deferred_at}",
+                    level="WARNING",
+                )
+                arm_timer(5)
+            return
+
+        if not db.requeue_account_password_setup(
             account_id,
-            {"ok": False, "error": f"重试入队失败: {type(exc).__name__}: {exc}"},
-        )
+            error,
+            attempt=next_attempt,
+            max_attempts=max_attempts,
+            next_retry_at=None,
+        ):
+            _QUEUE_SLOTS.release()
+            return
+        try:
+            _EXECUTOR.submit(
+                _run_task_wrapper,
+                account_id=account_id,
+                email=email,
+                mode=mode,
+                password=password,
+            )
+        except Exception as exc:
+            _QUEUE_SLOTS.release()
+            submit_error = f"重试入队失败: {type(exc).__name__}: {exc}"
+            db.update_account_password_setup(account_id, {"ok": False, "error": submit_error})
+            _append_password_setup_log(
+                email,
+                f"[设置密码] 自动重试入队失败 attempt={next_attempt}/{max_attempts} "
+                f"delay=0 next_retry_at=None error={redact_password(submit_error, password)}",
+                level="ERROR",
+            )
+            return
         _append_password_setup_log(
             email,
-            f"[设置密码] 自动重试入队失败：{type(exc).__name__}: {exc}",
-            level="ERROR",
+            f"[设置密码] 已提交自动重试 attempt={next_attempt}/{max_attempts} "
+            "delay=0 next_retry_at=None",
+            level="WARNING",
         )
-        return False
 
     _append_password_setup_log(
         email,
-        f"[设置密码] 失败后已重新排队 attempt={next_attempt}/{max_attempts} "
-        f"queue_tail=true error={error}",
+        f"[设置密码] 已安排自动重试 attempt={next_attempt}/{max_attempts} "
+        f"delay={delay} next_retry_at={retry_at} error={error}",
         level="WARNING",
     )
-    # 仅保持 Future 的可追踪性，任务状态仍由账号记录和日志提供。
-    return future is not None
+    arm_timer(delay)
+    return True
 
 
 def _run_task_wrapper(*, account_id: int, email: str, mode: str, password: str) -> dict:
@@ -566,13 +615,28 @@ def queue_settings() -> dict:
         active = len(_ACTIVE)
     rows = db.list_accounts(limit=5000, archived="all")
     queued_rows = [row for row in rows if str(row.get("password_setup_status") or "") == "queued"]
-    queued_rows.sort(key=lambda row: (
+    now = datetime.now()
+
+    def is_delayed(row: dict) -> bool:
+        raw = str(row.get("password_setup_next_retry_at") or "").strip()
+        if not raw:
+            return False
+        try:
+            retry_at = datetime.fromisoformat(raw)
+            current = datetime.now(retry_at.tzinfo) if retry_at.tzinfo else now
+            return retry_at > current
+        except (TypeError, ValueError):
+            return False
+
+    delayed_rows = [row for row in queued_rows if is_delayed(row)]
+    waiting_rows = [row for row in queued_rows if not is_delayed(row)]
+    waiting_rows.sort(key=lambda row: (
         str(row.get("password_setup_queued_at") or ""),
         int(row.get("id") or 0),
     ))
     positions = {
         str(row.get("id")): index
-        for index, row in enumerate(queued_rows, start=1)
+        for index, row in enumerate(waiting_rows, start=1)
         if row.get("id") is not None
     }
     queued = len(queued_rows)
@@ -581,7 +645,8 @@ def queue_settings() -> dict:
         "queue_limit": _QUEUE_LIMIT,
         "active": active,
         "queued": queued,
-        "waiting": queued,
+        "waiting": len(waiting_rows),
+        "delayed": len(delayed_rows),
         "available_workers": max(0, _WORKERS - active),
         "positions": positions,
     }

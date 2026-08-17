@@ -2,8 +2,9 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from config import roxybrowser as roxy_cfg
 
@@ -124,17 +125,25 @@ class PasswordSetupTaskServiceTests(unittest.TestCase):
         rows = [
             {"id": 11, "password_setup_status": "queued", "password_setup_queued_at": "2026-01-01T00:00:01"},
             {"id": 12, "password_setup_status": "queued", "password_setup_queued_at": "2026-01-01T00:00:02"},
+            {
+                "id": 14,
+                "password_setup_status": "queued",
+                "password_setup_queued_at": "2026-01-01T00:00:00",
+                "password_setup_next_retry_at": "2999-01-01T00:00:00",
+            },
             {"id": 13, "password_setup_status": "running", "password_setup_queued_at": "2026-01-01T00:00:00"},
         ]
         with patch.object(db, "list_accounts", return_value=rows), patch.object(service, "_ACTIVE", {13}):
             snapshot = service.queue_settings()
 
         self.assertEqual(snapshot["active"], 1)
-        self.assertEqual(snapshot["queued"], 2)
+        self.assertEqual(snapshot["queued"], 3)
         self.assertEqual(snapshot["waiting"], 2)
+        self.assertEqual(snapshot["delayed"], 1)
         self.assertEqual(snapshot["available_workers"], snapshot["workers"] - 1)
         self.assertEqual(snapshot["positions"]["11"], 1)
         self.assertEqual(snapshot["positions"]["12"], 2)
+        self.assertNotIn("14", snapshot["positions"])
 
     def test_csrf_abort_diagnostic_is_not_reported_as_roxy_open_failure(self):
         from core.password_setup_task_service import format_password_setup_diagnostic
@@ -215,6 +224,7 @@ class PasswordSetupTaskServiceTests(unittest.TestCase):
                     "TimeoutException: page load timeout",
                     attempt=2,
                     max_attempts=3,
+                    next_retry_at="2026-08-17T12:00:15",
                 ))
                 row = db.get_account(1)
             finally:
@@ -227,6 +237,262 @@ class PasswordSetupTaskServiceTests(unittest.TestCase):
         self.assertEqual(row["password_setup_last_error"], "TimeoutException: page load timeout")
         self.assertIsNone(row.get("password_setup_error"))
         self.assertTrue(row.get("password_setup_queued_at"))
+        self.assertEqual(row.get("password_setup_next_retry_at"), "2026-08-17T12:00:15")
+
+    def test_password_setup_state_transitions_clear_next_retry_at(self):
+        from core import db
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "accounts.json").write_text(json.dumps([{
+                "id": 1,
+                "email": "user@example.com",
+                "password_setup_status": "failed",
+                "password_setup_next_retry_at": "2026-08-17T12:00:15",
+            }]), encoding="utf-8")
+            with self._stack(*self._db_paths(root)):
+                self.assertTrue(db.claim_account_password_setup(1))
+                self.assertIsNone(db.get_account(1).get("password_setup_next_retry_at"))
+                self.assertTrue(db.requeue_account_password_setup(
+                    1,
+                    "timeout",
+                    attempt=2,
+                    max_attempts=3,
+                    next_retry_at="2026-08-17T12:01:00",
+                ))
+                self.assertTrue(db.mark_account_password_setup_running(1))
+                self.assertIsNone(db.get_account(1).get("password_setup_next_retry_at"))
+                self.assertTrue(db.update_account_password_setup(1, {
+                    "ok": False,
+                    "password": "must-not-be-saved",
+                    "error": "timeout",
+                }))
+                row = db.get_account(1)
+
+        self.assertIsNone(row.get("password_setup_next_retry_at"))
+        self.assertFalse(row.get("registration_password"))
+
+    def _db_paths(self, root: Path):
+        from core import db
+
+        return [
+            patch.object(db, "_ACCOUNTS_JSON", root / "accounts.json"),
+            patch.object(db, "_LEGACY_ACCOUNTS_JSON", root / "legacy.json"),
+            patch.object(db, "_ACCOUNTS_TXT", root / "accounts.txt"),
+            patch.object(db, "_TOKENS_TXT", root / "tokens.txt"),
+            patch.object(db, "_VIEWER_HTML", root / "viewer.html"),
+        ]
+
+    @staticmethod
+    def _stack(*patchers):
+        class _Stack:
+            def __enter__(self):
+                self.values = [item.start() for item in patchers]
+                return self.values
+
+            def __exit__(self, exc_type, exc, tb):
+                for item in reversed(patchers):
+                    item.stop()
+                return False
+
+        return _Stack()
+
+    def test_retry_delay_sequence_is_bounded(self):
+        from core.password_setup_task_service import _retry_delay_seconds
+
+        self.assertEqual(
+            [_retry_delay_seconds(attempt) for attempt in (1, 2, 3, 9)],
+            [15, 60, 180, 180],
+        )
+
+    def test_retry_schedule_creates_daemon_timer_without_holding_queue_slot(self):
+        from core import db
+        from core import password_setup_task_service as service
+
+        timers = []
+
+        class FixedDatetime:
+            @classmethod
+            def now(cls):
+                return datetime(2026, 8, 17, 12, 0, 0)
+
+        class FakeTimer:
+            def __init__(self, interval, function):
+                self.interval = interval
+                self.function = function
+                self.daemon = False
+                self.started = False
+                timers.append(self)
+
+            def start(self):
+                self.started = True
+
+        slots = Mock()
+        with patch.object(service, "datetime", FixedDatetime), patch.object(
+            service.threading, "Timer", FakeTimer
+        ), patch.object(service, "_QUEUE_SLOTS", slots), patch.object(
+            service, "_EXECUTOR"
+        ) as executor, patch.object(db, "requeue_account_password_setup", return_value=True) as requeue:
+            scheduled = service._schedule_password_setup_retry(
+                account_id=1,
+                email="user@example.com",
+                mode="post_login_add_password",
+                password="one-password-for-all-attempts",
+                result={
+                    "ok": False,
+                    "retryable": True,
+                    "error": "timeout",
+                    "attempt": 1,
+                    "max_attempts": 3,
+                },
+            )
+
+        self.assertTrue(scheduled)
+        self.assertEqual(len(timers), 1)
+        self.assertEqual(timers[0].interval, 15)
+        self.assertTrue(timers[0].daemon)
+        self.assertTrue(timers[0].started)
+        slots.acquire.assert_not_called()
+        executor.submit.assert_not_called()
+        requeue.assert_called_once_with(
+            1,
+            "timeout",
+            attempt=2,
+            max_attempts=3,
+            next_retry_at="2026-08-17T12:00:15",
+        )
+
+    def test_retry_timer_rearms_for_five_seconds_without_consuming_attempt_when_queue_is_full(self):
+        from core import db
+        from core import password_setup_task_service as service
+
+        timers = []
+
+        class FixedDatetime:
+            @classmethod
+            def now(cls):
+                return datetime(2026, 8, 17, 12, 0, 0)
+
+        class FakeTimer:
+            def __init__(self, interval, function):
+                self.interval = interval
+                self.function = function
+                self.daemon = False
+                timers.append(self)
+
+            def start(self):
+                pass
+
+        slots = Mock()
+        slots.acquire.return_value = False
+        with patch.object(service, "datetime", FixedDatetime), patch.object(
+            service.threading, "Timer", FakeTimer
+        ), patch.object(service, "_QUEUE_SLOTS", slots), patch.object(
+            service, "_EXECUTOR"
+        ) as executor, patch.object(db, "requeue_account_password_setup", return_value=True) as requeue:
+            self.assertTrue(service._schedule_password_setup_retry(
+                account_id=1,
+                email="user@example.com",
+                mode="post_login_add_password",
+                password="one-password-for-all-attempts",
+                result={"retryable": True, "error": "timeout", "attempt": 1, "max_attempts": 3},
+            ))
+            timers[0].function()
+
+        self.assertEqual([timer.interval for timer in timers], [15, 5])
+        self.assertTrue(timers[1].daemon)
+        executor.submit.assert_not_called()
+        self.assertEqual(requeue.call_count, 2)
+        self.assertEqual(requeue.call_args_list[1].kwargs["attempt"], 2)
+        self.assertEqual(requeue.call_args_list[1].kwargs["next_retry_at"], "2026-08-17T12:00:05")
+
+    def test_enqueue_resolves_password_once_and_retry_callback_reuses_it(self):
+        from core import db
+        from core import password_setup_task_service as service
+
+        timers = []
+
+        class FakeTimer:
+            def __init__(self, interval, function):
+                self.function = function
+                self.daemon = False
+                timers.append(self)
+
+            def start(self):
+                pass
+
+        slots = Mock()
+        slots.acquire.return_value = True
+        resolved = "resolved-once-password"
+        with patch.object(
+            service, "resolve_password_setup_request", return_value=("post_login_add_password", resolved)
+        ) as resolve, patch.object(service.threading, "Timer", FakeTimer), patch.object(
+            service, "_QUEUE_SLOTS", slots
+        ), patch.object(service, "_EXECUTOR") as executor, patch.object(
+            db, "get_account", return_value={"id": 1, "email": "user@example.com", "extra_json": "{}"}
+        ), patch.object(db, "claim_account_password_setup", return_value=True), patch.object(
+            db, "requeue_account_password_setup", return_value=True
+        ), patch.object(service, "_append_password_setup_log"):
+            accepted = service.enqueue_account_password_setup(
+                account_id=1,
+                mode="post_login_add_password",
+                password="",
+            )
+            self.assertTrue(service._schedule_password_setup_retry(
+                account_id=1,
+                email="user@example.com",
+                mode="post_login_add_password",
+                password=executor.submit.call_args.kwargs["password"],
+                result={"retryable": True, "error": "timeout", "attempt": 1, "max_attempts": 3},
+            ))
+            timers[0].function()
+
+        self.assertTrue(accepted["accepted"])
+        resolve.assert_called_once_with("post_login_add_password", "")
+        self.assertEqual(executor.submit.call_count, 2)
+        self.assertEqual(
+            [item.kwargs["password"] for item in executor.submit.call_args_list],
+            [resolved, resolved],
+        )
+
+    def test_retry_callback_submission_failure_releases_slot_and_marks_failed(self):
+        from core import db
+        from core import password_setup_task_service as service
+
+        timers = []
+
+        class FakeTimer:
+            def __init__(self, interval, function):
+                self.function = function
+                self.daemon = False
+                timers.append(self)
+
+            def start(self):
+                pass
+
+        slots = Mock()
+        slots.acquire.return_value = True
+        with patch.object(service.threading, "Timer", FakeTimer), patch.object(
+            service, "_QUEUE_SLOTS", slots
+        ), patch.object(service, "_EXECUTOR") as executor, patch.object(
+            db, "requeue_account_password_setup", return_value=True
+        ), patch.object(db, "update_account_password_setup", return_value=True) as update, patch.object(
+            service, "_append_password_setup_log"
+        ):
+            executor.submit.side_effect = RuntimeError("executor stopped")
+            self.assertTrue(service._schedule_password_setup_retry(
+                account_id=1,
+                email="user@example.com",
+                mode="post_login_add_password",
+                password="secret-not-for-logs",
+                result={"retryable": True, "error": "timeout", "attempt": 1, "max_attempts": 3},
+            ))
+            timers[0].function()
+
+        slots.release.assert_called_once_with()
+        update.assert_called_once()
+        self.assertFalse(update.call_args.args[1]["ok"])
+        self.assertNotIn("secret-not-for-logs", str(update.call_args))
 
     def test_stale_profile_creates_fresh_environment_and_retries_setup(self):
         from core import db

@@ -2,13 +2,50 @@
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from core.password_setup_service import PasswordSetupGate
 from core.roxy_registration import _run_password_setup_with_gate
 
 
 class PasswordSetupConcurrencyTests(unittest.TestCase):
+    def test_delayed_retry_does_not_increase_active_worker_count(self):
+        from core import db
+        from core import password_setup_task_service as service
+
+        timers = []
+
+        class FakeTimer:
+            def __init__(self, interval, function):
+                self.interval = interval
+                self.function = function
+                self.daemon = False
+                timers.append(self)
+
+            def start(self):
+                pass
+
+        slots = Mock()
+        with patch.object(service.threading, "Timer", FakeTimer), patch.object(
+            service, "_QUEUE_SLOTS", slots
+        ), patch.object(service, "_ACTIVE", {99}), patch.object(
+            db, "requeue_account_password_setup", return_value=True
+        ), patch.object(db, "list_accounts", return_value=[]):
+            before = service.queue_settings()["active"]
+            scheduled = service._schedule_password_setup_retry(
+                account_id=1,
+                email="user@example.com",
+                mode="post_login_add_password",
+                password="one-password-for-all-attempts",
+                result={"retryable": True, "error": "timeout", "attempt": 1, "max_attempts": 3},
+            )
+            after = service.queue_settings()["active"]
+
+        self.assertTrue(scheduled)
+        self.assertEqual((before, after), (1, 1))
+        self.assertEqual(len(timers), 1)
+        slots.acquire.assert_not_called()
+
     def test_workers_two_allows_two_password_runners_at_once(self):
         gate = PasswordSetupGate(workers=2, queue_limit=10)
         barrier = threading.Barrier(2)

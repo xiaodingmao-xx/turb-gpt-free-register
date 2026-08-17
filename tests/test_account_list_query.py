@@ -156,8 +156,18 @@ class AccountListQueryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             (root / "accounts.json").write_text(json.dumps([
-                {"id": 1, "email": "queued@example.com", "password_setup_status": "queued"},
-                {"id": 2, "email": "running@example.com", "password_setup_status": "running"},
+                {
+                    "id": 1,
+                    "email": "queued@example.com",
+                    "password_setup_status": "queued",
+                    "password_setup_next_retry_at": "2026-08-17T12:00:15",
+                },
+                {
+                    "id": 2,
+                    "email": "running@example.com",
+                    "password_setup_status": "running",
+                    "password_setup_next_retry_at": "2026-08-17T12:00:15",
+                },
                 {"id": 3, "email": "done@example.com", "password_setup_status": "success"},
             ]), encoding="utf-8")
             with self._stack(*self._db_paths(root)):
@@ -168,6 +178,8 @@ class AccountListQueryTests(unittest.TestCase):
             self.assertEqual(rows[1]["password_setup_status"], "failed")
             self.assertEqual(rows[2]["password_setup_status"], "failed")
             self.assertIn("WebUI 重启", rows[1]["password_setup_error"])
+            self.assertIsNone(rows[1].get("password_setup_next_retry_at"))
+            self.assertIsNone(rows[2].get("password_setup_next_retry_at"))
             self.assertEqual(rows[3]["password_setup_status"], "success")
 
     @staticmethod

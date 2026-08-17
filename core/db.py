@@ -1411,6 +1411,7 @@ def claim_account_password_setup(
         row["password_setup_completed_at"] = None
         row["password_setup_ok"] = None
         row["password_setup_error"] = None
+        row["password_setup_next_retry_at"] = None
         row["updated_at"] = now
         _save_accounts(rows)
         return True
@@ -1422,6 +1423,7 @@ def requeue_account_password_setup(
     *,
     attempt: int,
     max_attempts: int,
+    next_retry_at: str | None = None,
 ) -> bool:
     """设置密码临时失败后重新排队；新的 queued_at 保证任务进入队尾。"""
     with _LOCK:
@@ -1435,6 +1437,7 @@ def requeue_account_password_setup(
         row["password_setup_max_attempts"] = max(1, int(max_attempts))
         row["password_setup_last_error"] = str(error or "")[:500]
         row["password_setup_error"] = None
+        row["password_setup_next_retry_at"] = str(next_retry_at or "").strip() or None
         row["password_setup_queued_at"] = now
         row["password_setup_started_at"] = None
         row["password_setup_completed_at"] = None
@@ -1453,6 +1456,7 @@ def mark_account_password_setup_running(acc_id: int) -> bool:
         now = _now()
         row["password_setup_status"] = "running"
         row["password_setup_started_at"] = now
+        row["password_setup_next_retry_at"] = None
         row["updated_at"] = now
         _save_accounts(rows)
         return True
@@ -1474,6 +1478,7 @@ def update_account_password_setup(acc_id: int, result: dict | None = None) -> bo
         row["password_setup_completed_at"] = now
         row["password_setup_error"] = None if ok else str(result.get("error") or "设置密码失败")[:500]
         row["password_setup_last_error"] = None if ok else row["password_setup_error"]
+        row["password_setup_next_retry_at"] = None
         if ok and str(result.get("password") or "").strip():
             raw = row.get("extra_json")
             if isinstance(raw, dict):
@@ -1508,6 +1513,7 @@ def recover_interrupted_password_setups() -> int:
             row["password_setup_ok"] = False
             row["password_setup_error"] = message
             row["password_setup_last_error"] = message
+            row["password_setup_next_retry_at"] = None
             row["password_setup_completed_at"] = now
             row["updated_at"] = now
             recovered += 1
