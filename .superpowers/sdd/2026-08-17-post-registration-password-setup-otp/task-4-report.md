@@ -121,3 +121,38 @@ git diff --check
 - 未改变 15/60/180 秒退避、队满 5 秒重排、非阻塞取槽、密码单次解析/跨尝试复用和最大总尝试 3 次的语义。
 - 未修改 `core/db.py`、`config/roxybrowser.py`、GenericAPI、注册交接、OTP backend 或 WebUI。
 - 新增失败状态文本只包含固定原因和异常类型，不包含异常 message、目标密码或 OTP。
+
+## Fix round 2（日志密码边界与 Timer 构造覆盖）
+
+### RED
+
+新增 direct-log、backend progress callback 密码脱敏，以及 Timer 构造器异常回归测试后执行：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_password_setup_task_service.py tests/test_password_setup_concurrency.py tests/test_account_list_query.py -q
+```
+
+真实输出：
+
+```text
+..F..............F...............................                        [100%]
+2 failed, 47 passed in 12.58s
+```
+
+失败分别证明 `_append_password_setup_log` 尚不接受目标密码，以及 backend progress callback 会把目标密码写入日志。Timer 构造器异常测试在 RED 阶段已通过，确认 round 1 的同一 `try` 已覆盖 Timer 构造和 `start()`。
+
+### GREEN
+
+实现后执行同一命令：
+
+```text
+.................................................                        [100%]
+49 passed in 11.00s
+```
+
+### 修复内容与自审
+
+- `_append_password_setup_log` 新增可选 `password` 参数，在最终文件写入边界同时脱敏目标密码与独立 6 位 OTP。
+- `_run_password_setup_task` 的 backend progress callback、诊断错误日志和最终失败日志均传入本次目标密码。
+- 新增 Timer 构造器直接抛异常测试，验证状态收敛为 `failed`、`next_retry_at` 清空，且异常 message 中的密码/OTP 不泄露。
+- 未改变退避、槽位、attempt 上限、密码复用、profile/OTP 执行流程；未修改计划外文件。

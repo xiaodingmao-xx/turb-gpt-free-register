@@ -166,17 +166,76 @@ class PasswordSetupTaskServiceTests(unittest.TestCase):
     def test_password_setup_log_is_written_to_dedicated_file(self):
         from core import password_setup_task_service as service
 
+        password = "direct-log-secret-password"
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             with patch.object(service, "_LOG_DIR", root):
                 service._append_password_setup_log("user@example.com", "[设置密码] 已入队", clear=True)
-                service._append_password_setup_log("user@example.com", "[设置密码] 失败：OTP 112233")
+                service._append_password_setup_log(
+                    "user@example.com",
+                    f"[设置密码] 失败：OTP 112233 password={password}",
+                    password=password,
+                )
                 path = service.password_setup_log_path("user@example.com")
                 self.assertEqual(path, root / "password-setup-user@example.com.log")
                 content = path.read_text(encoding="utf-8")
         self.assertIn("[设置密码] 已入队", content)
         self.assertIn("<otp-redacted>", content)
         self.assertNotIn("112233", content)
+        self.assertNotIn(password, content)
+
+    def test_backend_progress_callback_redacts_target_password_at_log_boundary(self):
+        from core import db
+        from core import password_setup_task_service as service
+        from core.roxybrowser_client import RoxyOpenResult
+
+        password = "progress-secret-password"
+
+        class FakeDriver:
+            def quit(self):
+                pass
+
+        class FakeClient:
+            def open_profile(self, profile_id, *, allow_existing_profile=False):
+                return RoxyOpenResult(profile_id, {"code": 0})
+
+            def cleanup_profile(self, opened):
+                pass
+
+        def emit_sensitive_progress(driver, email, *, progress_callback, **kwargs):
+            progress_callback(f"backend progress password={password}")
+            return password
+
+        account = {
+            "id": 1,
+            "email": "user@example.com",
+            "extra_json": json.dumps({"roxybrowser": {"profile_id": "profile-1"}}),
+        }
+        with tempfile.TemporaryDirectory() as td, patch.object(
+            service, "_LOG_DIR", Path(td)
+        ), patch.object(
+            db, "mark_account_password_setup_running", return_value=True
+        ), patch.object(db, "get_account", return_value=account), patch.object(
+            db, "update_account_password_setup", return_value=True
+        ), patch(
+            "core.roxybrowser_client.RoxyBrowserClient", return_value=FakeClient()
+        ), patch(
+            "core.roxy_registration._build_driver", return_value=FakeDriver()
+        ), patch(
+            "core.roxy_registration._run_roxy_password_setup", side_effect=emit_sensitive_progress
+        ):
+            result = service._run_password_setup_task(
+                account_id=1,
+                email="user@example.com",
+                mode="post_login_add_password",
+                password=password,
+            )
+            content = service.password_setup_log_path("user@example.com").read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"])
+        self.assertIn("backend progress", content)
+        self.assertIn("<redacted>", content)
+        self.assertNotIn(password, content)
 
     def test_password_setup_failure_writes_process_and_error_logs(self):
         from core import db
@@ -504,6 +563,45 @@ class PasswordSetupTaskServiceTests(unittest.TestCase):
 
             def start(self):
                 raise RuntimeError(f"timer failed OTP {otp} password={password}")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "accounts.json").write_text(json.dumps([{
+                "id": 1,
+                "email": "user@example.com",
+                "password_setup_status": "failed",
+            }]), encoding="utf-8")
+            with self._stack(*self._db_paths(root)), patch.object(
+                service, "_LOG_DIR", root
+            ), patch.object(service.threading, "Timer", FailingTimer):
+                scheduled = service._schedule_password_setup_retry(
+                    account_id=1,
+                    email="user@example.com",
+                    mode="post_login_add_password",
+                    password=password,
+                    result={"retryable": True, "error": "timeout", "attempt": 1, "max_attempts": 3},
+                )
+                row = db.get_account(1)
+                content = service.password_setup_log_path("user@example.com").read_text(encoding="utf-8")
+
+        self.assertFalse(scheduled)
+        self.assertEqual(row["password_setup_status"], "failed")
+        self.assertIsNone(row.get("password_setup_next_retry_at"))
+        sensitive_outputs = f"{row.get('password_setup_error')}\n{row.get('password_setup_last_error')}\n{content}"
+        self.assertIn("RuntimeError", sensitive_outputs)
+        self.assertNotIn(otp, sensitive_outputs)
+        self.assertNotIn(password, sensitive_outputs)
+
+    def test_retry_timer_constructor_failure_marks_account_failed_without_leaking_exception(self):
+        from core import db
+        from core import password_setup_task_service as service
+
+        otp = "556677"
+        password = "constructor-secret-password"
+
+        class FailingTimer:
+            def __init__(self, interval, function):
+                raise RuntimeError(f"constructor failed OTP {otp} password={password}")
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

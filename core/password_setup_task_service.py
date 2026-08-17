@@ -28,13 +28,20 @@ def password_setup_log_path(email: str) -> Path:
     return _LOG_DIR / f"password-setup-{safe}.log"
 
 
-def _append_password_setup_log(email: str, line: str, *, level: str = "INFO", clear: bool = False) -> None:
+def _append_password_setup_log(
+    email: str,
+    line: str,
+    *,
+    password: str = "",
+    level: str = "INFO",
+    clear: bool = False,
+) -> None:
     try:
         path = password_setup_log_path(email)
         path.parent.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%H:%M:%S")
         mode = "w" if clear else "a"
-        safe_line = redact_password(str(line or ""), "")
+        safe_line = redact_password(str(line or ""), password)
         with path.open(mode, encoding="utf-8") as handle:
             handle.write(f"{stamp} [{level}] {safe_line}\n")
     except Exception:
@@ -346,7 +353,11 @@ def _run_password_setup_task(*, account_id: int, email: str, mode: str, password
             email,
             mode=mode,
             password=password,
-            progress_callback=lambda message: _append_password_setup_log(email, message),
+            progress_callback=lambda message: _append_password_setup_log(
+                email,
+                message,
+                password=password,
+            ),
         )
         result = {
             "ok": True,
@@ -393,11 +404,17 @@ def _run_password_setup_task(*, account_id: int, email: str, mode: str, password
                     opened_profile_id=profile_for_log,
                     driver=driver,
                 ),
+                password=password,
                 level="ERROR",
             )
         except Exception:
             logger.exception("password setup diagnostic log failed email=%s", email)
-        _append_password_setup_log(email, f"[设置密码] 失败：{error_text}", level="ERROR")
+        _append_password_setup_log(
+            email,
+            f"[设置密码] 失败：{error_text}",
+            password=password,
+            level="ERROR",
+        )
         try:
             db.update_account_password_setup(account_id, result)
         except Exception:
