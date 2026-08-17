@@ -2332,12 +2332,16 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
         _check_manual_stop()
 
         current_otp = otp_code
+        rejected_codes: set[str] = set()
         max_otp_attempts = 3
         for otp_attempt in range(1, max_otp_attempts + 1):
             if current_otp is None:
                 logger.info("[Roxy注册][OTP] 等待验证码：%s（第 %s/%s 次）", email, otp_attempt, max_otp_attempts)
                 try:
-                    current_otp = wait_for_otp(email, after_ts=otp_after_ts)
+                    otp_kwargs = {"after_ts": otp_after_ts}
+                    if rejected_codes:
+                        otp_kwargs["exclude_codes"] = rejected_codes
+                    current_otp = wait_for_otp(email, **otp_kwargs)
                 except Exception as exc:
                     if otp_attempt >= max_otp_attempts:
                         raise
@@ -2370,6 +2374,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
                 break
             if otp_attempt >= max_otp_attempts:
                 raise RuntimeError("邮箱验证码连续错误/过期，已达到最大重试次数")
+            rejected_codes.add(str(current_otp).strip())
             logger.warning("[Roxy注册][OTP] 验证码错误/过期，准备重新发送并重新获取验证码（%s/%s）", otp_attempt + 1, max_otp_attempts)
             otp_after_ts = time.time()
             _click_resend_email_otp(driver, timeout=25)
