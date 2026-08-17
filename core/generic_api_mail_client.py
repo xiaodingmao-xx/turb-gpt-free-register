@@ -605,6 +605,98 @@ def get_account_context(email: str) -> GenericApiEmailAccount | None:
     return account
 
 
+@dataclass(frozen=True)
+class OtpBaseline:
+    codes: frozenset[str]
+    message_ids: frozenset[str]
+    captured_at: float
+
+
+def _matches_otp_baseline(
+    observation: GenericOtpObservation,
+    baseline: OtpBaseline | None,
+    after_ts: float | None,
+) -> bool:
+    """无新时间戳/消息 ID 证明时，判断候选是否仍是触发前基线。"""
+    if baseline is None or not observation.code:
+        return False
+    if (
+        observation.msg_ts is not None
+        and after_ts is not None
+        and observation.msg_ts + 2 >= after_ts
+    ):
+        return False
+    if observation.message_id and baseline.message_ids:
+        return observation.message_id in baseline.message_ids
+    return observation.code in baseline.codes
+
+
+def _fetch_current_observation(account: GenericApiEmailAccount) -> GenericOtpObservation:
+    """只读取一次取码接口当前状态，不等待、不执行 settle。"""
+    headers = {
+        "Accept": "application/json,text/plain,*/*",
+        "User-Agent": "Mozilla/5.0 (compatible; gpt-register/1.0)",
+    }
+    session = requests.Session()
+    if _parse_yangyang_code_url(account.code_url):
+        result = _fetch_yangyang_otp(session, account.code_url, headers)
+        if result:
+            code, meta = result
+            return GenericOtpObservation(
+                code=code,
+                source="yangyang",
+                received_at=meta.get("received_at"),
+                msg_ts=meta.get("msg_ts"),
+                message_id=str(meta.get("mail_id")) if meta.get("mail_id") is not None else None,
+                structured=True,
+            )
+        return GenericOtpObservation(None, "yangyang", None, None, None, True)
+
+    response = session.get(account.code_url, headers=headers, timeout=20, verify=False)
+    if response.status_code != 200:
+        raise GenericApiMailError(f"基线接口 HTTP {response.status_code}: {(response.text or '')[:160]}")
+    observation = _parse_generic_api_observation(response.text or "")
+    if observation.structured:
+        return observation
+    return replace(
+        observation,
+        code=_extract_code(response.text or ""),
+        source="plain_text",
+    )
+
+
+def capture_otp_baseline(email: str, attempts: int = 3) -> OtpBaseline:
+    """在触发发信前记录取码接口状态，防止缓存验证码成为首个候选。"""
+    account = get_account_context(email)
+    if account is None:
+        raise GenericApiMailError(f"通用 API 邮箱不存在或未导入: {email}")
+
+    last_error = ""
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        try:
+            observation = _fetch_current_observation(account)
+            codes = frozenset({observation.code}) if observation.code else frozenset()
+            message_ids = (
+                frozenset({observation.message_id})
+                if observation.message_id else frozenset()
+            )
+            baseline = OtpBaseline(codes, message_ids, time.time())
+            logger.info(
+                "[GenericAPI] 已抓取 OTP 基线: email=%s code_count=%s message_ids=%s captured_at=%s",
+                email,
+                len(baseline.codes),
+                sorted(baseline.message_ids),
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(baseline.captured_at)),
+            )
+            return baseline
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            if attempt < attempts:
+                time.sleep(1)
+
+    raise GenericApiMailError(f"抓取验证码接口基线失败: {email}; {last_error}")
+
+
 def release_account(email: str, status: str = "available", note: str | None = None) -> None:
     from core.db import release_generic_api_email
     release_generic_api_email(email, status=status, note=note)
@@ -618,6 +710,7 @@ def fetch_latest_otp(
     poll_interval: int | None = None,
     settle_seconds: int | None = None,
     exclude_codes=None,
+    otp_baseline: OtpBaseline | None = None,
 ) -> str:
     """
     轮询该邮箱配置的 code_url，直到提取到 6 位验证码或超时。
@@ -665,6 +758,25 @@ def fetch_latest_otp(
                     code = None
                 else:
                     now_seen = time.time()
+                    observation = GenericOtpObservation(
+                        code=code,
+                        source="yangyang",
+                        received_at=yy_meta.get("received_at"),
+                        msg_ts=yy_meta.get("msg_ts"),
+                        message_id=(
+                            str(yy_meta.get("mail_id"))
+                            if yy_meta.get("mail_id") is not None else None
+                        ),
+                        structured=True,
+                    )
+                    if _matches_otp_baseline(observation, otp_baseline, after_ts):
+                        last_error = (
+                            f"基线验证码未变化: code={code} "
+                            f"message_id={observation.message_id}"
+                        )
+                        resp = None
+                        text = ""
+                        code = None
                 if code:
                  if not best_otp:
                     best_otp = code
@@ -726,6 +838,12 @@ def fetch_latest_otp(
                     structured_meta = {}
                 if code in excluded_codes:
                     last_error = "忽略接口返回的旧 OTP"
+                    code = None
+                elif code and _matches_otp_baseline(observation, otp_baseline, after_ts):
+                    last_error = (
+                        f"基线验证码未变化: code={code} "
+                        f"message_id={observation.message_id}"
+                    )
                     code = None
                 if code:
                     now_seen = time.time()

@@ -8,6 +8,7 @@ from unittest.mock import patch
 from core.generic_api_mail_client import (
     GenericApiEmailAccount,
     GenericApiMailError,
+    OtpBaseline,
     _decode_data_uri,
     _extract_code,
     _extract_structured_api_code,
@@ -15,6 +16,7 @@ from core.generic_api_mail_client import (
     _html_to_visible_text,
     _parse_generic_api_observation,
     _parse_yangyang_code_url,
+    capture_otp_baseline,
     fetch_latest_otp,
 )
 
@@ -116,6 +118,16 @@ class FakeOldStructuredCodeSession:
         return FakeResponse(text=json.dumps(self.payload))
 
 
+class FakeSingleResponseSession:
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = 0
+
+    def get(self, _url, **_kwargs):
+        self.calls += 1
+        return FakeResponse(text=json.dumps(self.payload))
+
+
 class GenericApiYangyangTests(unittest.TestCase):
     def test_structured_old_code_is_recognized_but_rejected(self):
         payload = json.dumps({
@@ -184,6 +196,60 @@ class GenericApiYangyangTests(unittest.TestCase):
                     poll_interval=1,
                     settle_seconds=0,
                 )
+
+    def test_capture_baseline_records_cached_code_before_trigger(self):
+        account = GenericApiEmailAccount(
+            "user@example.com",
+            "https://mail.example/code",
+        )
+        session = FakeSingleResponseSession({
+            "code": "174510",
+            "message_id": "mail-before-trigger",
+        })
+
+        with patch("core.generic_api_mail_client.get_account_context", return_value=account), patch(
+            "core.generic_api_mail_client.requests.Session", return_value=session
+        ):
+            baseline = capture_otp_baseline(account.email, attempts=1)
+
+        self.assertEqual(baseline.codes, frozenset({"174510"}))
+        self.assertEqual(baseline.message_ids, frozenset({"mail-before-trigger"}))
+        self.assertGreater(baseline.captured_at, 0)
+
+    def test_capture_baseline_raises_after_request_failures(self):
+        account = GenericApiEmailAccount(
+            "user@example.com",
+            "https://mail.example/code",
+        )
+
+        with patch("core.generic_api_mail_client.get_account_context", return_value=account), patch(
+            "core.generic_api_mail_client.requests.Session.get",
+            side_effect=RuntimeError("baseline timeout"),
+        ), patch("core.generic_api_mail_client.time.sleep"):
+            with self.assertRaisesRegex(GenericApiMailError, "基线"):
+                capture_otp_baseline(account.email, attempts=3)
+
+    def test_polling_waits_until_code_changes_from_baseline(self):
+        account = GenericApiEmailAccount(
+            "user@example.com",
+            "https://mail.example/code",
+        )
+        session = FakeChangingCodeSession()
+        baseline = OtpBaseline(frozenset({"111111"}), frozenset(), 1.0)
+
+        with patch("core.generic_api_mail_client.get_account_context", return_value=account), patch(
+            "core.generic_api_mail_client.requests.Session", return_value=session
+        ), patch("core.generic_api_mail_client.time.sleep"):
+            code = fetch_latest_otp(
+                account.email,
+                max_wait=2,
+                poll_interval=1,
+                settle_seconds=0,
+                otp_baseline=baseline,
+            )
+
+        self.assertEqual(code, "222222")
+        self.assertEqual(session.calls, 2)
 
     def test_html_visible_text_removes_nonvisible_digits(self):
         source = """
