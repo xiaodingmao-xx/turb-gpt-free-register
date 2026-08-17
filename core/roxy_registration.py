@@ -2332,6 +2332,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
         _check_manual_stop()
 
         current_otp = otp_code
+        # 同一次注册中，页面已经拒绝的验证码不再重复提交。
         rejected_codes: set[str] = set()
         max_otp_attempts = 3
         for otp_attempt in range(1, max_otp_attempts + 1):

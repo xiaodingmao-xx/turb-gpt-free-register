@@ -26,6 +26,7 @@ from config import email as _email_cfg
 logger = logging.getLogger(__name__)
 
 _CODE_REGEX = re.compile(r"\b(\d{6})\b")
+# 仅用于识别 HTML 响应，真正提取时必须先转换为用户可见文本。
 _HTML_MARKER_RE = re.compile(
     r"<(?:!doctype|html|head|body|style|script|table|div|p|span|br|strong)\b",
     re.IGNORECASE,
@@ -262,6 +263,7 @@ def _extract_structured_api_code(text: str, after_ts: float | None = None) -> tu
     if not isinstance(data, dict):
         return None
 
+    # 信封接口的 message 才是邮件正文，不能把 email 等元数据一起扫描。
     if data.get("ok") is False or data.get("found") is False:
         return None
 
