@@ -251,6 +251,24 @@ class GenericApiYangyangTests(unittest.TestCase):
         self.assertEqual(code, "222222")
         self.assertEqual(session.calls, 2)
 
+    def test_timeout_does_not_return_unsettled_candidate(self):
+        account = GenericApiEmailAccount(
+            "user@example.com",
+            "https://mail.example/code",
+        )
+        session = FakeSingleResponseSession({"code": "107902"})
+
+        with patch("core.generic_api_mail_client.get_account_context", return_value=account), patch(
+            "core.generic_api_mail_client.requests.Session", return_value=session
+        ), patch("core.generic_api_mail_client.time.sleep"):
+            with self.assertRaisesRegex(GenericApiMailError, "settle 未完成"):
+                fetch_latest_otp(
+                    account.email,
+                    max_wait=0.01,
+                    poll_interval=1,
+                    settle_seconds=30,
+                )
+
     def test_html_visible_text_removes_nonvisible_digits(self):
         source = """
         <html><head><style>.x { color: #111111; }</style></head>

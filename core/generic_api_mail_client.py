@@ -67,6 +67,7 @@ class GenericOtpObservation:
     message_id: str | None
     structured: bool
     rejection_reason: str | None = None
+    subject: str | None = None
 
 
 def _flatten_json(obj) -> str:
@@ -349,6 +350,7 @@ def _parse_generic_api_observation(
         message_id=str(message_id) if message_id is not None else None,
         structured=True,
         rejection_reason=rejection_reason,
+        subject=str(data.get("subject") or "") or None,
     )
 
 
@@ -821,9 +823,19 @@ def fetch_latest_otp(
                         "received_at": observation.received_at,
                         "msg_ts": observation.msg_ts,
                         "message_id": observation.message_id,
-                        "subject": None,
+                        "subject": observation.subject,
                     }
                     if observation.rejection_reason:
+                        logger.info(
+                            "[GenericAPI] OTP候选 decision=reject_candidate code=%s source=%s "
+                            "message_id=%s msg_ts=%s after_ts=%s reason=%s",
+                            observation.code,
+                            observation.source,
+                            observation.message_id,
+                            observation.msg_ts,
+                            after_ts,
+                            observation.rejection_reason,
+                        )
                         last_error = (
                             f"结构化候选被拒绝: reason={observation.rejection_reason} "
                             f"ts={observation.received_at} message_id={observation.message_id}"
@@ -840,6 +852,15 @@ def fetch_latest_otp(
                     last_error = "忽略接口返回的旧 OTP"
                     code = None
                 elif code and _matches_otp_baseline(observation, otp_baseline, after_ts):
+                    logger.info(
+                        "[GenericAPI] OTP候选 decision=wait_for_change code=%s source=%s "
+                        "message_id=%s msg_ts=%s after_ts=%s baseline_hit=True",
+                        code,
+                        observation.source,
+                        observation.message_id,
+                        observation.msg_ts,
+                        after_ts,
+                    )
                     last_error = (
                         f"基线验证码未变化: code={code} "
                         f"message_id={observation.message_id}"
@@ -910,7 +931,8 @@ def fetch_latest_otp(
         time.sleep(interval)
 
     if best_otp:
-        logger.warning(f"[GenericAPI] 总超时但已有候选，返回 OTP={best_otp}")
-        return best_otp
+        raise GenericApiMailError(
+            f"等待通用 API 验证码超时: {email}; 候选 {best_otp} 的 settle 未完成"
+        )
 
     raise GenericApiMailError(f"等待通用 API 验证码超时: {email}; {last_error}")
