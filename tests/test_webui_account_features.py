@@ -355,6 +355,37 @@ class WebUiAccountFeatureTests(unittest.TestCase):
         self.assertEqual(row["password_setup_max_attempts"], 3)
         self.assertEqual(row["password_setup_last_error"], "TimeoutException: page load timeout")
 
+    @patch("webui.app.password_setup_task_service.queue_settings")
+    @patch("webui.app.db.list_accounts_page")
+    def test_account_list_exposes_delayed_password_setup_retry_without_executor_position(self, list_page, queue_settings):
+        list_page.return_value = {
+            "items": [{
+                "id": 7,
+                "email": "user@example.com",
+                "password_setup_status": "queued",
+                "password_setup_attempt": 2,
+                "password_setup_max_attempts": 3,
+                "password_setup_next_retry_at": "2026-08-17T16:30:00",
+            }],
+            "total": 1,
+            "sources": [],
+            "revision": "1:now",
+        }
+        queue_settings.return_value = {
+            "positions": {}, "waiting": 0, "delayed": 1,
+        }
+
+        response = self.client.get("/api/accounts?paged=1&page=1&page_size=20")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(
+            payload["items"][0]["password_setup_next_retry_at"],
+            "2026-08-17T16:30:00",
+        )
+        self.assertNotIn("password_setup_queue_position", payload["items"][0])
+        self.assertEqual(payload["password_setup_queue"]["delayed"], 1)
+
     def test_account_template_displays_password_retry_attempt_and_failure_state(self):
         template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"
         html = template.read_text(encoding="utf-8")
@@ -362,6 +393,14 @@ class WebUiAccountFeatureTests(unittest.TestCase):
         self.assertIn("password_setup_last_error", html)
         self.assertIn("失败后已重新排队", html)
         self.assertIn("最终失败", html)
+
+    def test_account_template_displays_delayed_password_setup_retry_time(self):
+        template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"
+        html = template.read_text(encoding="utf-8")
+
+        self.assertIn("password_setup_next_retry_at", html)
+        self.assertIn("注册成功，等待设置密码", html)
+        self.assertIn("后重试", html)
 
     @patch("webui.app.db.list_dead_account_candidates")
     def test_dead_archive_preview_returns_non_sensitive_candidates(self, candidates):

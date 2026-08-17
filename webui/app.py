@@ -130,6 +130,7 @@ def _compact_account_for_list(row: dict) -> dict:
         "password_setup_error", "password_setup_queued_at", "password_setup_started_at",
         "password_setup_completed_at", "password_setup_attempt",
         "password_setup_max_attempts", "password_setup_last_error",
+        "password_setup_next_retry_at",
     ):
         if key in row:
             out[key] = row.get(key)
