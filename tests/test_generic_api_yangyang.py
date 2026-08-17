@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import base64
+import json
 import unittest
 from unittest.mock import patch
 
@@ -7,7 +8,10 @@ from core.generic_api_mail_client import (
     GenericApiEmailAccount,
     GenericApiMailError,
     _decode_data_uri,
+    _extract_code,
+    _extract_structured_api_code,
     _fetch_yangyang_otp,
+    _html_to_visible_text,
     _parse_yangyang_code_url,
     fetch_latest_otp,
 )
@@ -79,6 +83,71 @@ class FakeChangingCodeSession:
 
 
 class GenericApiYangyangTests(unittest.TestCase):
+    def test_html_visible_text_removes_nonvisible_digits(self):
+        source = """
+        <html><head><style>.x { color: #111111; }</style></head>
+        <body data-build="222222">
+          <script>const tracking = 333333;</script>
+          <p>Hello, no login code is present.</p>
+        </body></html>
+        """
+        visible = _html_to_visible_text(source)
+        self.assertIn("Hello, no login code is present.", visible)
+        self.assertNotRegex(visible, r"111111|222222|333333")
+
+    def test_structured_message_does_not_treat_css_black_as_otp(self):
+        payload = json.dumps({
+            "email": "user@example.com",
+            "found": True,
+            "message": '<p style="color: #000000">New sign-in to your account</p>',
+            "ok": True,
+        })
+        self.assertIsNone(_extract_structured_api_code(payload))
+
+    def test_structured_html_prefers_visible_otp_over_css(self):
+        payload = json.dumps({
+            "email": "user@example.com",
+            "found": True,
+            "message": (
+                '<div style="color: #000000">'
+                "Enter this temporary verification code to continue: "
+                "<strong>992669</strong></div>"
+            ),
+            "ok": True,
+        })
+        code, meta = _extract_structured_api_code(payload)
+        self.assertEqual(code, "992669")
+        self.assertEqual(meta["source"], "html_visible_text")
+
+    def test_structured_envelope_respects_false_status(self):
+        for key in ("ok", "found"):
+            payload = {
+                "email": "user@example.com",
+                "found": True,
+                "message": "Your verification code is 992669",
+                "ok": True,
+            }
+            payload[key] = False
+            with self.subTest(key=key):
+                self.assertIsNone(_extract_structured_api_code(json.dumps(payload)))
+
+    def test_explicit_json_code_requires_exact_six_digits(self):
+        valid = _extract_structured_api_code(json.dumps({"code": "992669"}))
+        invalid = _extract_structured_api_code(
+            json.dumps({"code": "prefix-992669-suffix"})
+        )
+        self.assertEqual(valid[0], "992669")
+        self.assertEqual(valid[1]["source"], "json_code_field")
+        self.assertIsNone(invalid)
+
+    def test_plain_text_requires_exact_value_or_context(self):
+        self.assertEqual(_extract_code("992669"), "992669")
+        self.assertEqual(
+            _extract_code("Your verification code is 992669"),
+            "992669",
+        )
+        self.assertIsNone(_extract_code("build identifier 992669"))
+
     def test_parse_yangyang_url(self):
         self.assertEqual(
             _parse_yangyang_code_url("http://yangyang.website/messages/tok/a@icloud.com"),

@@ -22,11 +22,14 @@ from urllib.parse import quote, unquote, urlparse, urlunparse
 import requests
 
 from config import email as _email_cfg
-from core.otp_utils import extract_otp
 
 logger = logging.getLogger(__name__)
 
 _CODE_REGEX = re.compile(r"\b(\d{6})\b")
+_HTML_MARKER_RE = re.compile(
+    r"<(?:!doctype|html|head|body|style|script|table|div|p|span|br|strong)\b",
+    re.IGNORECASE,
+)
 _CONTEXT_WORDS = ("code", "verify", "verification", "验证码", "代码", "确认码", "認証", "コード")
 _CONTEXT_CACHE: dict[str, "GenericApiEmailAccount"] = {}
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -91,35 +94,40 @@ def _decode_data_uri(text: str) -> str:
         return text
 
 
-def _extract_code(text: str) -> str | None:
-    """从纯文本/HTML/JSON 文本中提取 6 位 OTP。"""
-    if not text:
+def _html_to_visible_text(text: str) -> str:
+    """删除 HTML/CSS/脚本和标签属性，只保留用户可见文本。"""
+    body = _decode_data_uri(text or "")
+    body = re.sub(
+        r"<(style|script|head)\b[^>]*>.*?</\1\s*>",
+        " ",
+        body,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    body = re.sub(r"<[^>]+>", " ", body)
+    body = html_lib.unescape(body)
+    return re.sub(r"\s+", " ", body).strip()
+
+
+def _extract_code(text: str, *, is_html: bool | None = None) -> str | None:
+    """从纯文本或 HTML 可见正文中提取可信的 6 位 OTP。"""
+    body = _decode_data_uri(text or "").strip()
+    if not body:
         return None
 
-    # 兼容 JSON：优先把所有 value 拉平再抽取。
-    candidates_text = [_decode_data_uri(text), text]
-    try:
-        parsed = json.loads(text)
-        candidates_text.insert(0, _decode_data_uri(_flatten_json(parsed)))
-    except Exception:
-        pass
+    html_input = bool(_HTML_MARKER_RE.search(body)) if is_html is None else is_html
+    searchable = _html_to_visible_text(body) if html_input else html_lib.unescape(body)
+    searchable = searchable.strip()
+    if re.fullmatch(r"\d{6}", searchable):
+        return searchable
 
-    for body in candidates_text:
-        # 复用邮件 OTP 抽取逻辑。
-        code = extract_otp({"text": body, "content": body, "subject": body[:200]})
-        if code:
-            return code
-
-        codes = _CODE_REGEX.findall(body)
-        if not codes:
-            continue
-        lower = body.lower()
-        for code in codes:
-            idx = lower.find(code)
-            window = lower[max(0, idx - 80): idx + 86]
-            if any(w.lower() in window for w in _CONTEXT_WORDS):
-                return code
-        return codes[-1]
+    lower = searchable.lower()
+    for match in _CODE_REGEX.finditer(searchable):
+        window = lower[
+            max(0, match.start() - 80):
+            min(len(lower), match.end() + 80)
+        ]
+        if any(word.lower() in window for word in _CONTEXT_WORDS):
+            return match.group(1)
     return None
 
 
@@ -254,22 +262,45 @@ def _extract_structured_api_code(text: str, after_ts: float | None = None) -> tu
     if not isinstance(data, dict):
         return None
 
-    # 常见字段优先级：code / otp / verification_code；没有再回退从拉平文本提取。
-    raw_code = (
-        data.get("code")
-        or data.get("otp")
-        or data.get("verification_code")
-        or data.get("verificationCode")
-        or data.get("email_code")
-        or data.get("emailCode")
+    if data.get("ok") is False or data.get("found") is False:
+        return None
+
+    raw_code = next(
+        (
+            data.get(name)
+            for name in (
+                "code",
+                "otp",
+                "verification_code",
+                "verificationCode",
+                "email_code",
+                "emailCode",
+            )
+            if data.get(name) is not None
+        ),
+        None,
     )
     code = None
+    source = ""
     if raw_code is not None:
-        m = _CODE_REGEX.search(str(raw_code))
-        if m:
-            code = m.group(1)
-    if not code:
-        code = _extract_code(_flatten_json(data))
+        value = str(raw_code).strip()
+        if re.fullmatch(r"\d{6}", value):
+            code = value
+            source = "json_code_field"
+    else:
+        message = next(
+            (
+                data.get(name)
+                for name in ("message", "text", "content", "html", "body")
+                if isinstance(data.get(name), str) and data.get(name).strip()
+            ),
+            "",
+        )
+        decoded_message = _decode_data_uri(message)
+        is_html = bool(_HTML_MARKER_RE.search(decoded_message))
+        code = _extract_code(message, is_html=is_html)
+        source = "html_visible_text" if is_html else "plain_text"
+
     if not code:
         return None
 
@@ -294,7 +325,7 @@ def _extract_structured_api_code(text: str, after_ts: float | None = None) -> tu
         return None
 
     return code, {
-        "source": "structured_api",
+        "source": source,
         "received_at": ts_raw,
         "msg_ts": msg_ts,
         "subject": data.get("subject"),
