@@ -8,6 +8,12 @@ from webui import config_editor
 
 
 class ConfigDefaultFallbackTests(unittest.TestCase):
+    def test_generic_api_otp_freshness_defaults(self):
+        from config import email
+
+        self.assertEqual(email.OTP_MAX_MESSAGE_AGE_SECONDS, 3600)
+        self.assertTrue(email.GENERIC_API_REQUIRE_BASELINE)
+
     def test_blank_env_value_uses_default_for_all_supported_types(self):
         old_loaded = env_loader._LOADED
         env_loader._LOADED = True
