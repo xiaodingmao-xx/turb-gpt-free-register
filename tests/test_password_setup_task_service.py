@@ -170,12 +170,13 @@ class PasswordSetupTaskServiceTests(unittest.TestCase):
             root = Path(td)
             with patch.object(service, "_LOG_DIR", root):
                 service._append_password_setup_log("user@example.com", "[设置密码] 已入队", clear=True)
-                service._append_password_setup_log("user@example.com", "[设置密码] 失败：示例错误")
+                service._append_password_setup_log("user@example.com", "[设置密码] 失败：OTP 112233")
                 path = service.password_setup_log_path("user@example.com")
                 self.assertEqual(path, root / "password-setup-user@example.com.log")
                 content = path.read_text(encoding="utf-8")
         self.assertIn("[设置密码] 已入队", content)
-        self.assertIn("[设置密码] 失败：示例错误", content)
+        self.assertIn("<otp-redacted>", content)
+        self.assertNotIn("112233", content)
 
     def test_password_setup_failure_writes_process_and_error_logs(self):
         from core import db
@@ -197,6 +198,45 @@ class PasswordSetupTaskServiceTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("[设置密码] 开始后台执行", content)
         self.assertIn("[设置密码] 失败", content)
+
+    def test_backend_failure_redacts_otp_from_result_log_and_account_errors(self):
+        from core import db
+        from core import password_setup_task_service as service
+
+        otp = "654321"
+        password = "target-password-654"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "accounts.json").write_text(json.dumps([{
+                "id": 1,
+                "email": "user@example.com",
+                "extra_json": "{}",
+            }]), encoding="utf-8")
+            with self._stack(*self._db_paths(root)), patch.object(
+                service, "_LOG_DIR", root
+            ), patch(
+                "core.roxybrowser_client.RoxyBrowserClient",
+                side_effect=RuntimeError(f"OTP {otp}; password={password}"),
+            ):
+                self.assertTrue(db.claim_account_password_setup(1))
+                result = service._run_password_setup_task(
+                    account_id=1,
+                    email="user@example.com",
+                    mode="post_login_add_password",
+                    password=password,
+                )
+                row = db.get_account(1)
+                content = service.password_setup_log_path("user@example.com").read_text(encoding="utf-8")
+
+        sensitive_outputs = "\n".join([
+            str(result.get("error") or ""),
+            str(row.get("password_setup_error") or ""),
+            str(row.get("password_setup_last_error") or ""),
+            content,
+        ])
+        self.assertNotIn(otp, sensitive_outputs)
+        self.assertNotIn(password, sensitive_outputs)
+        self.assertIn("<otp-redacted>", sensitive_outputs)
 
     def test_requeue_account_password_setup_preserves_failure_and_moves_to_queued(self):
         from core import db
@@ -362,6 +402,51 @@ class PasswordSetupTaskServiceTests(unittest.TestCase):
             next_retry_at="2026-08-17T12:00:15",
         )
 
+    def test_retry_schedule_redacts_otp_from_requeue_state_and_log(self):
+        from core import db
+        from core import password_setup_task_service as service
+
+        otp = "246810"
+        password = "one-password-for-all-attempts"
+
+        class FakeTimer:
+            def __init__(self, interval, function):
+                self.daemon = False
+
+            def start(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "accounts.json").write_text(json.dumps([{
+                "id": 1,
+                "email": "user@example.com",
+                "password_setup_status": "failed",
+            }]), encoding="utf-8")
+            with self._stack(*self._db_paths(root)), patch.object(
+                service, "_LOG_DIR", root
+            ), patch.object(service.threading, "Timer", FakeTimer):
+                scheduled = service._schedule_password_setup_retry(
+                    account_id=1,
+                    email="user@example.com",
+                    mode="post_login_add_password",
+                    password=password,
+                    result={
+                        "retryable": True,
+                        "error": f"OTP {otp}; password={password}",
+                        "attempt": 1,
+                        "max_attempts": 3,
+                    },
+                )
+                row = db.get_account(1)
+                content = service.password_setup_log_path("user@example.com").read_text(encoding="utf-8")
+
+        self.assertTrue(scheduled)
+        sensitive_outputs = f"{row.get('password_setup_last_error')}\n{content}"
+        self.assertNotIn(otp, sensitive_outputs)
+        self.assertNotIn(password, sensitive_outputs)
+        self.assertIn("<otp-redacted>", sensitive_outputs)
+
     def test_retry_timer_rearms_for_five_seconds_without_consuming_attempt_when_queue_is_full(self):
         from core import db
         from core import password_setup_task_service as service
@@ -405,6 +490,103 @@ class PasswordSetupTaskServiceTests(unittest.TestCase):
         self.assertEqual(requeue.call_count, 2)
         self.assertEqual(requeue.call_args_list[1].kwargs["attempt"], 2)
         self.assertEqual(requeue.call_args_list[1].kwargs["next_retry_at"], "2026-08-17T12:00:05")
+
+    def test_retry_timer_start_failure_marks_account_failed_without_leaking_exception(self):
+        from core import db
+        from core import password_setup_task_service as service
+
+        otp = "334455"
+        password = "timer-secret-password"
+
+        class FailingTimer:
+            def __init__(self, interval, function):
+                self.daemon = False
+
+            def start(self):
+                raise RuntimeError(f"timer failed OTP {otp} password={password}")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "accounts.json").write_text(json.dumps([{
+                "id": 1,
+                "email": "user@example.com",
+                "password_setup_status": "failed",
+            }]), encoding="utf-8")
+            with self._stack(*self._db_paths(root)), patch.object(
+                service, "_LOG_DIR", root
+            ), patch.object(service.threading, "Timer", FailingTimer):
+                scheduled = service._schedule_password_setup_retry(
+                    account_id=1,
+                    email="user@example.com",
+                    mode="post_login_add_password",
+                    password=password,
+                    result={"retryable": True, "error": "timeout", "attempt": 1, "max_attempts": 3},
+                )
+                row = db.get_account(1)
+                content = service.password_setup_log_path("user@example.com").read_text(encoding="utf-8")
+
+        self.assertFalse(scheduled)
+        self.assertEqual(row["password_setup_status"], "failed")
+        self.assertIsNone(row.get("password_setup_next_retry_at"))
+        sensitive_outputs = f"{row.get('password_setup_error')}\n{row.get('password_setup_last_error')}\n{content}"
+        self.assertIn("RuntimeError", sensitive_outputs)
+        self.assertNotIn(otp, sensitive_outputs)
+        self.assertNotIn(password, sensitive_outputs)
+
+    def test_queue_full_requeue_rejection_marks_account_failed_without_rearming(self):
+        from core import db
+        from core import password_setup_task_service as service
+
+        timers = []
+
+        class FakeTimer:
+            def __init__(self, interval, function):
+                self.function = function
+                self.daemon = False
+                timers.append(self)
+
+            def start(self):
+                pass
+
+        slots = Mock()
+        slots.acquire.return_value = False
+        original_requeue = db.requeue_account_password_setup
+        requeue_calls = 0
+
+        def reject_second_requeue(*args, **kwargs):
+            nonlocal requeue_calls
+            requeue_calls += 1
+            if requeue_calls == 1:
+                return original_requeue(*args, **kwargs)
+            return False
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "accounts.json").write_text(json.dumps([{
+                "id": 1,
+                "email": "user@example.com",
+                "password_setup_status": "failed",
+            }]), encoding="utf-8")
+            with self._stack(*self._db_paths(root)), patch.object(
+                service, "_LOG_DIR", root
+            ), patch.object(service.threading, "Timer", FakeTimer), patch.object(
+                service, "_QUEUE_SLOTS", slots
+            ), patch.object(db, "requeue_account_password_setup", side_effect=reject_second_requeue):
+                self.assertTrue(service._schedule_password_setup_retry(
+                    account_id=1,
+                    email="user@example.com",
+                    mode="post_login_add_password",
+                    password="queue-secret-password",
+                    result={"retryable": True, "error": "timeout", "attempt": 1, "max_attempts": 3},
+                ))
+                timers[0].function()
+                row = db.get_account(1)
+                content = service.password_setup_log_path("user@example.com").read_text(encoding="utf-8")
+
+        self.assertEqual(len(timers), 1)
+        self.assertEqual(row["password_setup_status"], "failed")
+        self.assertIsNone(row.get("password_setup_next_retry_at"))
+        self.assertIn("RequeueRejected", f"{row.get('password_setup_error')}\n{content}")
 
     def test_enqueue_resolves_password_once_and_retry_callback_reuses_it(self):
         from core import db

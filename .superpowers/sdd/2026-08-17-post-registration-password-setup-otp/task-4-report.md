@@ -79,3 +79,45 @@ git diff --check
 
 - daemon Timer 是进程内状态，进程退出后不会恢复；现有 `recover_interrupted_password_setups()` 会把遗留 queued/running 任务标记失败，需手动重新提交。这与当前密码只保存在进程内、不能在重启后自动恢复的安全模型一致。
 - 共享工作区包含大量其他任务未提交修改，尤其 `core/db.py` 是混合文件；提交时必须只分离本任务 hunk，否则保持未提交。
+
+## Fix round 1（复核修复）
+
+### RED
+
+新增 OTP 全链路脱敏、Timer 启动失败收敛、队满重排拒绝收敛测试后执行：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_password_setup_task_service.py tests/test_password_setup_concurrency.py tests/test_account_list_query.py -q
+```
+
+真实输出：
+
+```text
+.F..............F..F.......F.F.................                          [100%]
+5 failed, 42 passed in 14.29s
+```
+
+5 个失败分别证明：后端异常 OTP 会进入 result/DB/log；日志最终写入边界不脱敏 OTP；队满后的 requeue 拒绝会遗留 queued；retry 安排会把 OTP 写入 last_error/log；Timer.start 异常会冒泡并遗留 delayed。
+
+### GREEN
+
+实现后执行同一命令：
+
+```text
+...............................................                          [100%]
+47 passed in 11.95s
+```
+
+### 修复内容
+
+- `redact_password` 统一替换独立 6 位数字为 `<otp-redacted>`，同时继续替换当前目标密码。
+- `_append_password_setup_log` 在写文件前再次执行 OTP 脱敏，形成最终日志边界。
+- backend result、DB error/last_error、retry requeue 与安排日志中的 OTP 均被脱敏；enqueue/重试提交异常写 DB 前也统一脱敏。
+- Timer 构造或启动异常不再冒泡：写回 `failed`、清理 `next_retry_at`，仅记录安全异常类型。
+- 队满 callback 的 5 秒 requeue 若被拒绝，不再静默悬挂：写回 `failed`、清理 `next_retry_at`，记录 `RequeueRejected`，不再重臂 Timer。
+
+### Fix round 1 自审
+
+- 未改变 15/60/180 秒退避、队满 5 秒重排、非阻塞取槽、密码单次解析/跨尝试复用和最大总尝试 3 次的语义。
+- 未修改 `core/db.py`、`config/roxybrowser.py`、GenericAPI、注册交接、OTP backend 或 WebUI。
+- 新增失败状态文本只包含固定原因和异常类型，不包含异常 message、目标密码或 OTP。

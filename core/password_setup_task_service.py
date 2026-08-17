@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import json
+import re
 import secrets
 import string
 import threading
@@ -19,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 ALLOWED_MODES = {"post_login_add_password", "post_login_password_reset"}
 _LOG_DIR = Path(__file__).resolve().parent.parent / "注册日志"
+_OTP_PATTERN = re.compile(r"(?<!\d)\d{6}(?!\d)")
 
 
 def password_setup_log_path(email: str) -> Path:
@@ -32,8 +34,9 @@ def _append_password_setup_log(email: str, line: str, *, level: str = "INFO", cl
         path.parent.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%H:%M:%S")
         mode = "w" if clear else "a"
+        safe_line = redact_password(str(line or ""), "")
         with path.open(mode, encoding="utf-8") as handle:
-            handle.write(f"{stamp} [{level}] {line}\n")
+            handle.write(f"{stamp} [{level}] {safe_line}\n")
     except Exception:
         logger.exception("password setup log write failed email=%s", email)
 
@@ -95,7 +98,7 @@ def redact_password(message: str, password: str) -> str:
     secret = str(password or "")
     if secret:
         text = text.replace(secret, "<redacted>")
-    return text[:500]
+    return _OTP_PATTERN.sub("<otp-redacted>", text)[:500]
 
 
 def _is_retryable_password_setup_error(error: Exception) -> bool:
@@ -480,8 +483,9 @@ def enqueue_account_password_setup(
         )
     except Exception as exc:
         _QUEUE_SLOTS.release()
-        _append_password_setup_log(email, f"[设置密码] 入队失败：{type(exc).__name__}: {exc}", level="ERROR")
-        db.update_account_password_setup(int(account_id), {"ok": False, "error": f"入队失败: {exc}"})
+        enqueue_error = redact_password(f"入队失败: {type(exc).__name__}: {exc}", password)
+        _append_password_setup_log(email, f"[设置密码] {enqueue_error}", level="ERROR")
+        db.update_account_password_setup(int(account_id), {"ok": False, "error": enqueue_error})
         return {"accepted": False, "busy": False, "error": "设置密码入队失败"}
     return {
         "accepted": True,
@@ -517,10 +521,28 @@ def _schedule_password_setup_retry(
     ):
         return False
 
-    def arm_timer(timer_delay: int) -> None:
-        timer = threading.Timer(timer_delay, submit_retry)
-        timer.daemon = True
-        timer.start()
+    def mark_retry_failed(*, reason: str, error_type: str) -> None:
+        safe_error = redact_password(f"{reason}: {error_type}", password)
+        try:
+            db.update_account_password_setup(account_id, {"ok": False, "error": safe_error})
+        except Exception:
+            logger.exception("设置密码重试失败状态写回失败 account_id=%s", account_id)
+        _append_password_setup_log(
+            email,
+            f"[设置密码] 自动重试终止 attempt={next_attempt}/{max_attempts} "
+            f"delay=0 next_retry_at=None error_type={error_type}",
+            level="ERROR",
+        )
+
+    def arm_timer(timer_delay: int) -> bool:
+        try:
+            timer = threading.Timer(timer_delay, submit_retry)
+            timer.daemon = True
+            timer.start()
+        except Exception as exc:
+            mark_retry_failed(reason="自动重试定时器启动失败", error_type=type(exc).__name__)
+            return False
+        return True
 
     def submit_retry() -> None:
         if not _QUEUE_SLOTS.acquire(blocking=False):
@@ -539,6 +561,8 @@ def _schedule_password_setup_retry(
                     level="WARNING",
                 )
                 arm_timer(5)
+            else:
+                mark_retry_failed(reason="自动重试状态更新失败", error_type="RequeueRejected")
             return
 
         if not db.requeue_account_password_setup(
@@ -560,7 +584,7 @@ def _schedule_password_setup_retry(
             )
         except Exception as exc:
             _QUEUE_SLOTS.release()
-            submit_error = f"重试入队失败: {type(exc).__name__}: {exc}"
+            submit_error = redact_password(f"重试入队失败: {type(exc).__name__}: {exc}", password)
             db.update_account_password_setup(account_id, {"ok": False, "error": submit_error})
             _append_password_setup_log(
                 email,
@@ -582,8 +606,7 @@ def _schedule_password_setup_retry(
         f"delay={delay} next_retry_at={retry_at} error={error}",
         level="WARNING",
     )
-    arm_timer(delay)
-    return True
+    return arm_timer(delay)
 
 
 def _run_task_wrapper(*, account_id: int, email: str, mode: str, password: str) -> dict:
