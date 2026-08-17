@@ -15,14 +15,62 @@
 - 首次进入设密验证码页不得立即点击 `Resend email`；仅在超时或页面拒绝后重发。
 - 搜索阶段候选在 `OTP_MAX_WAIT` 截止前出现时，必须额外获得完整 `OTP_SETTLE_SECONDS` 确认窗口。
 - `OTP_MAX_WAIT=120`、`OTP_POLL_INTERVAL=3`、`OTP_SETTLE_SECONDS=5` 为默认值；配置仍可通过现有环境覆盖机制调整。
-- `ROXY_PASSWORD_SETUP_MAX_RETRIES=3` 表示首次后台执行之外追加 3 次重试，总执行次数最多 4 次。
+- `ROXY_PASSWORD_SETUP_MAX_RETRIES=3` 保持现有语义：表示后台最大总尝试次数 3；默认退避为 15 秒、60 秒，配置为 4 次以上时才使用 180 秒档。
 - 注册成功与设置密码状态分离；设置密码失败不得把注册任务改成失败或释放已确认邮箱。
 - 后台入队必须发生在 `run_roxy_registration` 的 driver/profile 清理完成之后。
 - 不打印目标密码；新增 OTP 日志使用消息身份、时间和脱敏状态，不新增明文验证码日志。
 - 每个任务结束时运行对应的聚焦 pytest；所有任务完成后运行全量 pytest。
 - 保留工作区内与本功能无关的未提交修改，不执行批量删除或覆盖。
+- 当前工作区的 `core/generic_api_mail_client.py`、`core/roxy_registration.py`、`core/db.py`、`core/registration_service.py`、WebUI 和对应测试已有用户未提交修改；实施时只能用 `apply_patch` 做小范围编辑，并用 `git add -p` 只暂存本任务新增 hunk，禁止整文件 `git add`。
 
 ---
+
+### Task 0: 建立脏工作区基线与保护边界
+
+**Files:**
+- Read only: `git status` 中所有已修改和未跟踪文件
+- Read only: 本计划各任务列出的生产代码与测试文件
+
+**Interfaces:**
+- Produces: 每个重叠文件的执行前 diff 记录、当前测试基线、每批允许修改的精确函数范围。
+- Consumes: 当前工作区用户修改；不得提交、还原或覆盖这些既有 hunk。
+
+- [ ] **Step 1: Record the dirty-file baseline**
+
+运行并保存终端输出到任务记录，不创建新的仓库文件：
+
+```powershell
+git status --short
+git diff -- core/generic_api_mail_client.py core/roxy_registration.py core/db.py core/registration_service.py core/password_setup_task_service.py webui/app.py webui/templates/index.html
+git diff -- tests/test_generic_api_yangyang.py tests/test_roxy_password_setup.py tests/test_password_setup_task_service.py tests/test_webui_account_features.py tests/test_webui_jobs.py
+```
+
+预期：这些文件中存在本计划开始前的用户修改。后续每批只编辑计划点名的函数或测试方法。
+
+- [ ] **Step 2: Run the pre-implementation test baseline**
+
+```powershell
+& '.venv\Scripts\python.exe' -m pytest tests/test_generic_api_yangyang.py tests/test_roxy_password_setup.py tests/test_password_setup_task_service.py tests/test_password_setup_concurrency.py tests/test_webui_account_features.py tests/test_webui_jobs.py -q
+```
+
+预期：记录准确的通过数和任何既有失败。若存在失败，先判断是否与本功能相关；不得把既有
+失败混入本功能的 GREEN 结论。
+
+- [ ] **Step 3: Define the checkpoint staging rule**
+
+每批提交前必须执行：
+
+```powershell
+git diff --cached --check
+git diff --cached --stat
+```
+
+先使用该任务 Step 5 列出的精确路径执行 `git diff --` 和 `git add -p --`；只有本批新增
+hunk 可以进入暂存区。若一个 hunk 同时包含用户旧改动和本批改动，先用
+`apply_patch` 把本批改动拆成独立 hunk；无法拆分时不提交该文件，只保留测试检查点并向
+用户说明。
+
+检查点：Task 0 不创建提交。
 
 ### Task 1: GenericAPI 两阶段 OTP 状态机
 
@@ -45,29 +93,78 @@ def _otp_observation_key(observation: GenericOtpObservation) -> tuple[str, str, 
 
 - [ ] **Step 1: Write failing tests for message identity and settle grace**
 
-在 `tests/test_generic_api_yangyang.py` 增加以下测试。测试使用现有
-`FakeSingleResponseSession`，并为时钟引入局部 `FakeClock`，让 `time.time()` 按测试序列前进：
+在 `tests/test_generic_api_yangyang.py` 增加可控会话和时钟：
+
+同时从 `core.generic_api_mail_client` 导入 `_matches_otp_baseline`；实现步骤完成后再导入并
+直接测试 `_otp_observation_key`。
 
 ```python
-def test_same_code_from_new_message_id_is_accepted():
-    baseline = OtpBaseline(frozenset({"119006"}), frozenset({"mail-old"}), 100.0)
-    session = FakeSingleResponseSession({
+class FakeClock:
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += max(float(seconds), 0.001)
+
+
+class FakeSequenceSession:
+    def __init__(self, payloads):
+        self.payloads = list(payloads)
+        self.calls = 0
+
+    def get(self, _url, **_kwargs):
+        index = min(self.calls, len(self.payloads) - 1)
+        self.calls += 1
+        return FakeResponse(text=json.dumps(self.payloads[index]))
+```
+
+然后增加四个具体测试：
+
+```python
+def test_same_code_from_new_message_id_is_accepted(self):
+    baseline = OtpBaseline(frozenset({"119006"}), frozenset({"mail-old"}), 999.0)
+    observation = _parse_generic_api_observation(json.dumps({
         "found": True,
         "ok": True,
-        "message": {"code": "119006", "timestamp": 105.0, "uid": "mail-new"},
-    })
-    # fetch_latest_otp(..., after_ts=100.0, otp_baseline=baseline) 返回 "119006"
+        "message": {"code": "119006", "timestamp": 1001.0, "uid": "mail-new"},
+    }), after_ts=1000.0, now_ts=1001.0)
+    self.assertEqual(observation.code, "119006")
+    self.assertFalse(_matches_otp_baseline(observation, baseline, 1000.0))
 
-def test_same_code_same_message_stays_rejected():
-    baseline = OtpBaseline(frozenset({"119006"}), frozenset({"mail-old"}), 100.0)
-    # 响应 uid=mail-old、timestamp=95.0；fetch_latest_otp 应超时而不是返回旧码
+def test_candidate_seen_before_search_deadline_gets_full_settle_window(self):
+    clock = FakeClock()
+    payloads = [{"found": False, "ok": True}] * 9 + [{
+        "found": True,
+        "ok": True,
+        "message": {"code": "119006", "timestamp": 1009.0, "uid": "mail-new"},
+    }]
+    session = FakeSequenceSession(payloads)
+    # patch account、Session、time.time、time.sleep；max_wait=10、poll_interval=1、settle=5
+    # 断言返回 "119006" 且 clock.now >= 1014.0。
 
-def test_candidate_seen_before_search_deadline_gets_full_settle_window():
-    # 候选在 search_deadline 前 1 秒出现，time.sleep 不得截断 settle；最终返回候选
+def test_same_code_new_message_resets_settle(self):
+    clock = FakeClock()
+    payloads = [
+        {"message": {"code": "119006", "timestamp": 1000.0, "uid": "mail-1"}},
+        {"message": {"code": "119006", "timestamp": 1000.0, "uid": "mail-1"}},
+        {"message": {"code": "119006", "timestamp": 1002.0, "uid": "mail-2"}},
+    ]
+    # settle=3；断言同码 mail-2 使返回时间从 1003 延后到至少 1005。
 
-def test_unstable_candidate_fails_after_confirmation_hard_limit():
-    # 候选在确认期持续变化，达到 max(15, 3 * settle) 后抛出“候选不稳定”错误
+def test_unstable_candidate_fails_after_confirmation_hard_limit(self):
+    clock = FakeClock()
+    payloads = [
+        {"message": {"code": "119006", "timestamp": 1000.0 + i, "uid": f"mail-{i}"}}
+        for i in range(30)
+    ]
+    # settle=2；每轮候选身份都变化。断言 GenericApiMailError 包含“候选不稳定”，
+    # 且 clock.now >= 1015.0。
 ```
+
+第一个测试是现有行为的 characterization，必须先通过；后三个测试用于 RED。
 
 - [ ] **Step 2: Run the focused tests and verify RED**
 
@@ -77,8 +174,8 @@ def test_unstable_candidate_fails_after_confirmation_hard_limit():
 & '.venv\Scripts\python.exe' -m pytest tests/test_generic_api_yangyang.py -k "same_code or settle or unstable" -q
 ```
 
-预期：新增测试失败，现有实现会按验证码字符串比较，并在总 deadline 到达时直接抛出
-`settle 未完成`。
+预期：`test_same_code_from_new_message_id_is_accepted` 通过；后三个新增测试失败。现有实现
+会按验证码字符串比较，并在总 deadline 到达时直接抛出 `settle 未完成`。
 
 - [ ] **Step 3: Implement observation identity and two-phase deadlines**
 
@@ -94,8 +191,8 @@ confirm_deadline = None
 hard_confirm_deadline = None
 ```
 
-4. 新候选判定继续调用 `_matches_otp_baseline`；GenericAPI 有消息 ID/时间戳时不使用
-   `exclude_codes` 阻止同码新邮件。
+4. 新候选判定继续调用 `_matches_otp_baseline`。保留 `exclude_codes` 的现有含义：只有调用方
+   明确传入、表示页面已经拒绝过该码时才按值排除；Task 2 的设置密码流程不会传该参数。
 5. 以候选 key 或更晚 `msg_ts` 判断“候选更新”，而不是只比较 `code`；更新候选时重置
    `confirm_deadline = now + settle`。
 6. 首个候选出现于 `search_deadline` 前时，设置
@@ -123,7 +220,7 @@ hard_confirm_deadline = None
 - [ ] **Step 5: Commit the independently testable change**
 
 ```powershell
-git add core/generic_api_mail_client.py config/email.py tests/test_generic_api_yangyang.py tests/test_config_defaults.py
+git add -p -- core/generic_api_mail_client.py config/email.py tests/test_generic_api_yangyang.py tests/test_config_defaults.py
 git commit -m "fix: 分离OTP搜索与settle确认窗口"
 ```
 
@@ -133,32 +230,42 @@ git commit -m "fix: 分离OTP搜索与settle确认窗口"
 
 **Files:**
 - Modify: `core/roxy_registration.py:1749-1845`（`_run_roxy_password_setup`）
-- Modify: `core/email_provider.py:154-218`（仅在需要时透传挑战参数，不改变非 GenericAPI provider）
 - Test: `tests/test_roxy_password_setup.py`
 - Test: `tests/test_roxy_registration_otp_retry.py`
 
 **Interfaces:**
 - Preserve `_run_roxy_password_setup(driver, email, mode=None, password=None, previous_otp=None, progress_callback=None) -> str`。
-- Each OTP wait continues to call `wait_for_otp(email, after_ts=..., otp_baseline=...)`; `exclude_codes` 仅为非 GenericAPI provider 保留。
+- Each OTP wait continues to call `wait_for_otp(email, after_ts=otp_after_ts, otp_baseline=otp_baseline)`；设置密码流程不再传 `exclude_codes`，因为跨业务阶段不能仅凭验证码值判旧。
 - Use existing `capture_otp_baseline(email)` and `_click_resend_email_otp(driver, timeout=25)`.
 
 - [ ] **Step 1: Write failing tests for the password setup challenge order**
 
-在 `tests/test_roxy_password_setup.py` 增加：
+先更新两个与旧行为绑定的现有测试：
+
+- 把 `test_password_setup_resends_and_excludes_previous_registration_otp` 改为
+  `test_password_setup_initial_attempt_does_not_resend_or_exclude_previous_code`；
+- 把 `test_password_setup_allows_generic_api_to_reuse_previous_otp_after_resend` 改为
+  `test_password_setup_allows_generic_api_to_reuse_previous_otp_without_resend`；
+- 两个测试都 patch `capture_otp_baseline`，断言首次 `resend.assert_not_called()`，并断言
+  `wait_for_otp.call_args.kwargs` 不含 `exclude_codes`。
+
+再增加按调用顺序记录事件的测试：
 
 ```python
-def test_initial_password_setup_waits_for_auto_sent_otp_without_resend():
-    # patch capture_otp_baseline、_fetch_password_setup_authorize_url、_safe_get、
-    # _is_email_verification_page=True、wait_for_otp="119006"、页面 accepted；
-    # 断言 _click_resend_email_otp 未调用，wait_for_otp 收到 otp_baseline 和 after_ts。
-
-def test_password_setup_same_code_from_new_generic_message_is_not_excluded():
-    # resolve_email_source 返回 generic_api，previous_otp="119006"；
-    # 断言 wait_for_otp 的 kwargs 不含 exclude_codes，且同码候选被输入页面。
-
 def test_password_setup_resend_refreshes_baseline_before_trigger():
-    # 首轮 wait_for_otp 抛出超时，第二次返回新码；
-    # 断言第二次 capture_otp_baseline 发生在第二次 _click_resend_email_otp 之前。
+    events = []
+    baselines = [object(), object()]
+    with patch("core.roxy_registration.capture_otp_baseline", side_effect=lambda _email: (
+        events.append("baseline") or baselines.pop(0)
+    )), patch("core.roxy_registration._click_resend_email_otp", side_effect=lambda *_a, **_k: (
+        events.append("resend")
+    )), patch("core.roxy_registration.wait_for_otp", side_effect=[
+        GenericApiMailError("timeout"), "119006"
+    ]):
+        # 同时 patch authorize、安全导航、页面状态、OTP 输入/提交和密码页。
+        result = _run_roxy_password_setup(driver, "user@example.com", password="valid-password-123")
+    self.assertEqual(result, "valid-password-123")
+    self.assertEqual(events[:3], ["baseline", "baseline", "resend"])
 ```
 
 - [ ] **Step 2: Run the focused tests and verify RED**
@@ -174,19 +281,21 @@ def test_password_setup_resend_refreshes_baseline_before_trigger():
 
 修改 `_run_roxy_password_setup`：
 
-1. 在 `_fetch_password_setup_authorize_url` 之前调用 `capture_otp_baseline(email)`，并立即记录
-   `otp_after_ts = time.time()`；非 GenericAPI 来源返回 `None` baseline。
+1. 在 `_fetch_password_setup_authorize_url` 之前调用 `capture_otp_baseline(email)`；完成基线
+   抓取后、authorize 请求前记录 `otp_after_ts = time.time()`。非 GenericAPI 来源返回
+   `None` baseline。
 2. 打开 authorize URL 并确认进入邮箱验证码页后，直接执行第一次 `wait_for_otp`；删除当前
    “只要有 previous_otp 就先 Resend”的无条件分支。
-3. GenericAPI 不把 `previous_otp` 加入 `exclude_codes`；Outlook 等没有可靠消息身份的来源
-   继续保留旧码排除。
-4. OTP 等待超时或页面明确拒绝时，下一轮开始前按此顺序执行：
+3. 设置密码流程对所有 provider 都不传 `exclude_codes`：Outlook/GPTMail 等继续用
+   `after_ts` 判断新鲜度，GenericAPI 额外使用 baseline/消息 ID/时间戳。
+4. 用 `try/except` 捕获 `wait_for_otp` 的超时；有剩余轮次时不要退出整个设密流程，而是
+   和页面明确拒绝走同一个重发分支。下一轮按此顺序执行：
 
 ```python
 otp_baseline = capture_otp_baseline(email)
 otp_after_ts = time.time()
 _click_resend_email_otp(driver, timeout=25)
-code = wait_for_otp(email, after_ts=otp_after_ts, otp_baseline=otp_baseline, ...)
+code = wait_for_otp(email, after_ts=otp_after_ts, otp_baseline=otp_baseline)
 ```
 
 5. 每轮调用 `wait_for_otp` 前检查页面是否已经自动进入新密码页；若已进入则跳过重复输入。
@@ -203,7 +312,7 @@ code = wait_for_otp(email, after_ts=otp_after_ts, otp_baseline=otp_baseline, ...
 - [ ] **Step 5: Commit the independently testable change**
 
 ```powershell
-git add core/roxy_registration.py core/email_provider.py tests/test_roxy_password_setup.py tests/test_roxy_registration_otp_retry.py
+git add -p -- core/roxy_registration.py tests/test_roxy_password_setup.py tests/test_roxy_registration_otp_retry.py
 git commit -m "fix: 隔离注册与设密验证码挑战"
 ```
 
@@ -214,14 +323,13 @@ git commit -m "fix: 隔离注册与设密验证码挑战"
 **Files:**
 - Modify: `core/roxy_registration.py:2427-2534`（注册结果、账号保存和清理边界）
 - Modify: `core/registration_service.py:421-500`（注册返回后的后台入队）
-- Modify: `core/db.py:1390-1518`（handoff 状态原子更新和字段清理）
 - Create: `tests/test_registration_password_handoff.py`
 - Modify: `tests/test_roxy_password_setup.py`
 
 **Interfaces:**
 - `run_roxy_registration` 成功返回增加内部字段 `password_setup_handoff: bool`；该字段不进入普通账号密钥输出。
 - `password_setup_task_service.enqueue_account_password_setup(*, account_id: int, mode: str, password: str, trigger: str = "manual") -> dict` 是唯一入队入口。
-- `db.claim_account_password_setup(...) -> bool` 继续保证同一账号不会并发领取；handoff 入队失败写回 `failed` 但不改变注册任务成功状态。
+- Add `registration_service._enqueue_password_setup_handoff(result: dict) -> dict | None`；无 handoff 时返回 `None`，有 handoff 时返回队列结果。
 
 - [ ] **Step 1: Write failing handoff tests**
 
@@ -229,14 +337,20 @@ git commit -m "fix: 隔离注册与设密验证码挑战"
 
 ```python
 def test_registration_success_with_password_handoff_queues_after_runner_returns():
-    # patch main.run_registration 返回 {success: True, account_id: 42,
-    # password_setup_handoff: True, email: "user@example.com"}；
-    # patch enqueue_account_password_setup；运行 registration_service 的单任务入口；
-    # 断言先完成 run_registration，再调用 enqueue，且任务最终 status=success。
+    events = []
+    result = {
+        "success": True, "account_id": 42, "password_setup_handoff": True,
+        "email": "user@example.com",
+    }
+    # fake run_registration 在返回前 append "runner_returning"；fake enqueue append "enqueue"。
+    # 运行 _run_one_job 后断言 events == ["runner_returning", "enqueue"]，
+    # 且 db.update_job 最终收到 status="success"。
 
 def test_password_handoff_enqueue_failure_keeps_registration_success():
-    # enqueue 返回 accepted=False；断言 job status 仍为 success，日志/账号状态记录
-    # 设置密码入队失败，而不是把 job 改为 failed。
+    result = {"success": True, "account_id": 42, "password_setup_handoff": True}
+    # enqueue 返回 {"accepted": False, "error": "queue full"}；
+    # 断言 db.update_account_password_setup(42, {"ok": False, "error": "queue full"}) 被调用，
+    # 但 db.update_job 没有收到 status="failed"。
 ```
 
 在 `tests/test_roxy_password_setup.py` 增加：
@@ -267,19 +381,20 @@ def test_inline_password_setup_failure_returns_handoff_flag_and_saves_account():
 
 修改 `core/registration_service.py`：
 
-1. `run_registration(...)` 返回后先判断成功并完成现有 job 更新。
-2. 仅当 `success=True`、`password_setup_handoff=True`、存在 `account_id` 时，调用
+1. 增加 `_enqueue_password_setup_handoff(result)`，仅当 `success=True`、
+   `password_setup_handoff=True`、存在 `account_id` 时调用
    `enqueue_account_password_setup(account_id=int(account_id), mode="", password="", trigger="registration_handoff")`。
-3. 入队调用必须位于 `run_registration` 返回之后，因此 Roxy driver/profile 的 `finally`
+2. 队列返回 `accepted=False` 或抛出异常时，调用
+   `db.update_account_password_setup(account_id, {"ok": False, "error": error_text})`，并返回失败
+   摘要；不得修改 registration job 状态。
+3. `_run_one_job` 在把成功 registration job 写为 success 后调用该 helper。入队调用位于
+   `run_registration` 返回之后，因此 Roxy driver/profile 的 `finally`
    清理已经完成；日志记录 `password_setup=queued` 或 `password_setup=queue_failed`。
 4. 入队异常只更新账号设置密码状态，不改变 job 的成功状态。
 
-修改 `core/db.py`：
-
-1. 增加或复用 `password_setup_trigger`、`password_setup_last_error` 字段记录 handoff 来源。
-2. 允许 handoff 账号从 `failed` 进入 `queued`，但仍拒绝 `queued/running` 重复领取。
-3. 不在 handoff 阶段写入目标密码；只有 `update_account_password_setup(..., {"ok": True, "password": ...})`
-   才写 `registration_password`。
+现有 `db.claim_account_password_setup` 已经只拒绝 `queued/running`，能从 inline failure 的
+空状态或 failed 状态进入 queued；本任务不修改该逻辑。现有成功落库逻辑也已经只在
+`ok=True` 时保存 `registration_password`。
 
 - [ ] **Step 4: Run handoff and registration regression tests**
 
@@ -292,7 +407,7 @@ def test_inline_password_setup_failure_returns_handoff_flag_and_saves_account():
 - [ ] **Step 5: Commit the independently testable change**
 
 ```powershell
-git add core/roxy_registration.py core/registration_service.py core/db.py tests/test_registration_password_handoff.py tests/test_roxy_password_setup.py
+git add -p -- core/roxy_registration.py core/registration_service.py tests/test_registration_password_handoff.py tests/test_roxy_password_setup.py
 git commit -m "feat: 注册成功后自动交接设置密码"
 ```
 
@@ -303,14 +418,15 @@ git commit -m "feat: 注册成功后自动交接设置密码"
 **Files:**
 - Modify: `core/password_setup_task_service.py:50-115,292-415,489-565`
 - Modify: `core/db.py:1400-1518`
-- Modify: `config/roxybrowser.py:68-75`
 - Test: `tests/test_password_setup_task_service.py`
 - Test: `tests/test_password_setup_concurrency.py`
 
 **Interfaces:**
-- Preserve `_run_password_setup_task(...) -> dict` and `_run_task_wrapper(...) -> dict`。
-- `_schedule_password_setup_retry(...) -> bool` 改为延迟调度，但不占用 `_QUEUE_SLOTS`；实际提交仍调用 `_run_task_wrapper`。
-- `ROXY_PASSWORD_SETUP_MAX_RETRIES=3` 表示追加重试次数；数据库中的 `password_setup_attempt` 从 1 开始记录当前执行次数，`password_setup_max_attempts` 记录总执行次数 4。
+- Preserve `_run_password_setup_task(*, account_id: int, email: str, mode: str, password: str) -> dict` and `_run_task_wrapper(*, account_id: int, email: str, mode: str, password: str) -> dict`。
+- Add `_retry_delay_seconds(attempt: int) -> int`，按当前失败 attempt 返回下一次执行前的延迟：1→15、2→60、3 及以上→180。
+- `_schedule_password_setup_retry(*, account_id: int, email: str, mode: str, password: str, result: dict) -> bool` 改为延迟调度，但不占用 `_QUEUE_SLOTS`；实际提交仍调用 `_run_task_wrapper`。
+- `ROXY_PASSWORD_SETUP_MAX_RETRIES=3` 保持现有“最大总尝试次数”语义；`password_setup_attempt` 从 1 开始，默认最多执行 3 次。
+- Change `db.requeue_account_password_setup(acc_id: int, error: str, *, attempt: int, max_attempts: int, next_retry_at: str | None = None) -> bool` to persist delayed state.
 
 - [ ] **Step 1: Write failing retry and lifecycle tests**
 
@@ -318,16 +434,38 @@ git commit -m "feat: 注册成功后自动交接设置密码"
 
 ```python
 def test_handoff_task_generates_one_password_for_all_attempts():
-    # 配置密码为空，patch _generate_password；首次执行失败并触发重试；
-    # 断言同一任务的每次 runner 收到相同目标密码，成功后才写回 registration_password。
+    submitted_passwords = []
+    class FakeExecutor:
+        def submit(self, _fn, **kwargs):
+            submitted_passwords.append(kwargs["password"])
+            return object()
+    with patch.object(service, "resolve_password_setup_request", return_value=(
+        "post_login_add_password", "generated-once"
+    )) as resolve, patch.object(service, "_EXECUTOR", FakeExecutor()):
+        # 同时 patch db.get_account、db.claim_account_password_setup 和 queue slot。
+        service.enqueue_account_password_setup(
+            account_id=7, mode="", password="", trigger="registration_handoff"
+        )
+    resolve.assert_called_once()
+    self.assertEqual(submitted_passwords, ["generated-once"])
+    failed_result = {
+        "ok": False, "retryable": True, "attempt": 1,
+        "max_attempts": 3, "error": "timeout",
+    }
+    # 调用 _schedule_password_setup_retry(account_id=7, email="user@example.com",
+    # mode="post_login_add_password", password="generated-once", result=failed_result)
+    # 并执行 fake Timer
+    # callback 后，再断言 submitted_passwords == ["generated-once", "generated-once"]。
 
 def test_retry_delays_are_15_60_180_seconds_without_holding_worker_slot():
+    self.assertEqual([service._retry_delay_seconds(i) for i in (1, 2, 3, 4)], [15, 60, 180, 180])
     # patch threading.Timer、_QUEUE_SLOTS 和 db.requeue_account_password_setup；
-    # 断言 delay 依次为 15、60、180，Timer 创建期间不 acquire queue slot。
+    # 调用 _schedule_password_setup_retry 后断言 Timer(delay, callback) 被创建并 start，
+    # 但 _QUEUE_SLOTS.acquire 尚未调用；手动执行 callback 后才 acquire。
 
-def test_handoff_accepts_failed_status_but_rejects_queued_or_running_duplicate():
-    # db.claim_account_password_setup(trigger="registration_handoff") 对 failed 返回 True，
-    # 对 queued/running 返回 False。
+def test_default_retry_limit_remains_three_total_attempts():
+    with patch.object(roxy_cfg, "ROXY_PASSWORD_SETUP_MAX_RETRIES", 3):
+        self.assertEqual(service._max_password_setup_attempts(), 3)
 ```
 
 在 `tests/test_password_setup_concurrency.py` 保留现有并发 gate 测试，并增加断言延迟重试
@@ -339,33 +477,45 @@ def test_handoff_accepts_failed_status_but_rejects_queued_or_running_duplicate()
 & '.venv\Scripts\python.exe' -m pytest tests/test_password_setup_task_service.py tests/test_password_setup_concurrency.py -k "handoff or retry or worker" -q
 ```
 
-预期：当前实现立即重新入队、把配置值当总尝试次数，且没有统一的 handoff 密码生命周期。
+预期：密码只生成一次和默认总尝试次数的 characterization 通过；延迟调度测试失败，因为
+当前实现会立即占用队列槽并重新提交。
 
 - [ ] **Step 3: Implement retry scheduling and DB state**
 
 修改 `core/password_setup_task_service.py`：
 
-1. `_max_password_setup_attempts()` 返回 `1 + configured_retries`，其中 configured_retries
-   来自 `ROXY_PASSWORD_SETUP_MAX_RETRIES`，边界仍为 1–10。
-2. 在 `_run_password_setup_task` 开始时解析一次目标密码；将其通过同一 `_run_task_wrapper`
-   调用链传递给本任务的所有重试，不在每次重试重新生成。
-3. `_schedule_password_setup_retry` 使用 `threading.Timer(delay, callback)`，delay 由
-   `attempt` 映射 `{1: 15, 2: 60, 3: 180}`；Timer 设为 daemon，不占 `_QUEUE_SLOTS`。
-4. Timer 到期后再 acquire slot 并提交 `_run_task_wrapper`；提交失败时回写 failed 和错误。
-5. `_append_password_setup_log` 记录 attempt、max_attempts、delay 和 queue_tail，不打印密码。
-6. `_open_profile_with_recovery` 保持现有失效 profile 自动创建新环境逻辑；每次后台执行都
+1. 保留 `_max_password_setup_attempts()` 当前语义和默认返回值 3，不修改
+   `config/roxybrowser.py`。
+2. 保留 `enqueue_account_password_setup` 在入队时调用一次
+   `resolve_password_setup_request(mode, password)` 的现有行为；Timer 和所有重试继续传递
+   同一个 `password` 参数，不在 runner 内重新生成。
+3. 添加 `_retry_delay_seconds`，使用延迟序列 `(15, 60, 180)`，超过序列后固定返回 180。
+4. `_schedule_password_setup_retry` 先调用 `db.requeue_account_password_setup(account_id,
+   error, attempt=next_attempt, max_attempts=max_attempts, next_retry_at=retry_at)`，再创建
+   `threading.Timer(delay, callback)`；Timer 设为 daemon，启动
+   Timer 时不得 acquire `_QUEUE_SLOTS`。
+5. Timer callback 使用 `_QUEUE_SLOTS.acquire(blocking=False)`。队列已满时不消耗 attempt，
+   把 `next_retry_at` 顺延 5 秒并重新创建 Timer；获得槽位后清空 `next_retry_at`，再提交
+   `_run_task_wrapper`。executor 提交失败时释放槽位并写回 failed。
+6. `_append_password_setup_log` 记录 attempt、max_attempts、delay 和 next_retry_at，不打印密码。
+7. `_open_profile_with_recovery` 保持现有失效 profile 自动创建新环境逻辑；每次后台执行都
    重新进入 `_run_roxy_password_setup`，从而获得全新的 OTP baseline。
 
 修改 `core/db.py`：
 
-1. `claim_account_password_setup` 对 `trigger="registration_handoff"` 允许 `failed` 行重新
-   进入 queued，其余 queued/running 继续拒绝重复领取。
-2. 增加 `password_setup_next_retry_at` 的清理、写入和展示字段；即时入队时置空，延迟
+1. `claim_account_password_setup` 保持当前去重规则，只拒绝 queued/running；即时入队时
+   把 `password_setup_next_retry_at` 置空。
+2. `requeue_account_password_setup` 增加 `next_retry_at` 参数并写入
+   `password_setup_next_retry_at`；延迟
    retry 时写入下次时间。
 3. `update_account_password_setup` 成功后保存密码，失败只写错误和状态；不把失败任务的
-   临时密码写入账号。
-4. `recover_interrupted_password_setups` 继续把 queued/running 标记 failed，并保留手动
+   临时密码写入账号，同时清空 `password_setup_next_retry_at`。
+4. `mark_account_password_setup_running` 清空 `password_setup_next_retry_at`；
+   `recover_interrupted_password_setups` 继续把 queued/running 标记 failed、清空该字段，并保留手动
    重新入队能力。
+
+修改 `queue_settings()`：未来时间的 `password_setup_next_retry_at` 计入 `delayed`，不分配
+执行器队列位置；普通 queued 继续计入 `waiting` 和 `positions`。
 
 - [ ] **Step 4: Run the backend queue tests**
 
@@ -378,7 +528,7 @@ def test_handoff_accepts_failed_status_but_rejects_queued_or_running_duplicate()
 - [ ] **Step 5: Commit the independently testable change**
 
 ```powershell
-git add core/password_setup_task_service.py core/db.py config/roxybrowser.py tests/test_password_setup_task_service.py tests/test_password_setup_concurrency.py tests/test_account_list_query.py
+git add -p -- core/password_setup_task_service.py core/db.py tests/test_password_setup_task_service.py tests/test_password_setup_concurrency.py tests/test_account_list_query.py
 git commit -m "feat: 设置密码失败后按退避策略后台重试"
 ```
 
@@ -387,17 +537,16 @@ git commit -m "feat: 设置密码失败后按退避策略后台重试"
 ### Task 5: 状态展示、集成回归与运行态验收
 
 **Files:**
-- Modify: `webui/app.py:135-205,778-790,2420-2455`（状态字段、队列状态和文案）
-- Modify: `webui/templates/index.html`（账号列表中的设置密码状态标签和重试入口）
+- Modify: `webui/app.py:141-203`（仅补充延迟重试字段和队列摘要）
+- Modify: `webui/templates/index.html:3475-3505`（仅在现有密码状态单元格显示下次重试时间）
 - Modify: `tests/test_webui_account_features.py`
-- Modify: `tests/test_webui_jobs.py`
 - Create: `tests/test_post_registration_password_setup_integration.py`
-- Modify: `docs/superpowers/specs/2026-08-17-post-registration-password-setup-otp-design.md`（若实施细节与验证结果需补充）
 
 **Interfaces:**
 - API 继续返回 `password_setup_status`、`password_setup_attempt`、`password_setup_max_attempts`、`password_setup_next_retry_at`。
 - UI 文案固定映射：`queued=注册成功，等待设置密码`、`running=正在设置密码`、
   `success=密码设置成功`、`already_set=密码已存在`、`failed=设置密码失败，可重试`。
+- `queue_settings()` 额外返回 `delayed`；延迟中的 queued 账号不显示执行器队列位置。
 - 手动重试继续调用 `password_setup_task_service.enqueue_account_password_setup`，不增加第二套队列。
 
 - [ ] **Step 1: Write failing UI/integration tests**
@@ -405,11 +554,27 @@ git commit -m "feat: 设置密码失败后按退避策略后台重试"
 在 `tests/test_webui_account_features.py` 增加状态映射断言：
 
 ```python
-def test_account_payload_exposes_password_setup_retry_fields():
-    # queued/running/failed 账号响应包含 password_setup_status、attempt、max_attempts、next_retry_at
+@patch("webui.app.password_setup_task_service.queue_settings")
+@patch("webui.app.db.list_accounts_page")
+def test_account_payload_exposes_password_setup_retry_fields(self, list_page, queue_settings):
+    list_page.return_value = {"items": [{
+        "id": 7,
+        "password_setup_status": "queued",
+        "password_setup_attempt": 2,
+        "password_setup_max_attempts": 3,
+        "password_setup_next_retry_at": "2026-08-17T16:30:00",
+    }], "total": 1, "sources": [], "revision": "1:now"}
+    queue_settings.return_value = {"positions": {}, "waiting": 0, "delayed": 1}
+    response = self.client.get("/api/accounts?paged=1&page=1&page_size=20")
+    row = response.get_json()["items"][0]
+    self.assertEqual(row["password_setup_next_retry_at"], "2026-08-17T16:30:00")
+    self.assertEqual(response.get_json()["password_setup_queue"]["delayed"], 1)
 
-def test_password_setup_status_labels_distinguish_registration_success():
-    # registration success + password_setup_status=queued 的页面文案不显示“注册失败”
+def test_password_setup_status_labels_distinguish_registration_success(self):
+    template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"
+    html = template.read_text(encoding="utf-8")
+    self.assertIn("注册成功，等待设置密码", html)
+    self.assertIn("password_setup_next_retry_at", html)
 ```
 
 创建 `tests/test_post_registration_password_setup_integration.py`，使用 fake runner、fake
@@ -426,17 +591,20 @@ def test_inline_timeout_handoffs_after_profile_cleanup_then_background_succeeds(
 - [ ] **Step 2: Run the focused UI/integration tests and verify RED**
 
 ```powershell
-& '.venv\Scripts\python.exe' -m pytest tests/test_webui_account_features.py tests/test_webui_jobs.py tests/test_post_registration_password_setup_integration.py -q
+& '.venv\Scripts\python.exe' -m pytest tests/test_webui_account_features.py tests/test_post_registration_password_setup_integration.py -q
 ```
 
-预期：当前 UI 没有 next retry 字段，且注册成功/设密 queued 的文案无法区分。
+预期：现有 UI 已经区分 queued/running/failed，因此对应 characterization 通过；
+`password_setup_next_retry_at` 和 delayed 摘要测试失败。
 
 - [ ] **Step 3: Implement status presentation and integration assertions**
 
-1. 在 `webui/app.py` 的账号 payload 和列表字段中加入 `password_setup_attempt`、
-   `password_setup_max_attempts`、`password_setup_next_retry_at`。
-2. 在 `webui/templates/index.html` 复用现有状态组件，确保设置密码状态独立于注册任务状态；
-   queued 状态显示预计重试时间，failed 状态保留“重新设置密码”入口。
+1. `webui/app.py` 已经返回 attempt/max_attempts/last_error，只需在
+   `_compact_account_for_list` 增加 `password_setup_next_retry_at`，并原样返回
+   `queue_settings()` 的 delayed 摘要。
+2. 在 `webui/templates/index.html` 现有 `_registrationPasswordCell` 中：queued 且
+   `password_setup_next_retry_at` 有值时显示“注册成功，等待设置密码 · HH:MM:SS 后重试”；
+   普通 queued 继续显示队列位置，running/success/already_set/failed 现有分支不重写。
 3. 不在前端渲染目标密码或 OTP；继续使用现有后端复制接口的权限和脱敏规则。
 4. 集成测试确认 Roxy profile cleanup 事件先于 handoff enqueue，且 registration job 保持 success。
 
@@ -445,7 +613,7 @@ def test_inline_timeout_handoffs_after_profile_cleanup_then_background_succeeds(
 依次运行：
 
 ```powershell
-& '.venv\Scripts\python.exe' -m pytest tests/test_generic_api_yangyang.py tests/test_roxy_password_setup.py tests/test_roxy_registration_otp_retry.py tests/test_password_setup_task_service.py tests/test_password_setup_concurrency.py tests/test_webui_account_features.py tests/test_webui_jobs.py tests/test_post_registration_password_setup_integration.py -q
+& '.venv\Scripts\python.exe' -m pytest tests/test_generic_api_yangyang.py tests/test_roxy_password_setup.py tests/test_roxy_registration_otp_retry.py tests/test_registration_password_handoff.py tests/test_password_setup_task_service.py tests/test_password_setup_concurrency.py tests/test_webui_account_features.py tests/test_webui_jobs.py tests/test_post_registration_password_setup_integration.py -q
 & '.venv\Scripts\python.exe' -m pytest -q
 git diff --check
 ```
@@ -457,13 +625,16 @@ git diff --check
 1. WebUI 监听 `127.0.0.1:5001`；
 2. 启动日志无 ImportError；
 3. 账号接口返回 200；
-4. 一次实际 GenericAPI 注册中未在设密验证码页立即重复 Resend；
-5. 设密晚到时能完成 settle，或注册成功后进入 queued 并由后台接管。
+4. fake provider 集成测试证明设密验证码页不会立即重复 Resend；
+5. fake 慢邮件证明能完成 settle，或注册成功后进入 queued 并由后台接管。
+
+真实 GenericAPI 注册会消耗邮箱、代理和外部账号资源，不属于自动验收。只有用户再次明确
+批准运行真实注册任务后，才执行一条真实任务作为补充验证。
 
 - [ ] **Step 5: Commit the integration and UI change**
 
 ```powershell
-git add webui/app.py webui/templates/index.html tests/test_webui_account_features.py tests/test_webui_jobs.py tests/test_post_registration_password_setup_integration.py
+git add -p -- webui/app.py webui/templates/index.html tests/test_webui_account_features.py tests/test_post_registration_password_setup_integration.py
 git commit -m "test: 验证注册后设密后台续跑全链路"
 ```
 
@@ -476,5 +647,6 @@ git commit -m "test: 验证注册后设密后台续跑全链路"
 - 每个检查点的提交哈希和聚焦测试结果；
 - 全量 pytest 总数和失败数；
 - 实际重启后的 WebUI 进程/端口状态；
-- 一次真实任务中 OTP 挑战、后台 handoff 和最终 `password_setup_status`；
+- fake 集成任务中的 OTP 挑战、后台 handoff 和最终 `password_setup_status`；如用户另行批准
+  真实注册，再补充真实任务证据；
 - 未修改的用户工作区文件清单。
