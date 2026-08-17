@@ -14,6 +14,7 @@ EMAIL_SOURCE 支持单个或多个来源：
     ["outlook", "generic_api", "mailnest", "cloudmail"]  # 也兼容列表写法
 """
 import logging
+import time
 from typing import Iterable
 
 logger = logging.getLogger(__name__)
@@ -69,9 +70,45 @@ def _pick_from_source(source: str) -> str:
     return pick_account().email
 
 
-def acquire_email() -> str:
+def check_registration_email_pool(source_value=None) -> dict:
+    """检查注册邮箱来源是否有可确定的可用容量。
+
+    本地邮箱池可以准确预检；远程临时邮箱服务的容量只能在真正领取时确认，
+    因此只要来源列表中包含远程服务，就不提前拦截。
+    """
+    from core import db
+
+    sources = parse_email_sources(source_value)
+    available = 0
+    details: dict[str, int | None] = {}
+    unknown_sources: list[str] = []
+    for source in sources:
+        if source == "outlook":
+            count = int(db.outlook_pool_summary().get("available", 0) or 0)
+        elif source == "generic_api":
+            count = int(db.generic_api_email_pool_summary().get("available", 0) or 0)
+        elif source == "cloudflare_domain":
+            count = int(db.domain_email_pool_summary().get("available", 0) or 0)
+        else:
+            count = None
+            unknown_sources.append(source)
+        details[source] = count
+        if count is not None:
+            available += count
+
+    ok = bool(unknown_sources or available > 0)
+    return {
+        "ok": ok,
+        "available": available,
+        "sources": sources,
+        "details": details,
+        "unknown_sources": unknown_sources,
+    }
+
+
+def acquire_email(source_value=None) -> str:
     """根据 EMAIL_SOURCE 领取一个用于注册的邮箱地址；多个来源时按顺序兜底。"""
-    sources = parse_email_sources()
+    sources = parse_email_sources(source_value)
     last_exc: Exception | None = None
     for source in sources:
         try:
@@ -125,6 +162,7 @@ def wait_for_otp(
     poll_interval: int | None = None,
     settle_seconds: int | None = None,
     exclude_codes: Iterable[str] | None = None,
+    otp_baseline=None,
 ) -> str:
     """等待并返回该邮箱最新的 ChatGPT OTP（6 位数字字符串）。
 
@@ -171,6 +209,8 @@ def wait_for_otp(
         from core.generic_api_mail_client import fetch_latest_otp
         if exclude_codes:
             extra_kwargs["exclude_codes"] = exclude_codes
+        if otp_baseline is not None:
+            extra_kwargs["otp_baseline"] = otp_baseline
         return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
     if source == "mailnest":
         from core.mailnest_client import fetch_latest_otp
@@ -180,6 +220,24 @@ def wait_for_otp(
         return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
     from core.outlook_client import fetch_latest_otp
     return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
+
+
+def capture_otp_baseline(email: str):
+    """按邮箱来源抓取触发验证码前的状态；非 GenericAPI 来源不需要基线。"""
+    if resolve_email_source(email) != "generic_api":
+        return None
+    from core.generic_api_mail_client import (
+        OtpBaseline,
+        capture_otp_baseline as capture,
+    )
+    try:
+        return capture(email)
+    except Exception:
+        from config import email as _email_cfg
+        if bool(getattr(_email_cfg, "GENERIC_API_REQUIRE_BASELINE", True)):
+            raise
+        logger.warning("[GenericAPI] 基线抓取失败，严格基线校验已关闭")
+        return OtpBaseline(frozenset(), frozenset(), time.time())
 
 
 def release_email(email: str, status: str = "available", note: str | None = None) -> str:

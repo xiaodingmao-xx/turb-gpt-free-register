@@ -12,7 +12,7 @@ from pathlib import Path
 from config import roxybrowser as _cfg
 from config import twofa as _twofa_cfg
 from core.account_export import save_account_data
-from core.email_provider import wait_for_otp, resolve_email_source
+from core.email_provider import capture_otp_baseline, wait_for_otp, resolve_email_source
 from core.humanize import delay as human_delay
 from core.registration_network import detect_selenium_exit_ip
 from core.roxybrowser_client import RoxyBrowserClient, RoxyOpenResult
@@ -54,10 +54,14 @@ def _log_prefix(driver=None) -> str:
 
 
 def _build_driver(opened: RoxyOpenResult):
+    from core.windows_window import move_process_window_to_primary
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
     from selenium.webdriver.remote.webdriver import WebDriver as RemoteWebDriver
+
+    # Roxy 已返回 PID 时，先用 Windows 原生 API 定位窗口，再连接 Selenium，避免第二屏闪现。
+    move_process_window_to_primary(opened.process_id)
 
     if opened.debugger_address:
         logger.info("[Roxy] Selenium 连接 debuggerAddress=%s", opened.debugger_address)
@@ -1755,6 +1759,11 @@ def _run_roxy_password_setup(
     mode = _normalize_password_setup_mode(mode or getattr(_cfg, "ROXY_PASSWORD_SETUP_MODE", "post_login_add_password"))
     password = _password_setup_target(password)
     progress = progress_callback or (lambda message: None)
+    email_source = resolve_email_source(email)
+    # 部分通用 API 取件地址只返回当前验证码，不返回邮件时间或 mail id。
+    # 这类服务在“重新发送”后可能连续投递同一个验证码；密码设置已经明确触发重发，
+    # 因此不能再把注册阶段的验证码无条件排除，否则会把新投递的同码邮件全部过滤掉。
+    generic_api_reuses_otp = email_source == "generic_api"
     progress(f"[设置密码] 获取 CSRF 和 authorize URL mode={mode}")
     authorize_url = _fetch_password_setup_authorize_url(driver, email, mode)
     progress("[设置密码] 已获取 authorize URL，进入邮箱 OTP 页面")
@@ -1772,15 +1781,21 @@ def _run_roxy_password_setup(
         raise RuntimeError(f"密码设置未进入邮箱验证码页面: url={getattr(driver, 'current_url', '')}")
 
     previous_otp = str(previous_otp or "").strip()
-    excluded_codes = {previous_otp} if previous_otp else set()
+    excluded_codes = set() if generic_api_reuses_otp else ({previous_otp} if previous_otp else set())
     if previous_otp:
-        progress("[设置密码] 已有注册验证码，重新发送密码设置验证码并排除旧码")
+        if generic_api_reuses_otp:
+            progress("[设置密码] 通用 API 已重新发送验证码，允许服务重复投递注册阶段验证码")
+        else:
+            progress("[设置密码] 已有注册验证码，重新发送密码设置验证码并排除旧码")
         _click_resend_email_otp(driver, timeout=25)
 
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
         progress(f"[设置密码] 等待邮箱 OTP attempt={attempt}/{max_attempts}")
-        code = wait_for_otp(email, after_ts=otp_after_ts, exclude_codes=excluded_codes or None)
+        otp_kwargs = {"after_ts": otp_after_ts}
+        if excluded_codes:
+            otp_kwargs["exclude_codes"] = excluded_codes
+        code = wait_for_otp(email, **otp_kwargs)
         # OTP 等待期间页面可能已经自动推进到新密码页；不要再把新密码页当成验证码页处理。
         if not _is_email_verification_page(driver):
             progress(f"[设置密码] OTP 页面已自动跳转，跳过重复输入 attempt={attempt}")
@@ -2296,6 +2311,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
     create_acknowledged = False
     openai_password: str | None = None
     password_setup_status: str | None = None
+    password_setup_error: str | None = None
     try:
         driver = _build_driver(opened)
         _center_browser_window(driver)
@@ -2306,7 +2322,6 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
             pass
         logger.info("[Roxy注册] 开始：%s，profile=%s", email, opened.profile_id)
 
-        otp_after_ts = time.time()
         logger.info("[Roxy注册] 打开登录页：https://chatgpt.com/auth/login")
         _safe_get(
             driver,
@@ -2320,6 +2335,15 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
         logger.info("[Roxy注册] 登录页加载完成，准备填写邮箱")
         _maybe_accept(driver)
         _check_manual_stop()
+
+        # 在触发 OpenAI 发信前记录 GenericAPI 当前值，防止取码接口缓存旧验证码。
+        otp_baseline = capture_otp_baseline(email) if otp_code is None else None
+        otp_after_ts = time.time()
+        logger.info(
+            "[Roxy注册][OTP] 准备触发验证码：after_ts=%s baseline=%s",
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(otp_after_ts)),
+            bool(otp_baseline),
+        )
 
         # 填邮箱。OpenAI UI 会随出口 IP/语言变化；这里只按 DOM 技术属性找邮箱入口，
         # 并排除 Google/Apple/Microsoft 等第三方入口，不依赖按钮可见文字。
@@ -2340,8 +2364,9 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
                 logger.info("[Roxy注册][OTP] 等待验证码：%s（第 %s/%s 次）", email, otp_attempt, max_otp_attempts)
                 try:
                     otp_kwargs = {"after_ts": otp_after_ts}
-                    if rejected_codes:
-                        otp_kwargs["exclude_codes"] = rejected_codes
+                    otp_kwargs["exclude_codes"] = rejected_codes
+                    if otp_baseline is not None:
+                        otp_kwargs["otp_baseline"] = otp_baseline
                     current_otp = wait_for_otp(email, **otp_kwargs)
                 except Exception as exc:
                     if otp_attempt >= max_otp_attempts:
@@ -2402,7 +2427,20 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
         if bool(getattr(_cfg, "ROXY_PASSWORD_SETUP_ENABLED", False)):
             try:
                 openai_password = _run_password_setup_with_gate(driver, email, previous_otp=current_otp)
-                _check_manual_stop()
+            except PasswordAlreadySetError:
+                password_setup_status = "already_set"
+                openai_password = None
+                logger.info("[Roxy注册] ChatGPT 已确认密码设置过，跳过设置密码任务并继续保存账号")
+            except Exception as exc:
+                password_setup_status = "failed"
+                password_setup_error = f"{type(exc).__name__}: {str(exc)[:300]}"
+                openai_password = None
+                logger.warning(
+                    "[Roxy注册] 注册已成功，但设置密码失败，继续保存账号：%s",
+                    password_setup_error,
+                )
+            _check_manual_stop()
+            if password_setup_status not in {"already_set", "failed"}:
                 # 密码重设可能刷新会话令牌；能读取到新令牌时优先保存新值。
                 try:
                     refreshed = _fetch_chatgpt_session(driver, timeout=45, auto_jump_wait=0)
@@ -2410,10 +2448,6 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
                     session_info = refreshed or session_info
                 except Exception as exc:
                     logger.warning("[Roxy注册] 密码设置后刷新 session 失败，继续使用原 accessToken：%s", str(exc)[:180])
-            except PasswordAlreadySetError:
-                password_setup_status = "already_set"
-                openai_password = None
-                logger.info("[Roxy注册] ChatGPT 已确认密码设置过，跳过设置密码任务并继续保存账号")
 
         if _twofa_cfg.ENABLE_2FA:
             logger.warning("[Roxy注册] 当前 Roxy 自动化路径暂不执行 2FA 设置，已跳过")
@@ -2455,6 +2489,8 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
         }
         if password_setup_status:
             account_extra["password_setup_status"] = password_setup_status
+        if password_setup_error:
+            account_extra["password_setup_error"] = password_setup_error
 
         account_id = save_account_data(
             email=email,
@@ -2474,6 +2510,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
             "access_token": access_token,
             "totp_secret": totp_secret,
             "codex": codex_result,
+            "password_setup_status": password_setup_status,
             "error": None if codex_ok else f"Codex 未完成: {codex_result.get('message')}",
         }
     except Exception as exc:

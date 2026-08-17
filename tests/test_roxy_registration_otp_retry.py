@@ -45,6 +45,10 @@ def test_registration_retry_excludes_code_rejected_by_verification_page():
         ))
         stack.enter_context(patch.object(service, "_click_resend_email_otp"))
         wait_otp = stack.enter_context(patch.object(service, "wait_for_otp", return_value="992669"))
+        baseline = object()
+        capture_baseline = stack.enter_context(
+            patch.object(service, "capture_otp_baseline", return_value=baseline)
+        )
         stack.enter_context(patch.object(service, "detect_selenium_exit_ip", return_value="203.0.113.9"))
         stack.enter_context(patch.object(service, "save_account_data", return_value=42))
         stack.enter_context(patch.object(service, "resolve_email_source", return_value="generic_api"))
@@ -58,9 +62,11 @@ def test_registration_retry_excludes_code_rejected_by_verification_page():
             email="user@example.com",
             name="Test User",
             birthday="2000-01-01",
-            otp_code="000000",
+            otp_code=None,
         )
 
     assert result["success"] is True
-    wait_otp.assert_called_once()
-    assert wait_otp.call_args.kwargs["exclude_codes"] == {"000000"}
+    capture_baseline.assert_called_once_with("user@example.com")
+    assert wait_otp.call_count == 2
+    assert wait_otp.call_args.kwargs["exclude_codes"] == {"992669"}
+    assert wait_otp.call_args.kwargs["otp_baseline"] is baseline
