@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import base64
+import datetime
 import json
 import unittest
 from unittest.mock import patch
@@ -12,6 +13,7 @@ from core.generic_api_mail_client import (
     _extract_structured_api_code,
     _fetch_yangyang_otp,
     _html_to_visible_text,
+    _parse_generic_api_observation,
     _parse_yangyang_code_url,
     fetch_latest_otp,
 )
@@ -104,7 +106,85 @@ class FakeNotificationThenOtpSession:
         }))
 
 
+class FakeOldStructuredCodeSession:
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = 0
+
+    def get(self, _url, **_kwargs):
+        self.calls += 1
+        return FakeResponse(text=json.dumps(self.payload))
+
+
 class GenericApiYangyangTests(unittest.TestCase):
+    def test_structured_old_code_is_recognized_but_rejected(self):
+        payload = json.dumps({
+            "code": "174510",
+            "time": "2026-08-17T14:40:00+08:00",
+            "message_id": "mail-old",
+        })
+        after = datetime.datetime.fromisoformat("2026-08-17T14:53:40+08:00").timestamp()
+
+        observation = _parse_generic_api_observation(payload, after_ts=after)
+
+        self.assertTrue(observation.structured)
+        self.assertIsNone(observation.code)
+        self.assertEqual(observation.rejection_reason, "before_trigger")
+        self.assertEqual(observation.message_id, "mail-old")
+
+    def test_structured_old_code_must_not_fall_back_to_raw_regex(self):
+        payload = json.dumps({
+            "code": "174510",
+            "time": "2026-08-17T14:40:00+08:00",
+        })
+        after = datetime.datetime.fromisoformat("2026-08-17T14:53:40+08:00").timestamp()
+
+        observation = _parse_generic_api_observation(payload, after_ts=after)
+
+        self.assertTrue(observation.structured)
+        self.assertIsNone(observation.code)
+
+    def test_structured_code_older_than_max_age_is_rejected(self):
+        observation = _parse_generic_api_observation(
+            json.dumps({"code": "174510", "timestamp": 100.0}),
+            max_age_seconds=1000,
+            now_ts=2000.0,
+        )
+
+        self.assertIsNone(observation.code)
+        self.assertEqual(observation.rejection_reason, "older_than_max_age")
+
+    def test_structured_code_without_timestamp_keeps_metadata_missing_state(self):
+        observation = _parse_generic_api_observation(json.dumps({"code": "174510"}))
+
+        self.assertEqual(observation.code, "174510")
+        self.assertTrue(observation.structured)
+        self.assertIsNone(observation.msg_ts)
+        self.assertIsNone(observation.rejection_reason)
+
+    def test_polling_does_not_fallback_to_old_structured_json_code(self):
+        account = GenericApiEmailAccount(
+            "user@example.com",
+            "https://mail.example/code",
+        )
+        session = FakeOldStructuredCodeSession({
+            "code": "174510",
+            "time": "2026-08-17T14:40:00+08:00",
+        })
+        after = datetime.datetime.fromisoformat("2026-08-17T14:53:40+08:00").timestamp()
+
+        with patch("core.generic_api_mail_client.get_account_context", return_value=account), patch(
+            "core.generic_api_mail_client.requests.Session", return_value=session
+        ), patch("core.generic_api_mail_client.time.sleep"):
+            with self.assertRaises(GenericApiMailError):
+                fetch_latest_otp(
+                    account.email,
+                    after_ts=after,
+                    max_wait=0.01,
+                    poll_interval=1,
+                    settle_seconds=0,
+                )
+
     def test_html_visible_text_removes_nonvisible_digits(self):
         source = """
         <html><head><style>.x { color: #111111; }</style></head>

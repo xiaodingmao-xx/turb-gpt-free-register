@@ -15,7 +15,7 @@ import time
 import base64
 import html as html_lib
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse, urlunparse
 
@@ -56,6 +56,17 @@ class GenericApiMailError(RuntimeError):
 class GenericApiEmailAccount:
     email: str
     code_url: str
+
+
+@dataclass(frozen=True)
+class GenericOtpObservation:
+    code: str | None
+    source: str
+    received_at: object | None
+    msg_ts: float | None
+    message_id: str | None
+    structured: bool
+    rejection_reason: str | None = None
 
 
 def _flatten_json(obj) -> str:
@@ -247,26 +258,8 @@ def _parse_generic_api_ts(value) -> float | None:
     return None
 
 
-def _extract_structured_api_code(text: str, after_ts: float | None = None) -> tuple[str, dict] | None:
-    """
-    兼容 newzoe 这类直接返回 JSON 的取码接口：
-      {"code":"784207","from":"...","subject":"Your temporary ChatGPT login code","time":"2026-08-05T01:10:17.000Z"}
-
-    如果响应里有 time/date/received_at，会按 after_ts 过滤旧码，避免拿到上一次缓存验证码。
-    """
-    if not text:
-        return None
-    try:
-        data = json.loads(text)
-    except Exception:
-        return None
-    if not isinstance(data, dict):
-        return None
-
-    # 信封接口的 message 才是邮件正文，不能把 email 等元数据一起扫描。
-    if data.get("ok") is False or data.get("found") is False:
-        return None
-
+def _extract_code_from_structured_dict(data: dict) -> tuple[str | None, str]:
+    """从已解析 JSON 中提取验证码，不负责判断邮件新鲜度。"""
     raw_code = next(
         (
             data.get(name)
@@ -282,13 +275,11 @@ def _extract_structured_api_code(text: str, after_ts: float | None = None) -> tu
         ),
         None,
     )
-    code = None
-    source = ""
     if raw_code is not None:
         value = str(raw_code).strip()
         if re.fullmatch(r"\d{6}", value):
-            code = value
-            source = "json_code_field"
+            return value, "json_code_field"
+        return None, "json_code_field"
     else:
         message = next(
             (
@@ -301,10 +292,24 @@ def _extract_structured_api_code(text: str, after_ts: float | None = None) -> tu
         decoded_message = _decode_data_uri(message)
         is_html = bool(_HTML_MARKER_RE.search(decoded_message))
         code = _extract_code(message, is_html=is_html)
-        source = "html_visible_text" if is_html else "plain_text"
+        return code, "html_visible_text" if is_html else "plain_text"
 
-    if not code:
-        return None
+
+def _parse_generic_api_observation(
+    text: str,
+    after_ts: float | None = None,
+    max_age_seconds: int | None = None,
+    now_ts: float | None = None,
+) -> GenericOtpObservation:
+    """解析 GenericAPI 响应，并保留结构化响应的拒绝原因。"""
+    if not text:
+        return GenericOtpObservation(None, "plain_text", None, None, None, False)
+    try:
+        data = json.loads(text)
+    except Exception:
+        return GenericOtpObservation(None, "plain_text", None, None, None, False)
+    if not isinstance(data, dict):
+        return GenericOtpObservation(None, "structured_api", None, None, None, True, "invalid_shape")
 
     ts_raw = (
         data.get("time")
@@ -316,22 +321,57 @@ def _extract_structured_api_code(text: str, after_ts: float | None = None) -> tu
         or data.get("timestamp")
     )
     msg_ts = _parse_generic_api_ts(ts_raw)
-    if after_ts and msg_ts and msg_ts + 2 < after_ts:
-        logger.debug(
-            "[GenericAPI] structured API 跳过旧验证码: code=%s ts=%s after=%s subject=%r",
-            code,
-            ts_raw,
-            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(after_ts)),
-            str(data.get("subject") or "")[:80],
-        )
+    message_id = data.get("message_id") or data.get("messageId") or data.get("id")
+    code, source = _extract_code_from_structured_dict(data)
+    rejection_reason = None
+    current_ts = time.time() if now_ts is None else now_ts
+
+    if data.get("ok") is False or data.get("found") is False:
+        code, rejection_reason = None, "not_found"
+    elif code and after_ts is not None and msg_ts is not None and msg_ts + 2 < after_ts:
+        rejection_reason = "before_trigger"
+        code = None
+    elif (
+        code
+        and max_age_seconds is not None
+        and max_age_seconds > 0
+        and msg_ts is not None
+        and current_ts - msg_ts > max_age_seconds
+    ):
+        rejection_reason = "older_than_max_age"
+        code = None
+
+    return GenericOtpObservation(
+        code=code,
+        source=source or "structured_api",
+        received_at=ts_raw,
+        msg_ts=msg_ts,
+        message_id=str(message_id) if message_id is not None else None,
+        structured=True,
+        rejection_reason=rejection_reason,
+    )
+
+
+def _extract_structured_api_code(text: str, after_ts: float | None = None) -> tuple[str, dict] | None:
+    """兼容旧调用方的结构化验证码提取包装层。"""
+    observation = _parse_generic_api_observation(text, after_ts=after_ts)
+    if not observation.code:
         return None
 
-    return code, {
-        "source": source,
-        "received_at": ts_raw,
-        "msg_ts": msg_ts,
-        "subject": data.get("subject"),
-        "from": data.get("from") or data.get("fromAddress") or data.get("sender"),
+    try:
+        data = json.loads(text)
+    except Exception:
+        data = {}
+    return observation.code, {
+        "source": observation.source,
+        "received_at": observation.received_at,
+        "msg_ts": observation.msg_ts,
+        "message_id": observation.message_id,
+        "subject": data.get("subject") if isinstance(data, dict) else None,
+        "from": (
+            data.get("from") or data.get("fromAddress") or data.get("sender")
+            if isinstance(data, dict) else None
+        ),
     }
 
 
@@ -593,6 +633,10 @@ def fetch_latest_otp(
     deadline = time.time() + (max_wait or _email_cfg.OTP_MAX_WAIT)
     interval = poll_interval or _email_cfg.OTP_POLL_INTERVAL
     settle = settle_seconds if settle_seconds is not None else _email_cfg.OTP_SETTLE_SECONDS
+    max_age_seconds = max(
+        0,
+        int(getattr(_email_cfg, "OTP_MAX_MESSAGE_AGE_SECONDS", 3600) or 0),
+    )
     excluded_codes = {str(value).strip() for value in (exclude_codes or ()) if str(value).strip()}
     headers = {
         "Accept": "application/json,text/plain,*/*",
@@ -653,9 +697,33 @@ def fetch_latest_otp(
             if resp is None:
                 pass
             elif resp.status_code == 200:
-                structured = _extract_structured_api_code(text, after_ts=after_ts)
-                structured_meta = structured[1] if structured else {}
-                code = structured[0] if structured else _extract_code(text)
+                observation = _parse_generic_api_observation(
+                    text,
+                    after_ts=after_ts,
+                    max_age_seconds=max_age_seconds,
+                )
+                if observation.structured:
+                    code = observation.code
+                    structured_meta = {
+                        "source": observation.source,
+                        "received_at": observation.received_at,
+                        "msg_ts": observation.msg_ts,
+                        "message_id": observation.message_id,
+                        "subject": None,
+                    }
+                    if observation.rejection_reason:
+                        last_error = (
+                            f"结构化候选被拒绝: reason={observation.rejection_reason} "
+                            f"ts={observation.received_at} message_id={observation.message_id}"
+                        )
+                else:
+                    code = _extract_code(text)
+                    observation = replace(
+                        observation,
+                        code=code,
+                        source="plain_text",
+                    )
+                    structured_meta = {}
                 if code in excluded_codes:
                     last_error = "忽略接口返回的旧 OTP"
                     code = None
