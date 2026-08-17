@@ -353,6 +353,14 @@ EDITABLE_FIELDS = [
         "label": "OTP 轮询间隔(秒)", "help": "每隔多少秒查一次新邮件",
     },
     {
+        "key": "OTP_MAX_MESSAGE_AGE_SECONDS", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "OTP 最大邮件年龄(秒)", "help": "接口提供邮件时间戳时，超过此年龄的验证码不参与候选；默认 3600 秒",
+    },
+    {
+        "key": "GENERIC_API_REQUIRE_BASELINE", "file": "email.py", "type": "bool", "group": "邮箱 / OTP",
+        "label": "GenericAPI 严格基线校验", "help": "发信前无法读取取码接口基线时停止注册，避免提交缓存旧验证码",
+    },
+    {
         "key": "EMAIL_SOURCE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
         "label": "邮箱来源", "help": "可填单个或多个，逗号分隔并按顺序兜底：outlook,generic_api,cloudflare_domain,cloudflare,gptmail,mailnest,cloudmail",
     },
