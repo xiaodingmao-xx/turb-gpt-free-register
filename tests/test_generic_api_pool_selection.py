@@ -8,6 +8,39 @@ from core import db, email_provider
 class GenericApiPoolSelectionTests(unittest.TestCase):
     @patch("core.db._save_generic_api_emails")
     @patch("core.db._load_generic_api_emails")
+    def test_restore_failed_email_makes_only_failed_row_available(self, load, save):
+        rows = [
+            {"id": 1, "email": "failed@example.com", "status": "failed", "used_at": "old", "cooldown_until": "old"},
+            {"id": 2, "email": "used@example.com", "status": "used", "used_at": "old"},
+        ]
+        load.return_value = rows
+
+        changed = db.restore_failed_generic_api_email(
+            "failed@example.com", note="用户手动恢复失败邮箱"
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(rows[0]["status"], "available")
+        self.assertIsNone(rows[0]["used_at"])
+        self.assertIsNone(rows[0]["cooldown_until"])
+        self.assertEqual(rows[0]["note"], "用户手动恢复失败邮箱")
+        self.assertEqual(rows[1]["status"], "used")
+        save.assert_called_once_with(rows)
+
+    @patch("core.db._save_generic_api_emails")
+    @patch("core.db._load_generic_api_emails")
+    def test_restore_failed_email_does_not_change_non_failed_row(self, load, save):
+        rows = [{"id": 1, "email": "available@example.com", "status": "available"}]
+        load.return_value = rows
+
+        changed = db.restore_failed_generic_api_email("available@example.com")
+
+        self.assertFalse(changed)
+        self.assertEqual(rows[0]["status"], "available")
+        save.assert_not_called()
+
+    @patch("core.db._save_generic_api_emails")
+    @patch("core.db._load_generic_api_emails")
     @patch("core.db._now", return_value="2026-08-16T16:00:00")
     def test_claim_skips_email_in_cooldown(self, _now, load, save):
         rows = [

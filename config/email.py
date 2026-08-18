@@ -46,7 +46,7 @@ OUTLOOK_API_BASE = "https://mail.chatai.codes"
 # ============================================================
 
 OTP_POLL_INTERVAL = 3
-OTP_MAX_WAIT = 90
+OTP_MAX_WAIT = 120
 
 # Outlook 双协议取件：抓到一封 OTP 后再多等多少秒看是否有更晚到达的邮件。
 OTP_SETTLE_SECONDS = 5

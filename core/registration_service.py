@@ -188,7 +188,7 @@ def _random_display_name() -> str:
     return random_display_name()
 
 
-def _prepare_registration_args() -> tuple[str, str, str]:
+def _prepare_registration_args(email_source: str | None = None) -> tuple[str, str, str]:
     """复用 CLI 的默认规则，为旧 Web 任务入口补齐注册参数。"""
     # 用模块属性读，支持 WebUI 热加载
     from config import register as _r, email as _e
@@ -210,7 +210,7 @@ def _prepare_registration_args() -> tuple[str, str, str]:
     # 邮箱领取会把池状态置为 used，因此放在所有其他准备逻辑之后。
     if not email:
         if _e.USE_EMAIL_SERVICE:
-            email = acquire_email()
+            email = acquire_email(email_source)
         else:
             raise RuntimeError(
                 "手动模式未配置邮箱。请在 WebUI 配置页设置 REGISTER_EMAIL，"
@@ -438,7 +438,7 @@ def _run_one_job(job_id: int, log_file: str) -> None:
         with _JobLogContext(log_file):
             from main import run_registration
             log_logger.info(f"[Job {job_id}] 开始注册任务")
-            email, name, birthday = _prepare_registration_args()
+            email, name, birthday = _prepare_registration_args(current.get("email_source"))
             db.update_job(job_id, email=email)
             check_stop_requested()
             result = run_registration(email=email, name=name, birthday=birthday)
@@ -461,6 +461,17 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                     account_id=result.get("account_id"),
                     completed_at=datetime.now().isoformat(timespec="seconds"),
                 )
+                handoff = _enqueue_password_setup_handoff(result)
+                if handoff:
+                    if handoff.get("queued"):
+                        log_logger.info("[Job %s] password_setup=queued account_id=%s", job_id, handoff["account_id"])
+                    else:
+                        log_logger.warning(
+                            "[Job %s] password_setup=queue_failed account_id=%s error_type=%s",
+                            job_id,
+                            handoff["account_id"],
+                            handoff.get("error_type", "queue_failed"),
+                        )
                 log_logger.info(f"[Job {job_id}] 成功: {result.get('email')}")
             else:
                 # 注意：失败也可能伴随 account_id（如 Codex 失败但账号已注册成功）
@@ -529,6 +540,73 @@ def _run_one_job(job_id: int, log_file: str) -> None:
         )
     finally:
         _deactivate_job(job_id)
+
+
+def _enqueue_password_setup_handoff(result: dict) -> dict | None:
+    """把内联设置密码失败的成功注册交接给后台队列。"""
+    if not (
+        result.get("success")
+        and result.get("password_setup_handoff")
+        and result.get("account_id") is not None
+    ):
+        return None
+    account_id = _password_setup_handoff_account_id(result["account_id"])
+    if account_id is None:
+        return None
+
+    try:
+        from core import password_setup_task_service
+
+        queued = password_setup_task_service.enqueue_account_password_setup(
+            account_id=account_id,
+            mode="",
+            password="",
+            trigger="registration_handoff",
+        )
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"[:500]
+        return _password_setup_handoff_failed(account_id, error, type(exc).__name__)
+
+    if isinstance(queued, dict) and queued.get("accepted") is True:
+        return {"queued": True, "account_id": account_id}
+
+    if isinstance(queued, dict):
+        error = str(queued.get("error") or "设置密码入队被拒绝")[:500]
+        error_type = "queue_rejected"
+    else:
+        error = "设置密码入队返回无效结果"
+        error_type = "invalid_response"
+    return _password_setup_handoff_failed(account_id, error, error_type)
+
+
+def _password_setup_handoff_account_id(value: object) -> int | None:
+    """仅接受正整数或纯数字字符串，避免错误地触碰其他账号。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if not isinstance(value, str) or not value or not value.isascii() or not value.isdecimal():
+        return None
+    account_id = int(value)
+    return account_id if account_id > 0 else None
+
+
+def _password_setup_handoff_failed(account_id: int, error: str, error_type: str) -> dict:
+    """安全记录 handoff 失败，绝不能改变已成功的注册 job 状态。"""
+    try:
+        db.update_account_password_setup(account_id, {"ok": False, "error": error})
+    except Exception as exc:
+        logger.warning(
+            "password_setup_handoff_account_update_failed account_id=%s status=queue_failed error_type=%s",
+            account_id,
+            type(exc).__name__,
+        )
+    return {
+        "queued": False,
+        "account_id": account_id,
+        "error": error,
+        "error_type": error_type,
+    }
 
 
 def _run_codex_retry_job(job_id: int, log_file: str, email: str, account_id: int) -> None:
@@ -754,6 +832,101 @@ def get_retry_info(job: dict) -> dict:
     return info
 
 
+def retry_failed_registration_jobs(workers: int | None = None) -> dict:
+    """一键重新提交失败的注册任务；已有账号的任务直接跳过。"""
+    rows = db.list_jobs(limit=1_000_000)
+    failed_rows = [row for row in rows if row.get("status") == "failed"]
+    accounts = db.list_accounts(limit=1_000_000)
+    accounts_by_id = {
+        int(account.get("id")): account
+        for account in accounts
+        if account.get("id") is not None
+    }
+    accounts_by_email = {
+        str(account.get("email") or "").strip().lower(): account
+        for account in accounts
+        if str(account.get("email") or "").strip()
+    }
+    started: list[dict] = []
+    reused: list[dict] = []
+    skipped: list[dict] = []
+    reserved_pool_capacity: dict[str, int] = {}
+
+    for source in failed_rows:
+        job_id = int(source.get("id") or 0)
+        if str(source.get("job_type") or "registration") == "codex_retry":
+            skipped.append({"id": job_id, "reason": "不是注册任务"})
+            continue
+        account = None
+        if source.get("account_id") is not None:
+            try:
+                account = accounts_by_id.get(int(source.get("account_id")))
+            except (TypeError, ValueError):
+                account = None
+        if account is None:
+            email = str(source.get("email") or "").strip().lower()
+            account = accounts_by_email.get(email) if email else None
+        if account is not None:
+            skipped.append({"id": job_id, "reason": "账号已存在"})
+            continue
+
+        email_source = str(source.get("email_source") or "").strip()
+        pool_status = _check_registration_retry_pool(email_source)
+        pool_key = ",".join(pool_status.get("sources") or [email_source])
+        unknown_sources = pool_status.get("unknown_sources") or []
+        reserved = reserved_pool_capacity.get(pool_key, 0)
+        if not unknown_sources and int(pool_status.get("available") or 0) <= reserved:
+            skipped.append({
+                "id": job_id,
+                "reason": f"邮箱池无可用邮箱：{pool_key or '未配置来源'}，请先导入或恢复可用邮箱",
+            })
+            continue
+
+        try:
+            result = retry_job(job_id, workers=workers)
+        except Exception as exc:
+            logger.exception("[Service] 一键失败重新注册任务 #%s 异常", job_id)
+            skipped.append({"id": job_id, "reason": f"{type(exc).__name__}: {exc}"[:500]})
+            continue
+        if not result.get("ok"):
+            skipped.append({"id": job_id, "reason": result.get("error") or "不能重试"})
+        elif result.get("reused"):
+            reused.append(result)
+        else:
+            started.append(result)
+            if not unknown_sources:
+                reserved_pool_capacity[pool_key] = reserved + 1
+
+    return {
+        "ok": True,
+        "found_count": len(failed_rows),
+        "started": started,
+        "started_count": len(started),
+        "reused": reused,
+        "reused_count": len(reused),
+        "skipped": skipped,
+        "skipped_count": len(skipped),
+        "email_pool_exhausted_count": sum(
+            1 for item in skipped if str(item.get("reason") or "").startswith("邮箱池无可用邮箱")
+        ),
+        "workers": workers,
+    }
+
+
+def _check_registration_retry_pool(email_source: str | None) -> dict:
+    """返回注册重试前的邮箱池容量；手动模式不做邮箱池拦截。"""
+    from config import email as _email_cfg
+    if not bool(getattr(_email_cfg, "USE_EMAIL_SERVICE", True)):
+        return {
+            "ok": True,
+            "available": 1,
+            "sources": [],
+            "unknown_sources": [],
+        }
+    from core.email_provider import check_registration_email_pool
+    return check_registration_email_pool(email_source or None)
+
+
 def retry_job(job_id: int, workers: int | None = None) -> dict:
     """智能重试终态任务：未生成账号则重新注册，已有账号则仅补跑 Codex。"""
     source = db.get_job(job_id)
@@ -769,6 +942,16 @@ def retry_job(job_id: int, workers: int | None = None) -> dict:
     account = _account_for_job(source)
     email = str((account or {}).get("email") or source.get("email") or "").strip()
     account_id = int(account["id"]) if account and account.get("id") is not None else None
+    if action == "registration":
+        pool_status = _check_registration_retry_pool(source.get("email_source"))
+        if not pool_status.get("ok"):
+            pool_key = ",".join(pool_status.get("sources") or [str(source.get("email_source") or "未配置来源")])
+            return {
+                "ok": False,
+                "error": f"邮箱池无可用邮箱：{pool_key}，请先导入或恢复可用邮箱",
+                "status": 409,
+                "retry_action": action,
+            }
     reserved_codex = False
     if action == "codex":
         if not email or account_id is None:

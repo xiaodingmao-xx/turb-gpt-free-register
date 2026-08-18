@@ -51,6 +51,23 @@ def _matches_query(row: dict, q: str | None) -> bool:
     q = str(q or "").strip().lower()
     if not q:
         return True
+    # 邮箱池搜索框支持直接输入中文状态。状态词必须只匹配 status，
+    # 不能因为备注里出现“注册失败”就把已用邮箱一起搜出来。
+    status_aliases = {
+        "可用": "available",
+        "available": "available",
+        "未使用": "available",
+        "已用": "used",
+        "使用中": "used",
+        "used": "used",
+        "失败": "failed",
+        "failed": "failed",
+        "停用": "disabled",
+        "disabled": "disabled",
+    }
+    status = status_aliases.get(q)
+    if status is not None:
+        return str(row.get("status") or "").strip().lower() == status
     try:
         return q in "\n".join(str(v) for v in row.values()).lower()
     except Exception:
@@ -131,6 +148,8 @@ def _compact_account_for_list(row: dict) -> dict:
         "password_setup_completed_at", "password_setup_attempt",
         "password_setup_max_attempts", "password_setup_last_error",
         "password_setup_next_retry_at",
+        "live_check_backend", "live_check_failure_kind", "live_check_attempt",
+        "live_check_max_attempts", "live_check_next_retry_at", "live_check_profile_source",
     ):
         if key in row:
             out[key] = row.get(key)
@@ -782,8 +801,12 @@ def create_app(auth_code: str | None = None) -> Flask:
 
     @app.post("/api/accounts/check-live-bulk")
     def api_accounts_check_live_bulk():
-        """批量查活：加入后台队列；协议 BrowserSession 指纹环境重新登录并刷新最新 AT。"""
+        """批量查活：按显式 mode 加入协议或 Roxy 浏览器后台队列。"""
         data = request.get_json(silent=True) or {}
+        try:
+            mode = live_check_service.normalize_live_check_mode(data.get("mode"))
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
         ids = data.get("account_ids") or data.get("ids") or []
         if not isinstance(ids, list) or not ids:
             return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
@@ -830,9 +853,10 @@ def create_app(auth_code: str | None = None) -> Flask:
                 # PLAN_CHECK_PROXY_MODE / PLAN_CHECK_PROXY / PROXY_POOL。
                 # 不复用账号注册时的 proxy_used，避免旧注册出口被 CF 403 后一直失败。
                 proxy=None,
+                mode=mode,
             )
             if queued.get("accepted"):
-                started.append({"id": acc_id, "email": email, "status": "queued"})
+                started.append({"id": acc_id, "email": email, "status": "queued", "mode": mode})
             elif queued.get("busy"):
                 busy_count += 1
                 skipped.append({"id": acc_id, "email": email, "reason": queued.get("error") or "正在查活"})
@@ -848,7 +872,8 @@ def create_app(auth_code: str | None = None) -> Flask:
             "failed": failed,
             "failed_count": len(failed),
             "skipped": skipped,
-            "queue": live_check_service.queue_settings(),
+            "mode": mode,
+            "queue": live_check_service.queue_settings(mode),
         }), 202
 
 
@@ -1720,6 +1745,61 @@ def create_app(auth_code: str | None = None) -> Flask:
             "ok": True,
             "updated": updated,
             "updated_count": len(updated),
+            "skipped": skipped,
+        })
+
+    @app.post("/api/outlook/restore-failed")
+    def api_outlook_restore_failed():
+        """只恢复邮箱池中原本为 failed 的邮箱；used/disabled/available 不会被改动。"""
+        data = request.get_json(silent=True) or {}
+        items = data.get("items") or data.get("emails") or []
+        default_source = (data.get("source") or _pool_source_arg()).strip()
+        if not isinstance(items, list) or not items:
+            return jsonify({"ok": False, "error": "items/emails 必须是非空数组"}), 400
+        if len(items) > 5000:
+            return jsonify({"ok": False, "error": "单次最多恢复 5000 个邮箱"}), 400
+
+        restored = []
+        skipped = []
+        seen: set[str] = set()
+        note = data.get("note") or "用户手动恢复失败邮箱"
+        restore_by_source = {
+            "outlook": db.restore_failed_outlook,
+            "generic_api": db.restore_failed_generic_api_email,
+            "cloudflare_domain": db.restore_failed_domain_email,
+        }
+        for raw_item in items:
+            if isinstance(raw_item, dict):
+                email = (str(raw_item.get("email") or "")).strip()
+                item_source = (raw_item.get("source") or default_source or "").strip()
+            else:
+                email = (str(raw_item or "")).strip()
+                item_source = default_source
+            if item_source == "all":
+                item_source = ""
+            key = f"{item_source}:{email.lower()}"
+            if not email:
+                skipped.append({"email": raw_item, "reason": "邮箱为空"})
+                continue
+            if item_source not in restore_by_source:
+                skipped.append({"email": email, "source": item_source, "reason": "邮箱池来源不明确"})
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                changed = restore_by_source[item_source](email, note=note)
+            except Exception as exc:
+                skipped.append({"email": email, "source": item_source, "reason": f"{type(exc).__name__}: {exc}"})
+                continue
+            if changed:
+                restored.append({"email": email, "source": item_source, "status": "available"})
+            else:
+                skipped.append({"email": email, "source": item_source, "reason": "当前状态不是失败或邮箱不存在"})
+        return jsonify({
+            "ok": True,
+            "restored": restored,
+            "restored_count": len(restored),
             "skipped": skipped,
         })
 
@@ -2629,6 +2709,16 @@ def create_app(auth_code: str | None = None) -> Flask:
             "skipped_count": len(skipped),
             "workers": workers,
         })
+
+    @app.post("/api/jobs/retry-failed-registrations")
+    def api_jobs_retry_failed_registrations():
+        """一键重新注册所有失败注册任务；已在账号中的任务跳过。"""
+        data = request.get_json(silent=True) or {}
+        try:
+            workers = max(1, min(16, int(data.get("workers", svc.get_executor_workers()))))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "workers 非法"}), 400
+        return jsonify(svc.retry_failed_registration_jobs(workers=workers))
 
     @app.post("/api/jobs/<int:job_id>/delete")
     def api_job_delete(job_id: int):

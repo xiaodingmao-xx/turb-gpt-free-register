@@ -41,6 +41,8 @@ ROXY_WORKSPACE_LIST_METHOD: str = "GET"
 ROXY_OPEN_PATH: str = "/browser/open"
 ROXY_CLOSE_PATH: str = "/browser/close"
 ROXY_CREATE_PATH: str = "/browser/create"
+ROXY_MDF_PATH: str = "/browser/mdf"
+ROXY_MDF_METHOD: str = "POST"
 
 # 接口方法：常见 open/close 为 GET；若你的版本要求 POST，可在 WebUI/配置里改。
 ROXY_OPEN_METHOD: str = "POST"
@@ -54,6 +56,12 @@ ROXY_OPEN_HEADLESS: bool = True
 
 # 打开浏览器时附加参数；会合并到 /browser/open 请求体，优先级高于默认值。
 ROXY_OPEN_EXTRA_PARAMS: dict = {}
+
+# Roxy Profile 的窗口位置。0,0 表示第一个显示器左上角。
+ROXY_WINDOW_POSITION_SWITCH: bool = True
+ROXY_WINDOW_RATIO_POSITION: str = "0,0"
+# True 时，在打开 Profile 前调用 /browser/mdf，确保 Roxy 已保存主屏位置；失败只记录警告。
+ROXY_ENFORCE_PRIMARY_WINDOW_POSITION: bool = True
 
 # Selenium 行为
 ROXY_SELENIUM_TIMEOUT: int = 90
@@ -113,6 +121,15 @@ ROXY_PASSWORD_SETUP_WORKERS: int = 1
 # 密码设置队列最大容量，包含运行中和等待中的任务。
 ROXY_PASSWORD_SETUP_QUEUE_LIMIT: int = 100
 
+# Roxy 真实浏览器查活使用独立队列。默认单并发，避免同时启动多个登录窗口。
+LIVE_CHECK_BROWSER_WORKERS: int = 1
+LIVE_CHECK_BROWSER_QUEUE_LIMIT: int = 100
+LIVE_CHECK_BROWSER_MAX_ATTEMPTS: int = 3
+# 逗号分隔；第 N 次失败后使用第 N 个延迟，超出时使用最后一个值。
+LIVE_CHECK_BROWSER_RETRY_DELAYS: str = "15,60,180"
+# 只控制查活任务本次创建的临时 profile；历史 profile 永不删除。
+LIVE_CHECK_BROWSER_DELETE_TEMP_PROFILE: bool = True
+
 # 创建环境时是否使用 RoxyBrowser 已保存的代理资源：
 #   False = 不读取 Roxy 的代理列表
 #   True  = 调用 /proxy/list，按 ROXY_PROXY_COUNTRY 筛选后以 proxyMethod=choose 绑定
@@ -120,7 +137,7 @@ ROXY_USE_SAVED_PROXY_POOL: bool = False
 ROXY_PROXY_LIST_PATH: str = "/proxy/list"
 ROXY_PROXY_LIST_PAGE_SIZE: int = 100
 # 例如 JP/Japan/日本；留空表示不按国家筛选。
-ROXY_PROXY_COUNTRY: str = "JP"
+ROXY_PROXY_COUNTRY: str = ""
 
 # Roxy 代理检测通道；留空则不传 checkChannel。
 ROXY_PROXY_CHECK_CHANNEL: str = "IPRust.io"
@@ -137,4 +154,4 @@ ROXY_PROFILE_CREATE_PAYLOAD: dict = {
 ROXY_CODEX_CALLBACK_TIMEOUT: int = 180
 
 # ---- .env overrides for WebUI editable fields ----
-apply_env_overrides(globals(), {'REGISTRATION_DRIVER': 'str', 'ROXY_API_BASE': 'str', 'ROXY_API_TOKEN': 'str', 'ROXY_PROFILE_ID': 'str', 'ROXY_WORKSPACE_ID': 'str', 'ROXY_PROJECT_ID': 'str', 'ROXY_WORKSPACE_LIST_PATH': 'str', 'ROXY_OPEN_PATH': 'str', 'ROXY_OPEN_HEADLESS': 'bool', 'ROXY_CLOSE_PATH': 'str', 'ROXY_KEEP_BROWSER_OPEN': 'bool', 'ROXY_ONE_PROFILE_PER_ACCOUNT': 'bool', 'ROXY_DELETE_PROFILE_AFTER_RUN': 'bool', 'ROXY_RANDOM_OS_ON_CREATE': 'bool', 'ROXY_RANDOM_OS_CHOICES': 'str', 'ROXY_RANDOM_PROFILE_NAME_ON_CREATE': 'bool', 'ROXY_PROFILE_NAME_PREFIX': 'str', 'ROXY_CREATE_USE_PROXY_POOL': 'bool', 'ROXY_PASSWORD_SETUP_ENABLED': 'bool', 'ROXY_PASSWORD_SETUP_MODE': 'str', 'ROXY_PASSWORD_SETUP_PASSWORD': 'str', 'ROXY_PASSWORD_SETUP_TIMEOUT': 'int', 'ROXY_PASSWORD_SETUP_WORKERS': 'int', 'ROXY_PASSWORD_SETUP_QUEUE_LIMIT': 'int', 'ROXY_USE_SAVED_PROXY_POOL': 'bool', 'ROXY_PROXY_LIST_PATH': 'str', 'ROXY_PROXY_LIST_PAGE_SIZE': 'int', 'ROXY_PROXY_COUNTRY': 'str', 'ROXY_PROXY_CHECK_CHANNEL': 'str', 'ROXY_DELETE_PATH': 'str', 'ROXY_CODEX_CALLBACK_TIMEOUT': 'int'})
+apply_env_overrides(globals(), {'REGISTRATION_DRIVER': 'str', 'ROXY_API_BASE': 'str', 'ROXY_API_TOKEN': 'str', 'ROXY_PROFILE_ID': 'str', 'ROXY_WORKSPACE_ID': 'str', 'ROXY_PROJECT_ID': 'str', 'ROXY_WORKSPACE_LIST_PATH': 'str', 'ROXY_OPEN_PATH': 'str', 'ROXY_OPEN_HEADLESS': 'bool', 'ROXY_CLOSE_PATH': 'str', 'ROXY_KEEP_BROWSER_OPEN': 'bool', 'ROXY_ONE_PROFILE_PER_ACCOUNT': 'bool', 'ROXY_DELETE_PROFILE_AFTER_RUN': 'bool', 'ROXY_RANDOM_OS_ON_CREATE': 'bool', 'ROXY_RANDOM_OS_CHOICES': 'str', 'ROXY_RANDOM_PROFILE_NAME_ON_CREATE': 'bool', 'ROXY_PROFILE_NAME_PREFIX': 'str', 'ROXY_CREATE_USE_PROXY_POOL': 'bool', 'ROXY_PASSWORD_SETUP_ENABLED': 'bool', 'ROXY_PASSWORD_SETUP_MODE': 'str', 'ROXY_PASSWORD_SETUP_PASSWORD': 'str', 'ROXY_PASSWORD_SETUP_TIMEOUT': 'int', 'ROXY_PASSWORD_SETUP_WORKERS': 'int', 'ROXY_PASSWORD_SETUP_QUEUE_LIMIT': 'int', 'LIVE_CHECK_BROWSER_WORKERS': 'int', 'LIVE_CHECK_BROWSER_QUEUE_LIMIT': 'int', 'LIVE_CHECK_BROWSER_MAX_ATTEMPTS': 'int', 'LIVE_CHECK_BROWSER_RETRY_DELAYS': 'str', 'LIVE_CHECK_BROWSER_DELETE_TEMP_PROFILE': 'bool', 'ROXY_USE_SAVED_PROXY_POOL': 'bool', 'ROXY_PROXY_LIST_PATH': 'str', 'ROXY_PROXY_LIST_PAGE_SIZE': 'int', 'ROXY_PROXY_COUNTRY': 'str', 'ROXY_PROXY_CHECK_CHANNEL': 'str', 'ROXY_DELETE_PATH': 'str', 'ROXY_CODEX_CALLBACK_TIMEOUT': 'int', 'ROXY_WINDOW_POSITION_SWITCH': 'bool', 'ROXY_WINDOW_RATIO_POSITION': 'str', 'ROXY_ENFORCE_PRIMARY_WINDOW_POSITION': 'bool'})

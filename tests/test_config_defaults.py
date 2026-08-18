@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import importlib
 import unittest
 from unittest.mock import patch
 
@@ -8,11 +9,45 @@ from webui import config_editor
 
 
 class ConfigDefaultFallbackTests(unittest.TestCase):
+    def test_browser_live_check_defaults_are_safe_and_serial(self):
+        from config import roxybrowser
+
+        self.assertEqual(roxybrowser.LIVE_CHECK_BROWSER_WORKERS, 1)
+        self.assertEqual(roxybrowser.LIVE_CHECK_BROWSER_QUEUE_LIMIT, 100)
+        self.assertEqual(roxybrowser.LIVE_CHECK_BROWSER_MAX_ATTEMPTS, 3)
+        self.assertEqual(roxybrowser.LIVE_CHECK_BROWSER_RETRY_DELAYS, "15,60,180")
+        self.assertTrue(roxybrowser.LIVE_CHECK_BROWSER_DELETE_TEMP_PROFILE)
+
+    def test_config_editor_exposes_browser_live_check_settings(self):
+        from webui.config_editor import EDITABLE_FIELDS
+
+        fields = {item["key"]: item for item in EDITABLE_FIELDS}
+        expected = {
+            "LIVE_CHECK_BROWSER_WORKERS": "int",
+            "LIVE_CHECK_BROWSER_QUEUE_LIMIT": "int",
+            "LIVE_CHECK_BROWSER_MAX_ATTEMPTS": "int",
+            "LIVE_CHECK_BROWSER_RETRY_DELAYS": "str",
+            "LIVE_CHECK_BROWSER_DELETE_TEMP_PROFILE": "bool",
+        }
+        self.assertEqual(
+            {key: fields[key]["type"] for key in expected},
+            expected,
+        )
+
     def test_generic_api_otp_freshness_defaults(self):
         from config import email
 
-        self.assertEqual(email.OTP_MAX_MESSAGE_AGE_SECONDS, 3600)
-        self.assertTrue(email.GENERIC_API_REQUIRE_BASELINE)
+        old_loaded = env_loader._LOADED
+        try:
+            with patch.dict(os.environ, {}, clear=True):
+                env_loader._LOADED = True
+                reloaded_email = importlib.reload(email)
+                self.assertEqual(reloaded_email.OTP_MAX_WAIT, 120)
+                self.assertEqual(reloaded_email.OTP_MAX_MESSAGE_AGE_SECONDS, 3600)
+                self.assertTrue(reloaded_email.GENERIC_API_REQUIRE_BASELINE)
+        finally:
+            env_loader._LOADED = old_loaded
+            importlib.reload(email)
 
     def test_blank_env_value_uses_default_for_all_supported_types(self):
         old_loaded = env_loader._LOADED
@@ -60,6 +95,26 @@ class ConfigDefaultFallbackTests(unittest.TestCase):
 
         self.assertTrue(namespace["FEATURE_ENABLED"])
         self.assertEqual(namespace["BASE_URL"], "https://example.test")
+
+    def test_roxy_proxy_country_blank_value_explicitly_disables_country_filter(self):
+        old_loaded = env_loader._LOADED
+        env_loader._LOADED = True
+        namespace = {"ROXY_PROXY_COUNTRY": "JP"}
+        try:
+            with patch.dict(os.environ, {"ROXY_PROXY_COUNTRY": ""}, clear=True):
+                env_loader.apply_env_overrides(namespace, {"ROXY_PROXY_COUNTRY": "str"})
+        finally:
+            env_loader._LOADED = old_loaded
+
+        self.assertEqual(namespace["ROXY_PROXY_COUNTRY"], "")
+
+    def test_config_editor_preserves_explicit_blank_roxy_proxy_country(self):
+        self.assertEqual(
+            config_editor._coerce_raw_value(
+                "", "JP", "str", key="ROXY_PROXY_COUNTRY"
+            ),
+            "",
+        )
 
     def test_config_editor_parses_env_str_default_from_source(self):
         source = 'API_KEY: str = env_str("API_KEY", "fallback-key")\n'

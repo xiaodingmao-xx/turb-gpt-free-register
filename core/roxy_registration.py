@@ -8,6 +8,7 @@ import string
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 
 from config import roxybrowser as _cfg
 from config import twofa as _twofa_cfg
@@ -53,6 +54,15 @@ def _log_prefix(driver=None) -> str:
     return "[Roxy注册]"
 
 
+def _disable_local_webdriver_proxy(options, endpoint: str | None = None):
+    """让 Selenium 连接本机 Chromedriver/Roxy 调试端口时绕过系统代理。"""
+    host = urlparse(str(endpoint or "http://127.0.0.1")).hostname
+    if host in {"127.0.0.1", "localhost", "::1", "0.0.0.0"}:
+        # ChromiumDriver 会读取这个标记并让 RemoteConnection 不使用 SYSTEM proxy。
+        options._ignore_local_proxy = True
+    return options
+
+
 def _build_driver(opened: RoxyOpenResult):
     from core.windows_window import move_process_window_to_primary
     from selenium import webdriver
@@ -69,6 +79,7 @@ def _build_driver(opened: RoxyOpenResult):
         # 页面里长轮询/风控脚本偶尔会让 driver.get 等到超时；eager 只等 DOMContentLoaded。
         options.page_load_strategy = "eager"
         options.add_experimental_option("debuggerAddress", opened.debugger_address)
+        _disable_local_webdriver_proxy(options)
         driver_path = ""
         try:
             raw_data = opened.raw.get("data") if isinstance(opened.raw, dict) else {}
@@ -88,6 +99,7 @@ def _build_driver(opened: RoxyOpenResult):
         logger.info("[Roxy] Selenium 连接 webdriver_url=%s", opened.webdriver_url)
         options = Options()
         options.page_load_strategy = "eager"
+        _disable_local_webdriver_proxy(options, opened.webdriver_url)
         driver = RemoteWebDriver(command_executor=opened.webdriver_url, options=options)
         _apply_browser_automation_mask(driver)
         return driver
@@ -1746,6 +1758,16 @@ def _fill_password_setup_page(driver, password: str, timeout: int = 120) -> None
     raise RuntimeError(f"等待密码设置页面超时: {last_state}")
 
 
+def _is_otp_wait_timeout(error: BaseException) -> bool:
+    """仅识别邮件提供方明确报告的 OTP 等待超时。"""
+    if isinstance(error, TimeoutError):
+        return True
+    if not isinstance(error, RuntimeError):
+        return False
+    message = str(error).lower()
+    return any(marker in message for marker in ("超时", "timeout", "timed out"))
+
+
 def _run_roxy_password_setup(
     driver,
     email: str,
@@ -1759,17 +1781,13 @@ def _run_roxy_password_setup(
     mode = _normalize_password_setup_mode(mode or getattr(_cfg, "ROXY_PASSWORD_SETUP_MODE", "post_login_add_password"))
     password = _password_setup_target(password)
     progress = progress_callback or (lambda message: None)
-    email_source = resolve_email_source(email)
-    # 部分通用 API 取件地址只返回当前验证码，不返回邮件时间或 mail id。
-    # 这类服务在“重新发送”后可能连续投递同一个验证码；密码设置已经明确触发重发，
-    # 因此不能再把注册阶段的验证码无条件排除，否则会把新投递的同码邮件全部过滤掉。
-    generic_api_reuses_otp = email_source == "generic_api"
+    otp_baseline = capture_otp_baseline(email)
+    otp_after_ts = time.time()
     progress(f"[设置密码] 获取 CSRF 和 authorize URL mode={mode}")
     authorize_url = _fetch_password_setup_authorize_url(driver, email, mode)
     progress("[设置密码] 已获取 authorize URL，进入邮箱 OTP 页面")
     logger.info("%s 密码设置重新认证已创建：mode=%s", _log_prefix(driver), mode)
 
-    otp_after_ts = time.time()
     _safe_get(
         driver,
         authorize_url,
@@ -1780,22 +1798,33 @@ def _run_roxy_password_setup(
     if not _is_email_verification_page(driver):
         raise RuntimeError(f"密码设置未进入邮箱验证码页面: url={getattr(driver, 'current_url', '')}")
 
-    previous_otp = str(previous_otp or "").strip()
-    excluded_codes = set() if generic_api_reuses_otp else ({previous_otp} if previous_otp else set())
-    if previous_otp:
-        if generic_api_reuses_otp:
-            progress("[设置密码] 通用 API 已重新发送验证码，允许服务重复投递注册阶段验证码")
-        else:
-            progress("[设置密码] 已有注册验证码，重新发送密码设置验证码并排除旧码")
-        _click_resend_email_otp(driver, timeout=25)
-
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
+        # 页面可能在验证码投递或等待期间自动进入新密码页，无需再次输入 OTP。
+        if not _is_email_verification_page(driver):
+            progress(f"[设置密码] OTP 页面已自动跳转，跳过重复输入 attempt={attempt}")
+            break
         progress(f"[设置密码] 等待邮箱 OTP attempt={attempt}/{max_attempts}")
-        otp_kwargs = {"after_ts": otp_after_ts}
-        if excluded_codes:
-            otp_kwargs["exclude_codes"] = excluded_codes
-        code = wait_for_otp(email, **otp_kwargs)
+        logger.info(
+            "%s OTP challenge purpose=password_setup attempt=%s/%s baseline_present=%s trigger_ts=%.3f",
+            _log_prefix(driver),
+            attempt,
+            max_attempts,
+            bool(otp_baseline),
+            otp_after_ts,
+        )
+        try:
+            code = wait_for_otp(email, after_ts=otp_after_ts, otp_baseline=otp_baseline)
+        except (TimeoutError, RuntimeError) as exc:
+            if not _is_otp_wait_timeout(exc):
+                raise
+            if attempt >= max_attempts:
+                raise
+            otp_baseline = capture_otp_baseline(email)
+            otp_after_ts = time.time()
+            progress(f"[设置密码] OTP 等待超时，重新发送 attempt={attempt + 1}/{max_attempts}")
+            _click_resend_email_otp(driver, timeout=25)
+            continue
         # OTP 等待期间页面可能已经自动推进到新密码页；不要再把新密码页当成验证码页处理。
         if not _is_email_verification_page(driver):
             progress(f"[设置密码] OTP 页面已自动跳转，跳过重复输入 attempt={attempt}")
@@ -1815,6 +1844,7 @@ def _run_roxy_password_setup(
         if not _is_email_verification_page(driver):
             progress(f"[设置密码] OTP 已通过，页面已进入下一步，跳过重新发送 attempt={attempt}")
             break
+        otp_baseline = capture_otp_baseline(email)
         otp_after_ts = time.time()
         progress(f"[设置密码] OTP 无效或过期，重新发送 attempt={attempt + 1}/{max_attempts}")
         _click_resend_email_otp(driver, timeout=25)
@@ -2203,6 +2233,85 @@ def _click_if_enabled_submit(driver) -> bool:
         return False
 
 
+class RoxyExistingLoginError(RuntimeError):
+    """已注册账号的浏览器登录未完成，供浏览器查活分类。"""
+
+    def __init__(self, failure_kind: str, message: str, *, retryable: bool):
+        super().__init__(message)
+        self.failure_kind = str(failure_kind or "unknown")
+        self.retryable = bool(retryable)
+
+
+def _existing_login_is_incomplete(driver) -> bool:
+    url = str(getattr(driver, "current_url", "") or "").lower()
+    return any(marker in url for marker in (
+        "about-you", "create-account/password", "signup/profile", "create-account/profile"
+    ))
+
+
+def login_existing_account_with_otp(driver, email: str, *, progress_callback=None) -> dict:
+    """登录已注册账号并返回 ChatGPT session，不执行注册、资料补全或设置密码。"""
+    progress = progress_callback or (lambda message: None)
+    _safe_get(
+        driver,
+        "https://chatgpt.com/auth/login",
+        timeout=min(45, int(getattr(_cfg, "ROXY_SELENIUM_TIMEOUT", 90) or 90)),
+        attempts=2,
+        accept_hosts=("chatgpt.com", "auth.openai.com"),
+    )
+    _maybe_accept(driver)
+    existing = _read_chatgpt_session_once(driver)
+    if existing:
+        progress("[浏览器查活] 已检测到现有 ChatGPT session")
+        return existing
+
+    otp_baseline = capture_otp_baseline(email)
+    otp_after_ts = time.time()
+    next_state = _submit_email_and_wait_next(driver, email, attempts=3)
+    if next_state != "otp":
+        clicked = _click_passwordless_signup_if_present(driver)
+        if not clicked.get("ok"):
+            raise RoxyExistingLoginError(
+                "account_incomplete", "现有账号登录进入密码或注册页面，未找到 OTP 登录入口", retryable=False
+            )
+
+    for attempt in range(1, 4):
+        if _existing_login_is_incomplete(driver):
+            raise RoxyExistingLoginError(
+                "account_incomplete", "账号登录进入未完成注册资料页", retryable=False
+            )
+        progress(f"[浏览器查活] 等待邮箱 OTP attempt={attempt}/3")
+        try:
+            code = wait_for_otp(email, after_ts=otp_after_ts, otp_baseline=otp_baseline)
+        except Exception as exc:
+            if attempt >= 3:
+                raise RoxyExistingLoginError("otp_timeout", "等待邮箱验证码超时", retryable=True) from exc
+            otp_baseline = capture_otp_baseline(email)
+            otp_after_ts = time.time()
+            _click_resend_email_otp(driver, timeout=25)
+            continue
+
+        _clear_otp_inputs(driver)
+        _type_otp(driver, code)
+        try:
+            _click_continue(driver)
+        except Exception:
+            logger.info("%s 浏览器查活 OTP 页面没有显式提交按钮，继续观察页面状态", _log_prefix(driver))
+        outcome = _wait_after_email_otp_submit(driver, timeout=12)
+        if outcome == "accepted":
+            break
+        if attempt >= 3:
+            raise RoxyExistingLoginError("otp_invalid", "邮箱验证码连续无效或过期", retryable=True)
+        otp_baseline = capture_otp_baseline(email)
+        otp_after_ts = time.time()
+        _click_resend_email_otp(driver, timeout=25)
+
+    if _existing_login_is_incomplete(driver):
+        raise RoxyExistingLoginError("account_incomplete", "账号登录进入未完成注册资料页", retryable=False)
+    progress("[浏览器查活] OTP 已验证，等待 ChatGPT session")
+    return _fetch_chatgpt_session(driver, timeout=90)
+
+
 def _read_chatgpt_session_once(driver) -> dict | None:
     """当前页面必须在 chatgpt.com；读取 /api/auth/session，拿不到 token 返回 None。"""
     script = r"""
@@ -2312,6 +2421,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
     openai_password: str | None = None
     password_setup_status: str | None = None
     password_setup_error: str | None = None
+    password_setup_handoff = False
     try:
         driver = _build_driver(opened)
         _center_browser_window(driver)
@@ -2435,6 +2545,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
                 password_setup_status = "failed"
                 password_setup_error = f"{type(exc).__name__}: {str(exc)[:300]}"
                 openai_password = None
+                password_setup_handoff = True
                 logger.warning(
                     "[Roxy注册] 注册已成功，但设置密码失败，继续保存账号：%s",
                     password_setup_error,
@@ -2511,6 +2622,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
             "totp_secret": totp_secret,
             "codex": codex_result,
             "password_setup_status": password_setup_status,
+            "password_setup_handoff": password_setup_handoff,
             "error": None if codex_ok else f"Codex 未完成: {codex_result.get('message')}",
         }
     except Exception as exc:

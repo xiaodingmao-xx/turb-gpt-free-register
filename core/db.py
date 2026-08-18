@@ -1567,6 +1567,13 @@ def update_account_liveness(acc_id: int, result: dict | None = None) -> bool:
         row["live_check_ok"] = ok
         row["live_checked_at"] = result.get("checked_at") or now
         row["live_check_error"] = None if ok else result.get("error")
+        row["live_check_backend"] = str(result.get("backend") or row.get("live_check_backend") or "protocol")
+        row["live_check_failure_kind"] = None if ok else (result.get("failure_kind") or "unknown")
+        row["live_check_profile_id"] = result.get("profile_id") or row.get("live_check_profile_id")
+        row["live_check_profile_source"] = result.get("profile_source") or row.get("live_check_profile_source")
+        if result.get("proxy_used") is not None:
+            row["live_check_proxy_used"] = result.get("proxy_used")
+        row["live_check_next_retry_at"] = None
         row["updated_at"] = now
 
         if status == "deactivated":
@@ -1590,16 +1597,21 @@ def update_account_liveness(acc_id: int, result: dict | None = None) -> bool:
                 row["expires_at"] = session.get("expires")
             if result.get("device_id"):
                 row["device_id"] = result.get("device_id")
-            if result.get("proxy_used"):
-                row["live_check_proxy_used"] = result.get("proxy_used")
             row["live_check_error"] = None
+            row["live_check_failure_kind"] = None
 
         row["copy_line"] = _account_line(row)
         _save_accounts(rows)
         return True
 
 
-def claim_account_live_check(acc_id: int, trigger: str = "manual") -> bool:
+def claim_account_live_check(
+    acc_id: int,
+    trigger: str = "manual",
+    *,
+    backend: str = "protocol",
+    max_attempts: int = 1,
+) -> bool:
     """原子占用账号查活任务；已有 queued/running 时返回 False。"""
     with _LOCK:
         rows = _load_accounts()
@@ -1621,11 +1633,43 @@ def claim_account_live_check(acc_id: int, trigger: str = "manual") -> bool:
         row["live_check_status"] = "queued"
         row["live_check_ok"] = False
         row["live_check_trigger"] = str(trigger or "manual")
+        row["live_check_backend"] = str(backend or "protocol")
+        row["live_check_attempt"] = 1
+        row["live_check_max_attempts"] = max(1, int(max_attempts or 1))
+        row["live_check_next_retry_at"] = None
+        row["live_check_failure_kind"] = None
         row["live_check_queued_at"] = now
         row["live_check_started_at"] = None
         row["live_checked_at"] = None
         row["live_check_error"] = None
         row["updated_at"] = now
+        _save_accounts(rows)
+        return True
+
+
+def requeue_account_live_check(
+    acc_id: int,
+    error: str,
+    *,
+    failure_kind: str,
+    attempt: int,
+    max_attempts: int,
+    next_retry_at: str,
+) -> bool:
+    """把可重试的查活结果放回队列，保持同一账号的任务占用。"""
+    with _LOCK:
+        rows = _load_accounts()
+        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        if row is None or row.get("live_check_status") not in {"running", "queued"}:
+            return False
+        row["live_check_status"] = "queued"
+        row["live_check_ok"] = False
+        row["live_check_attempt"] = max(1, int(attempt))
+        row["live_check_max_attempts"] = max(1, int(max_attempts))
+        row["live_check_next_retry_at"] = str(next_retry_at or "") or None
+        row["live_check_failure_kind"] = str(failure_kind or "unknown")
+        row["live_check_error"] = str(error or "查活失败")[:500]
+        row["updated_at"] = _now()
         _save_accounts(rows)
         return True
 
@@ -2105,6 +2149,21 @@ def release_outlook(email: str, status: str = "available", note: str | None = No
         _save_outlook(rows)
 
 
+def restore_failed_outlook(email: str, note: str | None = None) -> bool:
+    """仅把状态为 failed 的 Outlook 邮箱恢复为 available。"""
+    with _LOCK:
+        rows = _load_outlook()
+        row = _find_by_email(rows, email)
+        if row is None or row.get("status") != "failed":
+            return False
+        row["status"] = "available"
+        row["used_at"] = None
+        if note is not None:
+            row["note"] = note
+        _save_outlook(rows)
+        return True
+
+
 def release_unconsumed_outlook(email: str, note: str | None = None) -> bool:
     """原子回收未生成本地账号且仍为 used 的 Outlook 邮箱。"""
     with _LOCK:
@@ -2243,6 +2302,22 @@ def release_generic_api_email(email: str, status: str = "available", note: str |
         if note is not None:
             row["note"] = note
         _save_generic_api_emails(rows)
+
+
+def restore_failed_generic_api_email(email: str, note: str | None = None) -> bool:
+    """仅把状态为 failed 的通用 API 邮箱恢复为 available。"""
+    with _LOCK:
+        rows = _load_generic_api_emails()
+        row = _find_by_email(rows, email)
+        if row is None or row.get("status") != "failed":
+            return False
+        row["status"] = "available"
+        row["used_at"] = None
+        row["cooldown_until"] = None
+        if note is not None:
+            row["note"] = note
+        _save_generic_api_emails(rows)
+        return True
 
 
 def release_unconsumed_generic_api_email(
@@ -2868,6 +2943,21 @@ def release_domain_email(email: str, status: str = "available", note: str | None
         if note is not None:
             row["note"] = note
         _save_domain_pool(rows)
+
+
+def restore_failed_domain_email(email: str, note: str | None = None) -> bool:
+    """仅把状态为 failed 的域名邮箱恢复为 available。"""
+    with _LOCK:
+        rows = _load_domain_pool()
+        row = _find_domain_email(rows, email)
+        if row is None or row.get("status") != "failed":
+            return False
+        row["status"] = "available"
+        row["used_at"] = None
+        if note is not None:
+            row["note"] = note
+        _save_domain_pool(rows)
+        return True
 
 
 def release_unconsumed_domain_email(email: str, note: str | None = None) -> bool:

@@ -17,6 +17,7 @@ from pathlib import Path
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _CONFIG_DIR = _PROJECT_ROOT / "config"
 EXPLICIT_EMPTY_LIST_KEYS = {"PROXY_POOL"}
+EXPLICIT_EMPTY_STRING_KEYS = {"ROXY_PROXY_COUNTRY"}
 
 
 # ============================================================
@@ -242,6 +243,38 @@ EDITABLE_FIELDS = [
     {
         "key": "ROXY_OPEN_HEADLESS", "file": "roxybrowser.py", "type": "bool", "group": "RoxyBrowser",
         "label": "无头启动窗口", "help": "打开 Roxy 环境时向 /browser/open 传 headless；False=显示窗口，True=无头启动",
+    },
+    {
+        "key": "ROXY_WINDOW_POSITION_SWITCH", "file": "roxybrowser.py", "type": "bool", "group": "RoxyBrowser",
+        "label": "启用主屏窗口位置", "help": "创建 Roxy Profile 时保存窗口位置；True=使用 windowRatioPosition，False=全屏",
+    },
+    {
+        "key": "ROXY_WINDOW_RATIO_POSITION", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "label": "Roxy窗口位置", "help": "比例坐标，0,0 表示第一个显示器左上角，0.5,0.5 表示第一个显示器中央",
+    },
+    {
+        "key": "ROXY_ENFORCE_PRIMARY_WINDOW_POSITION", "file": "roxybrowser.py", "type": "bool", "group": "RoxyBrowser",
+        "label": "修正旧环境窗口位置", "help": "打开旧 Profile 前调用 /browser/mdf 修正窗口位置；默认关闭，避免每次启动修改远端配置",
+    },
+    {
+        "key": "LIVE_CHECK_BROWSER_WORKERS", "file": "roxybrowser.py", "type": "int", "group": "RoxyBrowser",
+        "label": "浏览器查活并发数", "help": "Roxy 真实浏览器查活的最大并发窗口数，建议保持为 1",
+    },
+    {
+        "key": "LIVE_CHECK_BROWSER_QUEUE_LIMIT", "file": "roxybrowser.py", "type": "int", "group": "RoxyBrowser",
+        "label": "浏览器查活队列容量", "help": "浏览器查活队列允许同时排队和运行的任务数",
+    },
+    {
+        "key": "LIVE_CHECK_BROWSER_MAX_ATTEMPTS", "file": "roxybrowser.py", "type": "int", "group": "RoxyBrowser",
+        "label": "浏览器查活最大尝试", "help": "浏览器查活包含首次执行在内的最大尝试次数",
+    },
+    {
+        "key": "LIVE_CHECK_BROWSER_RETRY_DELAYS", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "label": "浏览器查活退避秒数", "help": "按逗号分隔填写重试等待秒数，例如 15,60,180",
+    },
+    {
+        "key": "LIVE_CHECK_BROWSER_DELETE_TEMP_PROFILE", "file": "roxybrowser.py", "type": "bool", "group": "RoxyBrowser",
+        "label": "删除查活临时环境", "help": "是否删除本次查活创建的临时 Roxy Profile；历史 Profile 永不删除",
     },
     {
         "key": "ROXY_CLOSE_PATH", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
@@ -781,9 +814,11 @@ def _parse_env_typed_value(raw: str, fallback, vtype: str):
     return env_value("__NO_SUCH_ENV_KEY__", fallback, vtype) if raw is None else _coerce_raw_value(raw, fallback, vtype)
 
 
-def _coerce_raw_value(raw: str, fallback, vtype: str):
+def _coerce_raw_value(raw: str, fallback, vtype: str, *, key: str | None = None):
     try:
         if raw is None or str(raw).strip() == "":
+            if vtype == "str" and key in EXPLICIT_EMPTY_STRING_KEYS:
+                return ""
             return fallback
         if vtype == "bool":
             return str(raw).strip().lower() in ("true", "1", "yes", "on", "y")
@@ -826,7 +861,7 @@ def get_config() -> list[dict]:
             if field["type"] == "list_str_multiline" and key in EXPLICIT_EMPTY_LIST_KEYS and str(raw_env_value).strip() == "":
                 value = []
             else:
-                value = _coerce_raw_value(raw_env_value, fallback, field["type"])
+                value = _coerce_raw_value(raw_env_value, fallback, field["type"], key=key)
         elif os.getenv(key) is not None:
             value = _coerce_raw_value(os.getenv(key, ""), fallback, field["type"])
         else:

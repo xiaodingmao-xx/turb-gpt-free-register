@@ -156,6 +156,15 @@ from config.email import (
 # ---------- 2FA ----------
 from config.twofa import ENABLE_2FA
 
+# ---------- Roxy 浏览器查活 ----------
+from config.roxybrowser import (
+    LIVE_CHECK_BROWSER_WORKERS,
+    LIVE_CHECK_BROWSER_QUEUE_LIMIT,
+    LIVE_CHECK_BROWSER_MAX_ATTEMPTS,
+    LIVE_CHECK_BROWSER_RETRY_DELAYS,
+    LIVE_CHECK_BROWSER_DELETE_TEMP_PROFILE,
+)
+
 
 # ---------- 热加载支持 ----------
 # WebUI 改配置后调 reload_all() 即可让所有运行时代码看到新值，无需重启进程。
@@ -261,4 +270,8 @@ __all__ = [
     "CLOUDMAIL_AUTO_ADD_USER", "CLOUDMAIL_RANDOM_LOCAL_LENGTH",
     # twofa
     "ENABLE_2FA",
+    # Roxy 浏览器查活
+    "LIVE_CHECK_BROWSER_WORKERS", "LIVE_CHECK_BROWSER_QUEUE_LIMIT",
+    "LIVE_CHECK_BROWSER_MAX_ATTEMPTS", "LIVE_CHECK_BROWSER_RETRY_DELAYS",
+    "LIVE_CHECK_BROWSER_DELETE_TEMP_PROFILE",
 ]

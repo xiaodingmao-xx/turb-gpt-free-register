@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass
 from urllib.parse import unquote, urljoin, urlparse
 
@@ -21,6 +23,28 @@ logger = logging.getLogger(__name__)
 _ROXY_CREATE_LOCK = threading.Lock()
 
 
+_LOG_SECRET_KEY_RE = re.compile(
+    r"(?i)(?:password|passwd|proxyusername|proxypassword|token|authorization|cookie|secret|otp)"
+)
+_LOG_SECRET_TEXT_RE = re.compile(
+    r"(?i)((?:password|passwd|proxyUserName|proxyPassword|token|authorization|cookie|secret|otp)\s*[:=]\s*)[^\s,}]+"
+)
+
+
+def _redact_log_value(value):
+    """仅用于 Roxy API 日志，避免请求体/响应摘要泄露认证和代理凭据。"""
+    if isinstance(value, dict):
+        return {
+            key: "<redacted>" if _LOG_SECRET_KEY_RE.search(str(key)) else _redact_log_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_log_value(item) for item in value]
+    if isinstance(value, str):
+        return _LOG_SECRET_TEXT_RE.sub(r"\1<redacted>", value)
+    return value
+
+
 @dataclass
 class RoxyOpenResult:
     profile_id: str
@@ -29,6 +53,7 @@ class RoxyOpenResult:
     webdriver_url: str | None = None
     ws_endpoint: str | None = None
     created_by_run: bool = False
+    process_id: int | None = None
 
 
 def _strip_slashes(value: str) -> str:
@@ -144,6 +169,16 @@ def _proxy_country_matches(row: dict, country: str) -> bool:
     return bool(values & wanted)
 
 
+def _proxy_country_label(row: dict) -> str:
+    """返回用于诊断日志的国家标签，不记录代理地址或认证信息。"""
+    values = []
+    for key in ("lastCountry", "country", "proxyCountry", "countryCode"):
+        value = str(row.get(key) or "").strip().upper()
+        if value and value not in values:
+            values.append(value)
+    return "/".join(values) or "未知"
+
+
 def _dig(payload: dict, *keys: str):
     cur = payload
     for key in keys:
@@ -159,6 +194,18 @@ def _first(payload: dict, paths: list[tuple[str, ...]]) -> str:
         if value is not None and str(value).strip():
             return str(value).strip()
     return ""
+
+
+def _extract_process_id(payload: dict) -> int | None:
+    raw = _first(payload, [
+        ("pid",), ("processId",), ("process_id",),
+        ("data", "pid"), ("data", "processId"), ("data", "process_id"),
+    ])
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 def _workspace_id_value() -> str | int:
@@ -201,6 +248,11 @@ class RoxyBrowserClient:
         self.api_base = (api_base or _cfg.ROXY_API_BASE).strip()
         self.token = (token if token is not None else _cfg.ROXY_API_TOKEN).strip()
         self.http = requests.Session()
+        # Roxy 默认运行在本机；本地 API 不能被系统 HTTP/SOCKS 代理转发，
+        # 否则代理可能把 127.0.0.1 请求转成空响应 502。远程 Roxy 地址仍保留
+        # requests 的环境代理行为。
+        if urlparse(self.api_base).hostname in {"127.0.0.1", "localhost", "::1", "0.0.0.0"}:
+            self.http.trust_env = False
         if self.token:
             # 官方文档要求所有接口请求头必须加 token。这里同时兼容 token / Authorization。
             self.http.headers.update({
@@ -237,7 +289,7 @@ class RoxyBrowserClient:
             try:
                 logger.debug(
                     "[Roxy] %s %s params=%s body=%s attempt=%s/%s",
-                    method, url, params, json_body, attempt, max_attempts,
+                    method, url, _redact_log_value(params), _redact_log_value(json_body), attempt, max_attempts,
                 )
                 resp = self.http.request(
                     method_u,
@@ -271,7 +323,7 @@ class RoxyBrowserClient:
                 delay = base_delay * attempt
                 logger.warning(
                     "[Roxy] API 请求失败，将在 %.1fs 后重试：%s %s attempt=%s/%s error=%s",
-                    delay, method_u, path, attempt, max_attempts, exc,
+                    delay, method_u, path, attempt, max_attempts, _redact_log_value(str(exc)),
                 )
                 time.sleep(delay)
         raise last_exc or RuntimeError(f"Roxy API 请求失败 {method_u} {path}")
@@ -450,11 +502,56 @@ class RoxyBrowserClient:
             rows = result.get("rows") or result.get("list") or [] if isinstance(result, dict) else []
         return [row for row in rows if isinstance(row, dict)]
 
+    def update_profile_window_position(self, profile_id: str) -> dict:
+        """通过 /browser/mdf 将已有 Profile 固定到 Roxy 的第一个显示器。"""
+        pid = self._normalize_profile_id(profile_id)
+        if not pid:
+            raise ValueError("更新窗口位置需要有效的 profile_id")
+        body = {
+            "workspaceId": _workspace_id_value(),
+            "dirId": int(pid) if pid.isdigit() else pid,
+            "positionSwitch": bool(getattr(_cfg, "ROXY_WINDOW_POSITION_SWITCH", True)),
+            "windowRatioPosition": str(getattr(_cfg, "ROXY_WINDOW_RATIO_POSITION", "0,0") or "0,0"),
+        }
+        method = str(getattr(_cfg, "ROXY_MDF_METHOD", "POST") or "POST").upper()
+        path = str(getattr(_cfg, "ROXY_MDF_PATH", "/browser/mdf") or "/browser/mdf")
+        return self.request(
+            method,
+            path,
+            params=body if method == "GET" else None,
+            json_body=body if method != "GET" else None,
+        )
+
     def _pick_saved_proxy_info(self) -> tuple[dict, dict]:
         rows = self.list_proxies()
         country = str(getattr(_cfg, "ROXY_PROXY_COUNTRY", "") or "").strip()
+        country_counts = Counter(_proxy_country_label(row) for row in rows)
+        distribution = ",".join(
+            f"{label}:{count}" for label, count in sorted(country_counts.items())
+        ) or "无"
+        logger.info(
+            "[Roxy代理] 代理筛选诊断：目标国家=%s，总数=%s，国家分布=%s",
+            country or "不限",
+            len(rows),
+            distribution,
+        )
         candidates = [row for row in rows if _proxy_country_matches(row, country)]
         if not candidates:
+            sample = [
+                {
+                    "id": row.get("id") or row.get("moduleId") or row.get("module_id"),
+                    "country": _proxy_country_label(row),
+                    "protocol": row.get("protocol") or row.get("proxyCategory"),
+                }
+                for row in rows[:5]
+            ]
+            logger.error(
+                "[Roxy代理] 代理筛选失败：目标国家=%s，无匹配项；总数=%s，国家分布=%s，样本=%s",
+                country or "不限",
+                len(rows),
+                distribution,
+                sample,
+            )
             raise RuntimeError(
                 f"Roxy 代理列表没有找到符合国家筛选的代理：{country or '不限'}，共读取 {len(rows)} 条"
             )
@@ -466,6 +563,15 @@ class RoxyBrowserClient:
 
     def create_profile(self, payload: dict | None = None) -> str:
         body = dict(getattr(_cfg, "ROXY_PROFILE_CREATE_PAYLOAD", {}) or {})
+        # Profile 创建时保存主屏位置；调用方显式传入的 payload 仍可覆盖这两个默认值。
+        body.setdefault(
+            "positionSwitch",
+            bool(getattr(_cfg, "ROXY_WINDOW_POSITION_SWITCH", True)),
+        )
+        body.setdefault(
+            "windowRatioPosition",
+            str(getattr(_cfg, "ROXY_WINDOW_RATIO_POSITION", "0,0") or "0,0"),
+        )
         random_name_enabled = bool(getattr(_cfg, "ROXY_RANDOM_PROFILE_NAME_ON_CREATE", True))
         if random_name_enabled:
             # 覆盖 ROXY_PROFILE_CREATE_PAYLOAD 里的固定 name，避免所有 Roxy 窗口同名。
@@ -525,7 +631,7 @@ class RoxyBrowserClient:
                 "或直接在 ROXY_PROFILE_CREATE_PAYLOAD 里加入 {'workspaceId': '你的工作区ID'}。"
             )
         logger.info(
-            "[Roxy] 创建环境参数：workspaceId=%s projectId=%s name=%s random_name=%s os=%s osVersion=%s random_os=%s",
+            "[Roxy] 创建环境参数：workspaceId=%s projectId=%s name=%s random_name=%s os=%s osVersion=%s random_os=%s positionSwitch=%s windowRatioPosition=%s",
             body.get("workspaceId"),
             body.get("projectId") or "-",
             body.get("name") or "-",
@@ -533,6 +639,8 @@ class RoxyBrowserClient:
             body.get("os") or "-",
             body.get("osVersion") or "-",
             random_os_enabled,
+            body.get("positionSwitch"),
+            body.get("windowRatioPosition"),
         )
         logger.info("[Roxy] 等待环境创建队列：%s", body.get("name") or "-")
         with _ROXY_CREATE_LOCK:
@@ -571,6 +679,14 @@ class RoxyBrowserClient:
             created_by_run = True
             logger.info("[Roxy] 已创建临时环境：%s", pid)
 
+        if bool(getattr(_cfg, "ROXY_ENFORCE_PRIMARY_WINDOW_POSITION", True)):
+            try:
+                self.update_profile_window_position(pid)
+                logger.info("[Roxy] 已在打开前确认主屏窗口位置：%s created=%s", pid, created_by_run)
+            except Exception as exc:
+                # 位置修正失败不能阻断注册；保留后续 PID/Windows 原生兜底定位。
+                logger.warning("[Roxy] 打开前修正窗口位置失败，继续执行：%s", exc)
+
         path = str(_cfg.ROXY_OPEN_PATH).format(profile_id=pid)
         params = dict(getattr(_cfg, "ROXY_OPEN_EXTRA_PARAMS", {}) or {})
         # Roxy 官方 /browser/open body: {workspaceId, dirId, args, forceOpen, headless}
@@ -589,7 +705,13 @@ class RoxyBrowserClient:
             json_body=params if _cfg.ROXY_OPEN_METHOD.upper() != "GET" else None,
         )
         debugger_address = self._extract_debugger_address(result)
-        logger.info("[Roxy] open 返回摘要: debugger=%s raw=%s", debugger_address, json.dumps(result, ensure_ascii=False)[:800])
+        process_id = _extract_process_id(result)
+        logger.info(
+            "[Roxy] open 返回摘要: debugger=%s pid=%s raw=%s",
+            debugger_address,
+            process_id or "-",
+            json.dumps(_redact_log_value(result), ensure_ascii=False)[:800],
+        )
         webdriver_url = _first(result, [
             ("webdriver",), ("webDriver",), ("webdriver_url",), ("webdriverUrl",),
             ("selenium",), ("selenium_url",), ("seleniumUrl",),
@@ -608,6 +730,7 @@ class RoxyBrowserClient:
             debugger_address=debugger_address,
             webdriver_url=webdriver_url,
             ws_endpoint=ws_endpoint,
+            process_id=process_id,
             created_by_run=created_by_run,
         )
 

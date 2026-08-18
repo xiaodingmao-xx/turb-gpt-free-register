@@ -13,6 +13,7 @@ import logging
 import re
 import time
 import base64
+import hashlib
 import html as html_lib
 from datetime import datetime
 from dataclasses import dataclass, replace
@@ -171,7 +172,7 @@ def _extract_yangyang_openai_code(subject: str, body: str) -> str | None:
     noise = {"000000", "202123", "353740"}
     candidates = [c for c in codes if c not in noise]
     if not candidates:
-        candidates = codes
+        return None
 
     lower = clean.lower()
     patterns = (
@@ -189,7 +190,8 @@ def _extract_yangyang_openai_code(subject: str, body: str) -> str | None:
     if any(h in subject_l for h in _YANGYANG_OPENAI_SUBJECT_HINTS) or "openai" in lower or "chatgpt" in lower:
         return candidates[-1]
 
-    return _extract_code(clean)
+    fallback = _extract_code(clean)
+    return fallback if fallback in candidates else None
 
 
 def _parse_yangyang_code_url(code_url: str) -> tuple[str, str, str] | None:
@@ -312,18 +314,45 @@ def _parse_generic_api_observation(
     if not isinstance(data, dict):
         return GenericOtpObservation(None, "structured_api", None, None, None, True, "invalid_shape")
 
-    ts_raw = (
-        data.get("time")
-        or data.get("date")
-        or data.get("received_at")
-        or data.get("receivedAt")
-        or data.get("created_at")
-        or data.get("createdAt")
-        or data.get("timestamp")
+    nested_message = data.get("message")
+    payload = nested_message if isinstance(nested_message, dict) else data
+
+    ts_raw = None
+    msg_ts = None
+    time_sources = (payload, data) if payload is not data else (data,)
+    for time_source in time_sources:
+        for name in (
+            "timestamp",
+            "time",
+            "received_at",
+            "receivedAt",
+            "created_at",
+            "createdAt",
+            "date",
+        ):
+            candidate = time_source.get(name)
+            if candidate is None or str(candidate).strip() == "":
+                continue
+            parsed_ts = _parse_generic_api_ts(candidate)
+            if ts_raw is None:
+                ts_raw = candidate
+            if parsed_ts is not None:
+                ts_raw = candidate
+                msg_ts = parsed_ts
+                break
+        if msg_ts is not None:
+            break
+
+    message_id = (
+        payload.get("message_id")
+        or payload.get("messageId")
+        or payload.get("id")
+        or payload.get("uid")
+        or data.get("message_id")
+        or data.get("messageId")
+        or data.get("id")
     )
-    msg_ts = _parse_generic_api_ts(ts_raw)
-    message_id = data.get("message_id") or data.get("messageId") or data.get("id")
-    code, source = _extract_code_from_structured_dict(data)
+    code, source = _extract_code_from_structured_dict(payload)
     rejection_reason = None
     current_ts = time.time() if now_ts is None else now_ts
 
@@ -350,7 +379,7 @@ def _parse_generic_api_observation(
         message_id=str(message_id) if message_id is not None else None,
         structured=True,
         rejection_reason=rejection_reason,
-        subject=str(data.get("subject") or "") or None,
+        subject=str(payload.get("subject") or data.get("subject") or "") or None,
     )
 
 
@@ -364,15 +393,20 @@ def _extract_structured_api_code(text: str, after_ts: float | None = None) -> tu
         data = json.loads(text)
     except Exception:
         data = {}
+    payload = (
+        data.get("message")
+        if isinstance(data, dict) and isinstance(data.get("message"), dict)
+        else data
+    )
     return observation.code, {
         "source": observation.source,
         "received_at": observation.received_at,
         "msg_ts": observation.msg_ts,
         "message_id": observation.message_id,
-        "subject": data.get("subject") if isinstance(data, dict) else None,
+        "subject": observation.subject,
         "from": (
-            data.get("from") or data.get("fromAddress") or data.get("sender")
-            if isinstance(data, dict) else None
+            payload.get("from") or payload.get("fromAddress") or payload.get("sender")
+            if isinstance(payload, dict) else None
         ),
     }
 
@@ -382,6 +416,7 @@ def _fetch_yangyang_otp(
     code_url: str,
     headers: dict,
     after_ts: float | None = None,
+    baseline_message_ids: frozenset[str] | None = None,
 ) -> tuple[str, dict] | None:
     """从 yangyang 邮箱页面的列表 API + 详情 API 中抽取最新 6 位验证码。"""
     parsed = _parse_yangyang_code_url(code_url)
@@ -407,8 +442,15 @@ def _fetch_yangyang_otp(
                     code_url=code_url,
                     headers=headers,
                     after_ts=after_ts,
+                    baseline_message_ids=baseline_message_ids,
                 )
-            logger.debug(f"[GenericAPI] yangyang 邮件列表 HTTP {resp.status_code}: {resp.text[:160]}")
+            response_body = resp.text or ""
+            logger.debug(
+                "[GenericAPI] yangyang 邮件列表 HTTP %s: has_body=%s body_len=%s",
+                resp.status_code,
+                bool(response_body),
+                len(response_body),
+            )
             return None
         data = resp.json()
         page_items = data.get("items") or []
@@ -420,17 +462,21 @@ def _fetch_yangyang_otp(
 
     # API 默认新邮件在前；再次按时间倒序，尽量取最新验证码。
     items.sort(key=lambda x: _parse_yangyang_ts(x.get("received_at") or x.get("receivedAt")) or 0, reverse=True)
+    baseline_ids = {str(value) for value in (baseline_message_ids or ())}
     for item in items:
+        msg_id = item.get("id")
+        if msg_id is not None and str(msg_id) in baseline_ids:
+            logger.debug("[GenericAPI] yangyang 跳过基线邮件: id=%s", msg_id)
+            continue
         msg_ts_raw = item.get("received_at") or item.get("receivedAt")
         msg_ts = _parse_yangyang_ts(msg_ts_raw)
         if after_ts and msg_ts and msg_ts + 2 < after_ts:
             logger.debug(
-                "[GenericAPI] yangyang 跳过旧邮件: id=%s ts=%s after=%s subject=%r",
+                "[GenericAPI] yangyang 跳过旧邮件: id=%s ts=%s after=%s has_subject=%s subject_len=%s",
                 item.get("id"), msg_ts_raw, time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(after_ts)),
-                item.get("subject") or "",
+                bool(item.get("subject")), len(str(item.get("subject") or "")),
             )
             continue
-        msg_id = item.get("id")
         if not msg_id:
             continue
         detail_url = f"{origin}/message/{quote(str(msg_id), safe='')}/{token_q}/{email_q}"
@@ -455,8 +501,9 @@ def _fetch_yangyang_otp(
         code = _extract_yangyang_openai_code(subject, body)
         if code:
             logger.info(
-                f"[GenericAPI] yangyang 页面提取到 OTP={code}, "
-                f"mail_id={msg_id}, ts={detail.get('receivedAt') or item.get('received_at')}, subject={subject[:80]!r}"
+                f"[GenericAPI] yangyang 页面提取到 OTP 候选, "
+                f"mail_id={msg_id}, ts={detail.get('receivedAt') or item.get('received_at')}, "
+                f"has_subject={bool(subject)}, subject_len={len(subject)}"
             )
             return code, {
                 "mail_id": msg_id,
@@ -483,6 +530,7 @@ def _fetch_inline_messages_page_otp(
     code_url: str,
     headers: dict,
     after_ts: float | None = None,
+    baseline_message_ids: frozenset[str] | None = None,
 ) -> tuple[str, dict] | None:
     """解析无 JSON API、直接把邮件卡片渲染在 HTML 里的 /messages 页面。"""
     try:
@@ -493,20 +541,50 @@ def _fetch_inline_messages_page_otp(
             verify=False,
         )
         if resp.status_code != 200:
-            logger.debug("[GenericAPI] inline messages 页面 HTTP %s: %s", resp.status_code, (resp.text or "")[:160])
+            response_body = resp.text or ""
+            logger.debug(
+                "[GenericAPI] inline messages 页面 HTTP %s: has_body=%s body_len=%s",
+                resp.status_code,
+                bool(response_body),
+                len(response_body),
+            )
             return None
         html = resp.text or ""
     except Exception as exc:
         logger.debug("[GenericAPI] inline messages 页面读取失败: %s: %s", type(exc).__name__, exc)
         return None
 
-    cards = re.findall(r"<article\b[^>]*class=[\"'][^\"']*mail-card[^\"']*[\"'][^>]*>(.*?)</article>", html, flags=re.DOTALL | re.IGNORECASE)
+    cards: list[tuple[str, str]] = []
+    for match in re.finditer(
+        r"<article\b(?P<attrs>[^>]*)>(?P<body>.*?)</article>",
+        html,
+        flags=re.DOTALL | re.IGNORECASE,
+    ):
+        attrs = match.group("attrs") or ""
+        class_match = re.search(r"\bclass\s*=\s*[\"']([^\"']*)[\"']", attrs, flags=re.IGNORECASE)
+        if class_match and "mail-card" in class_match.group(1).lower().split():
+            cards.append((attrs, match.group("body")))
     # 没有 article 时退一步按 details 分块，避免 class 名细微变化。
     if not cards:
-        cards = re.findall(r"<details\b[^>]*>(.*?)</details>", html, flags=re.DOTALL | re.IGNORECASE)
+        cards = [
+            (match.group("attrs") or "", match.group("body"))
+            for match in re.finditer(
+                r"<details\b(?P<attrs>[^>]*)>(?P<body>.*?)</details>",
+                html,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+        ]
 
     items: list[dict] = []
-    for idx, card in enumerate(cards):
+    for attrs, card in cards:
+        attr_map = {
+            name.lower(): html_lib.unescape(value).strip()
+            for name, value in re.findall(
+                r"([:\w-]+)\s*=\s*[\"']([^\"']*)[\"']",
+                attrs,
+                flags=re.IGNORECASE,
+            )
+        }
         subject_m = re.search(r"<span\b[^>]*class=[\"'][^\"']*subject[^\"']*[\"'][^>]*>(.*?)</span>", card, flags=re.DOTALL | re.IGNORECASE)
         date_m = re.search(r"<span\b[^>]*class=[\"'][^\"']*date[^\"']*[\"'][^>]*>(.*?)</span>", card, flags=re.DOTALL | re.IGNORECASE)
         from_m = re.search(r"<div\b[^>]*class=[\"'][^\"']*meta[^\"']*[\"'][^>]*>(.*?)</div>", card, flags=re.DOTALL | re.IGNORECASE)
@@ -519,8 +597,33 @@ def _fetch_inline_messages_page_otp(
         from_addr = _strip_html_fragment(from_m.group(1) if from_m else "")
         body = _strip_html_fragment(body_m.group(1) if body_m else card)
         msg_ts = _parse_yangyang_ts(received_at)
+        mail_id = next((
+            attr_map.get(name)
+            for name in (
+                "data-message-id",
+                "message-id",
+                "data-id",
+                "data-uid",
+                "uid",
+                "id",
+            )
+            if attr_map.get(name)
+        ), None)
+        if mail_id is None:
+            identity_parts = (
+                received_at,
+                from_addr,
+                subject,
+                body,
+            )
+            normalized_identity = "\x1f".join(
+                re.sub(r"\s+", " ", str(value or "")).strip()
+                for value in identity_parts
+            )
+            digest = hashlib.sha256(normalized_identity.encode("utf-8")).hexdigest()[:24]
+            mail_id = f"inline-sha256-{digest}"
         items.append({
-            "mail_id": f"inline-{idx}",
+            "mail_id": mail_id,
             "subject": subject,
             "received_at": received_at,
             "from": from_addr,
@@ -529,21 +632,26 @@ def _fetch_inline_messages_page_otp(
         })
 
     items.sort(key=lambda x: float(x.get("msg_ts") or 0.0), reverse=True)
+    baseline_ids = {str(value) for value in (baseline_message_ids or ())}
     for item in items:
+        if str(item.get("mail_id")) in baseline_ids:
+            logger.debug("[GenericAPI] inline messages 跳过基线邮件: id=%s", item.get("mail_id"))
+            continue
         msg_ts = float(item.get("msg_ts") or 0.0)
         if after_ts and msg_ts and msg_ts + 2 < after_ts:
             logger.debug(
-                "[GenericAPI] inline messages 跳过旧邮件: id=%s ts=%s after=%s subject=%r",
+                "[GenericAPI] inline messages 跳过旧邮件: id=%s ts=%s after=%s has_subject=%s subject_len=%s",
                 item.get("mail_id"), item.get("received_at"),
                 time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(after_ts)),
-                item.get("subject") or "",
+                bool(item.get("subject")), len(str(item.get("subject") or "")),
             )
             continue
         code = _extract_yangyang_openai_code(str(item.get("subject") or ""), str(item.get("body") or ""))
         if code:
             logger.info(
-                "[GenericAPI] inline messages 页面提取到 OTP=%s, mail_id=%s, ts=%s, subject=%r",
-                code, item.get("mail_id"), item.get("received_at"), str(item.get("subject") or "")[:80],
+                "[GenericAPI] inline messages 页面提取到 OTP 候选, mail_id=%s, ts=%s, has_subject=%s, subject_len=%s",
+                item.get("mail_id"), item.get("received_at"),
+                bool(item.get("subject")), len(str(item.get("subject") or "")),
             )
             return code, {
                 "mail_id": item.get("mail_id"),
@@ -614,6 +722,15 @@ class OtpBaseline:
     captured_at: float
 
 
+def _otp_observation_key(observation: GenericOtpObservation) -> tuple[str, str, str]:
+    """返回 message_id、msg_ts、code 的稳定字符串键。"""
+    return (
+        str(observation.message_id) if observation.message_id is not None else "",
+        str(observation.msg_ts) if observation.msg_ts is not None else "",
+        str(observation.code) if observation.code is not None else "",
+    )
+
+
 def _matches_otp_baseline(
     observation: GenericOtpObservation,
     baseline: OtpBaseline | None,
@@ -623,13 +740,19 @@ def _matches_otp_baseline(
     if baseline is None or not observation.code:
         return False
     if (
+        observation.message_id
+        and baseline.message_ids
+        and observation.message_id not in baseline.message_ids
+    ):
+        return False
+    if (
         observation.msg_ts is not None
         and after_ts is not None
         and observation.msg_ts + 2 >= after_ts
     ):
         return False
     if observation.message_id and baseline.message_ids:
-        return observation.message_id in baseline.message_ids
+        return True
     return observation.code in baseline.codes
 
 
@@ -725,7 +848,7 @@ def fetch_latest_otp(
     if account is None:
         raise GenericApiMailError(f"通用 API 邮箱不存在或未导入: {email}")
 
-    deadline = time.time() + (max_wait or _email_cfg.OTP_MAX_WAIT)
+    search_deadline = time.time() + (max_wait or _email_cfg.OTP_MAX_WAIT)
     interval = poll_interval or _email_cfg.OTP_POLL_INTERVAL
     settle = settle_seconds if settle_seconds is not None else _email_cfg.OTP_SETTLE_SECONDS
     max_age_seconds = max(
@@ -738,19 +861,84 @@ def fetch_latest_otp(
         "User-Agent": "Mozilla/5.0 (compatible; gpt-register/1.0)",
     }
     last_error = ""
-    best_otp: str | None = None
+    best_observation: GenericOtpObservation | None = None
     best_seen_at: float = 0.0
-    settle_until: float | None = None
+    confirm_deadline: float | None = None
+    hard_confirm_deadline: float | None = None
     logger.info(
         f"[GenericAPI] 开始轮询取码地址: {email}，"
         f"最长 {max_wait or _email_cfg.OTP_MAX_WAIT}s, settle={settle}s"
     )
     is_yangyang = _parse_yangyang_code_url(account.code_url) is not None
 
-    while time.time() < deadline:
+    def update_candidate(observation: GenericOtpObservation, now_seen: float) -> None:
+        """用邮件身份（而不是验证码值）判定候选是否发生更新。"""
+        nonlocal best_observation, best_seen_at, confirm_deadline, hard_confirm_deadline
+
+        if best_observation is None:
+            best_observation = observation
+            best_seen_at = now_seen
+            confirm_deadline = now_seen + settle
+            hard_confirm_deadline = now_seen + max(15, 3 * max(settle, 0))
+            logger.info(
+                "[GenericAPI] 首次锁定 OTP 候选: source=%s message_id=%s msg_ts=%s，等 %ss 看取码接口是否更新...",
+                observation.source,
+                observation.message_id,
+                observation.msg_ts,
+                settle,
+            )
+            return
+
+        previous_key = _otp_observation_key(best_observation)
+        observation_key = _otp_observation_key(observation)
+        later_message = (
+            observation.msg_ts is not None
+            and (
+                best_observation.msg_ts is None
+                or observation.msg_ts > best_observation.msg_ts
+            )
+        )
+        if observation_key != previous_key or later_message:
+            best_observation = observation
+            best_seen_at = now_seen
+            confirm_deadline = now_seen + settle
+            logger.info(
+                "[GenericAPI] 发现更新 OTP 候选: source=%s message_id=%s msg_ts=%s，重置 settle 计时",
+                observation.source,
+                observation.message_id,
+                observation.msg_ts,
+            )
+        else:
+            logger.debug("[GenericAPI] 取码接口仍返回同一 OTP 候选")
+
+    while True:
+        now = time.time()
+        if best_observation is not None:
+            if hard_confirm_deadline is not None and now >= hard_confirm_deadline:
+                raise GenericApiMailError(
+                    f"等待通用 API 验证码失败: {email}; 候选不稳定，确认窗口内持续更新"
+                )
+            if confirm_deadline is not None and now >= confirm_deadline:
+                logger.info(
+                    "[GenericAPI] settle 完成，返回 OTP 候选: 候选锁定时间=%s",
+                    time.strftime("%H:%M:%S", time.localtime(best_seen_at)),
+                )
+                return best_observation.code
+        elif now >= search_deadline:
+            break
+
         try:
             session = requests.Session()
-            yy_result = _fetch_yangyang_otp(session, account.code_url, headers, after_ts=after_ts) if is_yangyang else None
+            yy_after_ts = None if otp_baseline is not None else after_ts
+            yy_result = _fetch_yangyang_otp(
+                session,
+                account.code_url,
+                headers,
+                after_ts=yy_after_ts,
+                baseline_message_ids=(
+                    otp_baseline.message_ids if otp_baseline is not None else None
+                ),
+            ) if is_yangyang else None
             if yy_result:
                 code, yy_meta = yy_result
                 if code in excluded_codes:
@@ -759,7 +947,6 @@ def fetch_latest_otp(
                     text = ""
                     code = None
                 else:
-                    now_seen = time.time()
                     observation = GenericOtpObservation(
                         code=code,
                         source="yangyang",
@@ -772,32 +959,12 @@ def fetch_latest_otp(
                         structured=True,
                     )
                     if _matches_otp_baseline(observation, otp_baseline, after_ts):
-                        last_error = (
-                            f"基线验证码未变化: code={code} "
-                            f"message_id={observation.message_id}"
-                        )
+                        last_error = f"基线验证码未变化: message_id={observation.message_id}"
                         resp = None
                         text = ""
                         code = None
                 if code:
-                 if not best_otp:
-                    best_otp = code
-                    best_seen_at = now_seen
-                    settle_until = now_seen + settle
-                    logger.info(
-                        f"[GenericAPI] 首次锁定 OTP={code}, source=yangyang mail_id={yy_meta.get('mail_id')} ts={yy_meta.get('received_at')}, "
-                        f"等 {settle}s 看取码接口是否出现更新验证码..."
-                    )
-                 elif code != best_otp:
-                    logger.info(
-                        f"[GenericAPI] 发现更新 OTP={code}, source=yangyang mail_id={yy_meta.get('mail_id')} ts={yy_meta.get('received_at')}，"
-                        f"替换之前的 {best_otp}, 重置 settle 计时"
-                    )
-                    best_otp = code
-                    best_seen_at = now_seen
-                    settle_until = now_seen + settle
-                 else:
-                    logger.debug(f"[GenericAPI] 取码接口仍返回候选 OTP={best_otp}")
+                    update_candidate(observation, time.time())
                 resp = None
                 text = ""
             else:
@@ -813,8 +980,8 @@ def fetch_latest_otp(
             elif resp.status_code == 200:
                 observation = _parse_generic_api_observation(
                     text,
-                    after_ts=after_ts,
-                    max_age_seconds=max_age_seconds,
+                    after_ts=None if otp_baseline is not None else after_ts,
+                    max_age_seconds=None if otp_baseline is not None else max_age_seconds,
                 )
                 if observation.structured:
                     code = observation.code
@@ -827,9 +994,8 @@ def fetch_latest_otp(
                     }
                     if observation.rejection_reason:
                         logger.info(
-                            "[GenericAPI] OTP候选 decision=reject_candidate code=%s source=%s "
+                            "[GenericAPI] OTP候选 decision=reject_candidate source=%s "
                             "message_id=%s msg_ts=%s after_ts=%s reason=%s",
-                            observation.code,
                             observation.source,
                             observation.message_id,
                             observation.msg_ts,
@@ -853,86 +1019,52 @@ def fetch_latest_otp(
                     code = None
                 elif code and _matches_otp_baseline(observation, otp_baseline, after_ts):
                     logger.info(
-                        "[GenericAPI] OTP候选 decision=wait_for_change code=%s source=%s "
+                        "[GenericAPI] OTP候选 decision=wait_for_change source=%s "
                         "message_id=%s msg_ts=%s after_ts=%s baseline_hit=True",
-                        code,
                         observation.source,
                         observation.message_id,
                         observation.msg_ts,
                         after_ts,
                     )
-                    last_error = (
-                        f"基线验证码未变化: code={code} "
-                        f"message_id={observation.message_id}"
-                    )
+                    last_error = f"基线验证码未变化: message_id={observation.message_id}"
                     code = None
                 if code:
-                    now_seen = time.time()
-                    if not best_otp:
-                        best_otp = code
-                        best_seen_at = now_seen
-                        settle_until = now_seen + settle
-                        if structured_meta:
-                            source = structured_meta.get("source") or "structured_api"
-                            logger.info(
-                                f"[GenericAPI] 首次锁定 OTP={code}, source={source} "
-                                f"ts={structured_meta.get('received_at')} subject={str(structured_meta.get('subject') or '')[:80]!r}, "
-                                f"等 {settle}s 看取码接口是否出现更新验证码..."
-                            )
-                        else:
-                            logger.info(
-                                f"[GenericAPI] 首次锁定 OTP={code}, "
-                                f"等 {settle}s 看取码接口是否出现更新验证码..."
-                            )
-                    elif code != best_otp:
-                        if structured_meta:
-                            source = structured_meta.get("source") or "structured_api"
-                            logger.info(
-                                f"[GenericAPI] 发现更新 OTP={code}, source={source} "
-                                f"ts={structured_meta.get('received_at')} subject={str(structured_meta.get('subject') or '')[:80]!r}，"
-                                f"替换之前的 {best_otp}, 重置 settle 计时"
-                            )
-                        else:
-                            logger.info(
-                                f"[GenericAPI] 发现更新 OTP={code}，"
-                                f"替换之前的 {best_otp}, 重置 settle 计时"
-                            )
-                        best_otp = code
-                        best_seen_at = now_seen
-                        settle_until = now_seen + settle
-                    else:
-                        logger.debug(f"[GenericAPI] 取码接口仍返回候选 OTP={best_otp}")
+                    update_candidate(observation, time.time())
                 else:
-                    last_error = f"HTTP 200 但未提取到 6 位验证码，响应预览: {text[:160]}"
+                    last_error = "HTTP 200 但未提取到 6 位验证码"
             else:
-                last_error = f"HTTP {resp.status_code}: {text[:160]}"
+                last_error = f"HTTP {resp.status_code}"
         except Exception as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
+            last_error = type(exc).__name__
 
         now = time.time()
-        if best_otp and settle_until is not None and now >= settle_until:
-            logger.info(
-                f"[GenericAPI] settle 完成，返回 OTP={best_otp}, "
-                f"候选锁定时间={time.strftime('%H:%M:%S', time.localtime(best_seen_at))}"
+        if best_observation is not None:
+            if hard_confirm_deadline is not None and now >= hard_confirm_deadline:
+                raise GenericApiMailError(
+                    f"等待通用 API 验证码失败: {email}; 候选不稳定，确认窗口内持续更新"
+                )
+            if confirm_deadline is not None and now >= confirm_deadline:
+                logger.info(
+                    "[GenericAPI] settle 完成，返回 OTP 候选: 候选锁定时间=%s",
+                    time.strftime("%H:%M:%S", time.localtime(best_seen_at)),
+                )
+                return best_observation.code
+            stage_deadline = min(
+                deadline for deadline in (confirm_deadline, hard_confirm_deadline)
+                if deadline is not None
             )
-            return best_otp
-
-        remaining = int(deadline - now)
-        if best_otp and settle_until is not None:
             logger.info(
-                f"[GenericAPI] 已锁定候选 OTP={best_otp}，等 settle 中"
-                f"（剩余 settle ~{max(0, int(settle_until - now))}s, 总剩余 {remaining}s）..."
+                "[GenericAPI] 已锁定 OTP 候选，等 settle 中（剩余 settle ~%ss）...",
+                max(0, int((confirm_deadline or now) - now)),
             )
         else:
+            stage_deadline = search_deadline
             logger.info(
                 f"[GenericAPI] 暂未从取码接口拿到验证码，"
-                f"{interval}s 后重试（剩余 {remaining}s）..."
+                f"{interval}s 后重试（剩余 {max(0, int(search_deadline - now))}s）..."
             )
-        time.sleep(interval)
-
-    if best_otp:
-        raise GenericApiMailError(
-            f"等待通用 API 验证码超时: {email}; 候选 {best_otp} 的 settle 未完成"
-        )
+        remaining = max(0, stage_deadline - now)
+        if remaining:
+            time.sleep(min(interval, remaining))
 
     raise GenericApiMailError(f"等待通用 API 验证码超时: {email}; {last_error}")

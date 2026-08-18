@@ -599,6 +599,18 @@ ROXY_PASSWORD_SETUP_QUEUE_LIMIT="100"
 
 ---
 
+### Roxy 浏览器查活
+
+账号页提供“协议查活”和“浏览器查活”。协议查活仍是默认方式；浏览器查活会打开账号保存的
+Roxy profile，或在 profile 不存在时创建一个临时环境，通过邮箱 OTP 登录后刷新
+`accessToken`。
+
+- 浏览器查活默认单并发，可在配置页调整队列容量、最大尝试次数和退避秒数。
+- 历史 profile 只关闭不删除；任务创建的临时 profile 才受“删除查活临时环境”配置控制。
+- profile 已登录其他邮箱时任务失败且不会写回 token，也不会自动退出或清理历史 profile。
+- 浏览器、网络、OTP 和 session 错误不会被判为废号；只有明确停用/删除/封禁信号会标记已废。
+- 查活失败保留旧 token。浏览器查活不能保证绕过第三方风控，也不会自动切换查活后端或网络出口。
+
 ## 重要配置文件
 
 | 文件 | 说明 |
@@ -769,6 +781,7 @@ ENABLE_CODEX_AUTO = False
 │   └── ...
 ├── core/
 │   ├── roxy_registration.py        # Roxy / 浏览器注册页面流程
+│   ├── roxy_live_check.py          # Roxy 真实浏览器查活与身份校验
 │   ├── cloakbrowser_registration.py # Cloak 注册入口
 │   ├── cloakbrowser_driver.py      # Cloak Playwright→Selenium 风格适配层
 │   ├── browser_use_registration.py # Browser Use + Playwright 注册流程

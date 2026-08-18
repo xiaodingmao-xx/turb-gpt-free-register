@@ -19,6 +19,9 @@ _LOADED = False
 # 这些多行列表字段允许用空值显式覆盖为 []。
 # 例如 WebUI 清空代理池后会写入 PROXY_POOL="" / PROXY_POOL="[]"，不能再回退到源码默认本地代理。
 EXPLICIT_EMPTY_LIST_ENV_KEYS = {"PROXY_POOL"}
+# 这些字符串字段允许用空值显式覆盖源码默认值。
+# Roxy 代理国家留空表示不限国家，不能回退到历史默认 JP。
+EXPLICIT_EMPTY_STRING_ENV_KEYS = {"ROXY_PROXY_COUNTRY"}
 
 # 统一管理：env key -> 说明（.env.example 用）
 SECRET_ENV_KEYS: dict[str, str] = {
@@ -211,6 +214,8 @@ def env_value(key: str, default=None, vtype: str | None = None):
     if str(raw).strip() == "":
         if vtype == "list_str_multiline" and key in EXPLICIT_EMPTY_LIST_ENV_KEYS:
             return []
+        if vtype == "str" and key in EXPLICIT_EMPTY_STRING_ENV_KEYS:
+            return ""
         return default
     try:
         return _coerce_env_value(raw, default, vtype)

@@ -7,6 +7,37 @@ from core.roxybrowser_client import RoxyBrowserClient, _saved_proxy_row_to_info
 
 
 class RoxySavedProxyTests(unittest.TestCase):
+    def test_roxy_api_debug_logs_redact_proxy_credentials(self):
+        client = RoxyBrowserClient()
+
+        class Response:
+            status_code = 200
+            text = '{}'
+
+            @staticmethod
+            def json():
+                return {"code": 0}
+
+        with patch.object(client.http, "request", return_value=Response()), self.assertLogs(
+            "core.roxybrowser_client", level="DEBUG"
+        ) as logs:
+            client.request(
+                "POST",
+                "/browser/create",
+                json_body={"proxyUserName": "proxy-user", "proxyPassword": "proxy-pass"},
+            )
+
+        output = "\n".join(logs.output)
+        self.assertNotIn("proxy-user", output)
+        self.assertNotIn("proxy-pass", output)
+
+    def test_local_api_client_bypasses_environment_proxy(self):
+        local_client = RoxyBrowserClient(api_base="http://127.0.0.1:50000")
+        remote_client = RoxyBrowserClient(api_base="https://roxy.example.com")
+
+        self.assertFalse(local_client.http.trust_env)
+        self.assertTrue(remote_client.http.trust_env)
+
     def test_saved_proxy_row_uses_choose_mode_and_proxy_module_id(self):
         row = {
             "id": 42,
@@ -60,9 +91,18 @@ class RoxySavedProxyTests(unittest.TestCase):
         client = RoxyBrowserClient()
         with patch.object(roxy_cfg, "ROXY_USE_SAVED_PROXY_POOL", True, create=True), \
                 patch.object(roxy_cfg, "ROXY_PROXY_COUNTRY", "JP", create=True), \
-                patch.object(client, "list_proxies", return_value=[]):
-            with self.assertRaisesRegex(RuntimeError, "没有找到符合国家筛选"):
-                client.create_profile()
+                patch.object(client, "list_proxies", return_value=[{
+                    "id": 77,
+                    "protocol": "SOCKS5",
+                    "lastCountry": "US",
+                }]):
+            with self.assertLogs("core.roxybrowser_client", level="INFO") as logs:
+                with self.assertRaisesRegex(RuntimeError, "没有找到符合国家筛选"):
+                    client.create_profile()
+
+        output = "\n".join(logs.output)
+        self.assertIn("目标国家=JP", output)
+        self.assertIn("国家分布=US:1", output)
 
     def test_list_proxies_reads_rows_from_roxy_api_response(self):
         client = RoxyBrowserClient()

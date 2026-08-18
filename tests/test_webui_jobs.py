@@ -47,6 +47,59 @@ class WebUiJobFilterTests(unittest.TestCase):
         self.assertIn("JOB_STATUS_FILTER", html)
         self.assertIn("status=", html)
 
+    @patch("webui.app.svc.retry_failed_registration_jobs")
+    def test_retry_failed_registrations_endpoint_returns_summary(self, retry_failed):
+        retry_failed.return_value = {
+            "ok": True,
+            "found_count": 4,
+            "started_count": 2,
+            "reused_count": 0,
+            "skipped_count": 2,
+            "started": [{"job": {"id": 10}}],
+            "skipped": [
+                {"id": 11, "reason": "账号已存在"},
+                {"id": 12, "reason": "账号已存在"},
+            ],
+            "workers": 2,
+        }
+        response = self.client.post(
+            "/api/jobs/retry-failed-registrations",
+            json={"workers": 2},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["started_count"], 2)
+        self.assertEqual(response.get_json()["skipped_count"], 2)
+        retry_failed.assert_called_once_with(workers=2)
+
+    def test_job_template_has_one_click_failed_registration_button(self):
+        template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"
+        html = template.read_text(encoding="utf-8")
+        self.assertIn('id="btnRetryFailedRegistrationsV2"', html)
+        self.assertIn("retryFailedRegistrations", html)
+        self.assertIn("retry-failed-registrations", html)
+
+    @patch("webui.app.db.restore_failed_generic_api_email", return_value=True)
+    def test_restore_failed_pool_endpoint_only_returns_restored_items(self, restore):
+        response = self.client.post(
+            "/api/outlook/restore-failed",
+            json={
+                "items": [
+                    {"email": "failed@example.com", "source": "generic_api"},
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["restored_count"], 1)
+        self.assertEqual(payload["restored"][0]["email"], "failed@example.com")
+        restore.assert_called_once()
+
+    def test_job_template_exposes_failed_pool_restore_action(self):
+        template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"
+        html = template.read_text(encoding="utf-8")
+        self.assertIn('id="btnRestoreFailedOutlookV2"', html)
+        self.assertIn("restore-failed", html)
+
 
 if __name__ == "__main__":
     unittest.main()

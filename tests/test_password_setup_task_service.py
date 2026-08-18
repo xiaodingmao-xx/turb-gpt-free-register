@@ -774,6 +774,125 @@ class PasswordSetupTaskServiceTests(unittest.TestCase):
         self.assertFalse(update.call_args.args[1]["ok"])
         self.assertNotIn("secret-not-for-logs", str(update.call_args))
 
+    def test_retry_callback_requeue_exception_after_slot_acquire_releases_slot_and_marks_failed(self):
+        from core import db
+        from core import password_setup_task_service as service
+
+        timers = []
+
+        class FakeTimer:
+            def __init__(self, interval, function):
+                self.function = function
+                self.daemon = False
+                timers.append(self)
+
+            def start(self):
+                pass
+
+        slots = Mock()
+        slots.acquire.return_value = True
+        with patch.object(service.threading, "Timer", FakeTimer), patch.object(
+            service, "_QUEUE_SLOTS", slots
+        ), patch.object(service, "_EXECUTOR") as executor, patch.object(
+            db,
+            "requeue_account_password_setup",
+            side_effect=[True, RuntimeError("database unavailable")],
+        ), patch.object(
+            db, "update_account_password_setup", return_value=True
+        ) as update, patch.object(service, "_append_password_setup_log"):
+            self.assertTrue(service._schedule_password_setup_retry(
+                account_id=1,
+                email="user@example.com",
+                mode="post_login_add_password",
+                password="secret-not-for-logs",
+                result={"retryable": True, "error": "timeout", "attempt": 1, "max_attempts": 3},
+            ))
+            timers[0].function()
+
+        slots.release.assert_called_once_with()
+        executor.submit.assert_not_called()
+        update.assert_called_once()
+        self.assertFalse(update.call_args.args[1]["ok"])
+
+    def test_retry_callback_queue_full_requeue_exception_marks_failed_without_orphaning_timer(self):
+        from core import db
+        from core import password_setup_task_service as service
+
+        timers = []
+
+        class FakeTimer:
+            def __init__(self, interval, function):
+                self.function = function
+                self.daemon = False
+                timers.append(self)
+
+            def start(self):
+                pass
+
+        slots = Mock()
+        slots.acquire.return_value = False
+        with patch.object(service.threading, "Timer", FakeTimer), patch.object(
+            service, "_QUEUE_SLOTS", slots
+        ), patch.object(service, "_EXECUTOR") as executor, patch.object(
+            db,
+            "requeue_account_password_setup",
+            side_effect=[True, RuntimeError("database unavailable")],
+        ), patch.object(
+            db, "update_account_password_setup", return_value=True
+        ) as update, patch.object(service, "_append_password_setup_log"):
+            self.assertTrue(service._schedule_password_setup_retry(
+                account_id=1,
+                email="user@example.com",
+                mode="post_login_add_password",
+                password="secret-not-for-logs",
+                result={"retryable": True, "error": "timeout", "attempt": 1, "max_attempts": 3},
+            ))
+            timers[0].function()
+
+        self.assertEqual(len(timers), 1)
+        executor.submit.assert_not_called()
+        update.assert_called_once()
+        self.assertFalse(update.call_args.args[1]["ok"])
+
+    def test_retry_callback_submission_failure_rearms_when_failed_state_cannot_be_written(self):
+        from core import db
+        from core import password_setup_task_service as service
+
+        timers = []
+
+        class FakeTimer:
+            def __init__(self, interval, function):
+                self.interval = interval
+                self.function = function
+                self.daemon = False
+                timers.append(self)
+
+            def start(self):
+                pass
+
+        slots = Mock()
+        slots.acquire.return_value = True
+        with patch.object(service.threading, "Timer", FakeTimer), patch.object(
+            service, "_QUEUE_SLOTS", slots
+        ), patch.object(service, "_EXECUTOR") as executor, patch.object(
+            db, "requeue_account_password_setup", return_value=True
+        ), patch.object(
+            db, "update_account_password_setup", return_value=False
+        ), patch.object(service, "_append_password_setup_log"):
+            executor.submit.side_effect = RuntimeError("executor stopped")
+            self.assertTrue(service._schedule_password_setup_retry(
+                account_id=1,
+                email="user@example.com",
+                mode="post_login_add_password",
+                password="secret-not-for-logs",
+                result={"retryable": True, "error": "timeout", "attempt": 1, "max_attempts": 3},
+            ))
+            timers[0].function()
+
+        self.assertEqual([timer.interval for timer in timers], [15, 5])
+        self.assertTrue(timers[1].daemon)
+        slots.release.assert_called_once_with()
+
     def test_stale_profile_creates_fresh_environment_and_retries_setup(self):
         from core import db
         from core import password_setup_task_service as service

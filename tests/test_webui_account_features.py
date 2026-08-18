@@ -12,6 +12,95 @@ class WebUiAccountFeatureTests(unittest.TestCase):
         self.client = create_app(auth_code="test-auth").test_client()
         self.client.environ_base["HTTP_X_AUTH_CODE"] = "test-auth"
 
+    @patch("webui.app.live_check_service.enqueue_account_live_check")
+    @patch("webui.app.live_check_service.queue_settings")
+    @patch("webui.app.db.get_account")
+    def test_browser_live_check_bulk_forwards_explicit_mode(self, get_account, queue_settings, enqueue):
+        get_account.return_value = {"id": 7, "email": "user@example.com"}
+        queue_settings.return_value = {"backend": "browser", "workers": 1, "queue_limit": 100}
+        enqueue.return_value = {
+            "accepted": True,
+            "account_id": 7,
+            "email": "user@example.com",
+            "status": "queued",
+            "mode": "browser",
+        }
+
+        response = self.client.post(
+            "/api/accounts/check-live-bulk",
+            json={"account_ids": [7], "mode": "browser"},
+        )
+
+        self.assertEqual(response.status_code, 202)
+        payload = response.get_json()
+        self.assertEqual(payload["mode"], "browser")
+        self.assertEqual(payload["started"][0]["mode"], "browser")
+        enqueue.assert_called_once_with(
+            account_id=7,
+            email="user@example.com",
+            trigger="manual",
+            proxy=None,
+            mode="browser",
+        )
+        queue_settings.assert_called_once_with("browser")
+
+    @patch("webui.app.live_check_service.enqueue_account_live_check")
+    def test_live_check_bulk_rejects_auto_mode_before_enqueue(self, enqueue):
+        response = self.client.post(
+            "/api/accounts/check-live-bulk",
+            json={"account_ids": [7], "mode": "auto"},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("protocol 或 browser", response.get_json()["error"])
+        enqueue.assert_not_called()
+
+    @patch("webui.app.live_check_service.enqueue_account_live_check")
+    @patch("webui.app.live_check_service.queue_settings")
+    @patch("webui.app.db.get_account")
+    def test_live_check_bulk_defaults_to_protocol(self, get_account, queue_settings, enqueue):
+        get_account.return_value = {"id": 7, "email": "user@example.com"}
+        queue_settings.return_value = {"backend": "protocol", "workers": 3, "queue_limit": 500}
+        enqueue.return_value = {"accepted": True, "mode": "protocol"}
+        response = self.client.post("/api/accounts/check-live-bulk", json={"account_ids": [7]})
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.get_json()["mode"], "protocol")
+
+    def test_account_template_exposes_protocol_and_browser_live_check_actions(self):
+        template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"
+        html = template.read_text(encoding="utf-8")
+        self.assertIn("协议查活", html)
+        self.assertIn("浏览器查活", html)
+        self.assertIn("checkSelectedLive", html)
+        self.assertIn("'browser'", html)
+        self.assertIn("live_check_backend", html)
+        self.assertIn("live_check_failure_kind", html)
+        self.assertIn("浏览器查活默认单并发", html)
+
+    @patch("webui.app.db.list_generic_api_email_pool")
+    def test_pool_search_failure_only_matches_failed_status(self, list_pool):
+        list_pool.return_value = [
+            {
+                "email": "used@example.com",
+                "status": "used",
+                "note": "Roxy注册失败: 密码设置失败",
+            },
+            {
+                "email": "failed@example.com",
+                "status": "failed",
+                "note": "验证码超时",
+            },
+        ]
+
+        response = self.client.get(
+            "/api/outlook?source=generic_api&paged=1&page=1&page_size=20&q=失败"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [row["email"] for row in response.get_json()["items"]],
+            ["failed@example.com"],
+        )
+
     @patch("webui.app.db.list_accounts_page")
     def test_account_list_exposes_region_and_payment_detection_fields(self, list_page):
         list_page.return_value = {

@@ -2004,6 +2004,7 @@
 
     <section class="jobs-panel-v2" id="jobsPanelV2" aria-label="注册任务">
       <div class="jobs-toolbar-v2" id="jobsToolbarV2">
+        <button type="button" class="jobs-tb-btn jobs-tb-btn--retry" id="btnRetryFailedRegistrationsV2" title="从原任务邮箱来源的可用池领取邮箱重新注册；失败/停用邮箱不会自动使用，已在账号中的任务自动跳过">失败重新注册</button>
         <button type="button" class="jobs-tb-btn jobs-tb-btn--retry" id="btnRetrySelectedJobsV2" disabled title="重试选中的失败、已停止或已取消任务">重试选中</button>
         <button type="button" class="jobs-tb-btn jobs-tb-btn--danger" id="btnDeleteSelectedJobsV2" disabled title="删除选中的非运行中任务，并同时删除对应日志">删除选中</button>
         <button type="button" class="jobs-tb-btn" id="btnCancelPendingV2" title="把所有排队任务标记为已取消">取消全部排队</button>
@@ -2097,14 +2098,16 @@
           <button type="button" class="acc-v2-toggle" id="showPlusAccountsOnlyV2" aria-pressed="false" title="只查询/显示已开通 Plus 的账号">已开通Plus</button>
           <button type="button" class="acc-v2-toggle" id="showTrialEligibleAccountsV2" aria-pressed="false" title="只查询/显示具有 Plus 试用资格的账号">可Plus试用</button>
           <button type="button" class="jobs-tb-btn" id="btnRefreshAccountsV2" title="重新加载当前筛选条件和当前页账号列表">刷新账号</button>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedLiveTopV2" onclick="checkSelectedLive()" title="重新登录选中账号；成功且未封号则标记正常，并刷新最新 AT/accessToken">查活</button>
+          <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedLiveTopV2" onclick="checkSelectedLive(null, this, 'protocol')" title="使用协议会话重新登录选中账号并刷新最新 AT/accessToken">协议查活</button>
+          <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedBrowserTopV2" onclick="checkSelectedLive(null, this, 'browser')" title="使用 Roxy 真实浏览器重新登录；浏览器查活默认单并发">浏览器查活</button>
 
         </div>
       </div>
       <div class="jobs-toolbar-v2" id="accountsToolbarV2">
         <div class="acc-v2-btn-group">
           <span class="acc-v2-btn-group-title">套餐/提链</span>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedLiveV2" onclick="checkSelectedLive()" title="重新登录选中账号；成功且未封号则标记正常，并刷新最新 AT/accessToken">查活</button>
+          <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedLiveV2" onclick="checkSelectedLive(null, this, 'protocol')" title="使用协议会话重新登录选中账号并刷新最新 AT/accessToken">协议查活</button>
+          <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedBrowserV2" onclick="checkSelectedLive(null, this, 'browser')" title="使用 Roxy 真实浏览器重新登录；浏览器查活默认单并发">浏览器查活</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedPlansV2" disabled title="查询选中账号当前套餐；free 账号会检查 Plus 试用资格">查套餐</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnExtractSelectedLinksV2" disabled title="给选中的 free(可Plus试用) 账号批量提链，类型按配置 PIX/UPI/KAKAO_PAY/IDEAL">提链</button>
         </div>
@@ -2273,7 +2276,8 @@
         <div class="acc-v2-btn-group acc-v2-search-wrap">
           <input id="qOutlookV2" type="search" placeholder="搜索邮箱、状态…" autocomplete="off">
         </div>
-        <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnMarkSelectedOutlookAvailableV2" disabled title="把选中的邮箱批量标记为未使用/可用">标记未使用</button>
+        <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnRestoreFailedOutlookV2" disabled title="只把选中且当前状态为失败的邮箱恢复为可用；已用/停用邮箱不会被修改">恢复失败邮箱</button>
+        <button type="button" class="jobs-tb-btn" id="btnMarkSelectedOutlookAvailableV2" disabled title="把选中的邮箱批量标记为未使用/可用">标记未使用</button>
         <button type="button" class="jobs-tb-btn" id="btnDisableSelectedOutlookV2" disabled title="批量停用选中的邮箱；停用后不会被注册任务领取">停用选中</button>
         <button type="button" class="jobs-tb-btn" id="btnFailSelectedOutlookV2" disabled title="批量标记选中的邮箱为失败">标失败</button>
         <button type="button" class="jobs-tb-btn jobs-tb-btn--danger" id="btnDeleteSelectedOutlookV2" disabled title="批量删除选中的邮箱素材">删除选中</button>
@@ -2777,6 +2781,8 @@ function bindJobsBodyEvents(bodyEl) {
   if (startV2) startV2.addEventListener('click', () => startRegistrationFromInputs($('#regCountV2'), $('#regWorkersV2'), startV2));
   const delV2 = $('#btnDeleteSelectedJobsV2');
   if (delV2) delV2.addEventListener('click', deleteSelectedJobs);
+  const retryFailedV2 = $('#btnRetryFailedRegistrationsV2');
+  if (retryFailedV2) retryFailedV2.addEventListener('click', retryFailedRegistrations);
   const retryV2 = $('#btnRetrySelectedJobsV2');
   if (retryV2) retryV2.addEventListener('click', retrySelectedJobs);
   const cancelV2 = $('#btnCancelPendingV2');
@@ -3083,6 +3089,30 @@ async function retrySelectedJobs() {
     showToast('批量重试失败: ' + e.message);
   } finally {
     updateJobsSelectionUi();
+  }
+}
+
+async function retryFailedRegistrations() {
+  const btn = $('#btnRetryFailedRegistrationsV2');
+  const workers = Math.max(1, Math.min(16, parseInt($('#regWorkersV2')?.value || '1', 10) || 1));
+  if (!confirm(`确定重新注册全部失败任务吗？\n\n将使用 ${workers} 个并发线程；只从原任务邮箱来源的“可用”池领取，失败/停用邮箱不会自动使用；已在“账号”中的账号会自动跳过。`)) return;
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api('/api/jobs/retry-failed-registrations', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({workers}),
+    });
+    const skippedCount = r.skipped_count || 0;
+    const poolEmptyCount = r.email_pool_exhausted_count || 0;
+    const reusedCount = r.reused_count || 0;
+    showToast(`发现失败 ${r.found_count || 0} 个，已提交 ${r.started_count || 0} 个${reusedCount ? `，复用 ${reusedCount} 个` : ''}${skippedCount ? `，跳过 ${skippedCount} 个` : ''}${poolEmptyCount ? `，邮箱池无可用 ${poolEmptyCount} 个` : ''}`);
+    JOB_SELECTED.clear();
+    refreshJobs();
+  } catch (e) {
+    showToast('失败重新注册失败: ' + e.message);
+  } finally {
+    if (btn) btn.disabled = false;
   }
 }
 
@@ -3433,12 +3463,23 @@ function _tokenCellV2(r) {
   const live = r.live_check_status || '';
   const liveErr = r.live_check_error || '';
   const liveAt = r.live_checked_at || '';
+  const backend = r.live_check_backend || 'protocol';
+  const backendLabel = backend === 'browser' ? '浏览器' : '协议';
+  const failureKind = r.live_check_failure_kind || '';
+  const failureLabels = {
+    network_unavailable: '网络不可用', browser_open_failed: '浏览器启动失败',
+    otp_timeout: 'OTP超时', otp_invalid: 'OTP无效', session_missing: '缺少登录态',
+    session_expired: '登录态过期', profile_account_mismatch: 'Profile账号不匹配',
+    account_identity_mismatch: '账号身份不匹配', account_incomplete: '账号未完成注册',
+    account_unusable: '账号不可用', unknown: '未知错误',
+  };
+  const failureLabel = failureLabels[failureKind] || failureKind || '失败';
   let liveHtml = '';
-  if (live === 'live') liveHtml = `<div class="acc-v2-sub" title="${esc(liveAt)}">查活: 正常</div>`;
-  else if (live === 'queued') liveHtml = `<div class="acc-v2-sub" title="${esc(liveAt)}" style="color:#e6a23c">查活: 排队</div>`;
-  else if (live === 'running') liveHtml = `<div class="acc-v2-sub" title="${esc(liveAt)}" style="color:#e6a23c">查活: 运行中</div>`;
-  else if (live === 'deactivated') liveHtml = `<div class="acc-v2-sub" title="${esc(liveErr || liveAt)}" style="color:#f56c6c">查活: 已废</div>`;
-  else if (live === 'failed') liveHtml = `<div class="acc-v2-sub" title="${esc(liveErr || liveAt)}" style="color:#e6a23c">查活: 失败</div>`;
+  if (live === 'live') liveHtml = `<div class="acc-v2-sub" title="${esc(liveAt)}">查活(${backendLabel}): 正常</div>`;
+  else if (live === 'queued') liveHtml = `<div class="acc-v2-sub" title="${esc(liveAt)}" style="color:#e6a23c">查活(${backendLabel}): 排队</div>`;
+  else if (live === 'running') liveHtml = `<div class="acc-v2-sub" title="${esc(liveAt)}" style="color:#e6a23c">查活(${backendLabel}): 运行中</div>`;
+  else if (live === 'deactivated') liveHtml = `<div class="acc-v2-sub" title="${esc(liveErr || liveAt)}" style="color:#f56c6c">查活(${backendLabel}): 已废（${esc(failureLabel)}）</div>`;
+  else if (live === 'failed') liveHtml = `<div class="acc-v2-sub" title="${esc(liveErr || liveAt)}" style="color:#e6a23c">查活(${backendLabel}): 失败（${esc(failureLabel)}）</div>`;
   if (r.has_access_token) {
     return `<button type="button" class="acc-v2-token-copy" data-account-copy-secret="access_token" data-account-id="${esc(r.id)}" title="复制完整 Token">复制</button>${liveHtml}`;
   }
@@ -3494,7 +3535,8 @@ function _accountsV2MoreMenu(r) {
     `<button type="button" data-account-password-log="${esc(r.email)}" title="查看该账号最近一次设置密码日志">设置密码日志</button>`,
     `<button type="button" data-account-pickup-address="${esc(r.id)}" title="设置该账号取件地址">取件地址</button>`,
     `<button type="button" data-account-note="${esc(r.id)}" title="设置/清空该账号备注">备注</button>`,
-    `<button type="button" onclick="checkSelectedLive([Number('${esc(r.id)}')], this); return false;" title="重新登录该账号，成功则刷新最新 AT/accessToken">查活刷新AT</button>`,
+    `<button type="button" onclick="checkSelectedLive([Number('${esc(r.id)}')], this, 'protocol'); return false;" title="使用协议会话重新登录该账号并刷新最新 AT/accessToken">协议查活</button>`,
+    `<button type="button" onclick="checkSelectedLive([Number('${esc(r.id)}')], this, 'browser'); return false;" title="使用 Roxy 真实浏览器重新登录；浏览器查活默认单并发">浏览器查活</button>`,
     `<button type="button" data-account-live-log="${esc(r.email)}" title="查看该账号最近一次查活日志">查活日志</button>`,
     `<button type="button" data-account-plan-log="${esc(r.email)}" title="查看该账号最近一次查套餐日志">查套餐日志</button>`,
     _planAction(r),
@@ -4541,18 +4583,20 @@ async function checkSelectedPlans() {
   }
 }
 
-async function checkSelectedLive(idsArg = null, btnArg = null) {
+async function checkSelectedLive(idsArg = null, btnArg = null, mode = 'protocol') {
+  const normalizedMode = mode === 'browser' ? 'browser' : 'protocol';
   const ids = idsArg || Array.from(ACCOUNT_SELECTED);
   if (ids.length === 0) { showToast('请先选择账号'); return; }
-  const workers = getCodexBulkWorkers();
-  const msg = idsArg ? `确定查活这个账号并刷新最新 AT/accessToken 吗？` : `确定查活选中的 ${ids.length} 个账号吗？
+  const modeLabel = normalizedMode === 'browser' ? '浏览器查活' : '协议查活';
+  const detail = normalizedMode === 'browser'
+    ? '会通过 Roxy 真实浏览器登录邮箱 OTP；浏览器查活默认单并发。'
+    : '会通过协议会话重新登录邮箱 OTP。';
+  const msg = idsArg ? `确定对这个账号执行${modeLabel}并刷新最新 AT/accessToken 吗？` : `确定对选中的 ${ids.length} 个账号执行${modeLabel}吗？
 
-会重新登录邮箱 OTP；登录成功且未封号则标记正常，并刷新最新 AT/accessToken。
-
-并发线程数：${workers}`;
+${detail}`;
   if (!confirm(msg)) return;
   const firstAcc = ACCOUNTS.find(a => Number(a.id) === Number(ids[0]));
-  const btn = btnArg || $('#btnCheckSelectedLiveV2');
+  const btn = btnArg || (normalizedMode === 'browser' ? $('#btnCheckSelectedBrowserV2') : $('#btnCheckSelectedLiveV2'));
   const old = btn ? btn.textContent : '';
   if (btn) {
     btn.disabled = true;
@@ -4562,17 +4606,17 @@ async function checkSelectedLive(idsArg = null, btnArg = null) {
     const r = await api('/api/accounts/check-live-bulk', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({account_ids: ids, workers}),
-    });
+    body: JSON.stringify({account_ids: ids, mode: normalizedMode}),
+  });
     const skipped = (r.skipped || []).length;
-    showToast(`查活已入队 ${r.started_count || 0} 个，忙碌 ${r.busy_count || 0} 个，失败 ${r.failed_count || 0}${skipped ? `，跳过 ${skipped}` : ''}`);
+    showToast(`${modeLabel}已入队 ${r.started_count || 0} 个，忙碌 ${r.busy_count || 0} 个，失败 ${r.failed_count || 0}${skipped ? `，跳过 ${skipped}` : ''}`);
     const firstStarted = (r.started || [])[0];
     if (firstStarted?.email) openLiveLog(firstStarted.email);
     else if (firstAcc && firstAcc.email) openLiveLog(firstAcc.email);
     await loadAccounts();
     loadSummary();
   } catch(err) {
-    showToast('查活失败: ' + err.message);
+    showToast(`${modeLabel}失败: ` + err.message);
     updateAccountSelectionUi();
   } finally {
     if (btn) {
@@ -5021,6 +5065,7 @@ function updateOutlookSelectionUi(pageRows = null) {
   const none = OUTLOOK_SELECTED.size === 0;
   [
     'btnDeleteSelectedOutlookV2',
+    'btnRestoreFailedOutlookV2',
     'btnMarkSelectedOutlookAvailableV2',
     'btnDisableSelectedOutlookV2',
     'btnFailSelectedOutlookV2',
@@ -5138,6 +5183,7 @@ async function onOutlookBodyClick(e) {
     bodyV2.addEventListener('click', onOutlookBodyClick);
   }
   const bind = (id, fn) => { const el = document.getElementById(id); if (el) el.addEventListener('click', fn); };
+  bind('btnRestoreFailedOutlookV2', restoreSelectedFailedOutlook);
   bind('btnMarkSelectedOutlookAvailableV2', () => bulkMarkOutlookStatus('available'));
   bind('btnDisableSelectedOutlookV2', () => bulkMarkOutlookStatus('disabled'));
   bind('btnFailSelectedOutlookV2', () => bulkMarkOutlookStatus('failed'));
@@ -5289,6 +5335,31 @@ async function bulkMarkOutlookStatus(status) {
     loadOutlook(); loadSummary();
   } catch(err) {
     showToast('批量标记失败: ' + err.message);
+    updateOutlookSelectionUi();
+  }
+}
+
+async function restoreSelectedFailedOutlook() {
+  const items = Array.from(OUTLOOK_SELECTED).map(key => {
+    const [source, ...rest] = key.split('|');
+    return {source, email: rest.join('|')};
+  });
+  if (items.length === 0) { showToast('请先选择邮箱'); return; }
+  if (!confirm(`确定恢复选中的 ${items.length} 个失败邮箱吗？\n\n只有当前状态为“失败”的邮箱会恢复为可用。`)) return;
+  const btn = document.getElementById('btnRestoreFailedOutlookV2');
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api('/api/outlook/restore-failed', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({items}),
+    });
+    OUTLOOK_SELECTED.clear();
+    const skippedCount = (r.skipped || []).length;
+    showToast(skippedCount ? `已恢复 ${r.restored_count || 0} 个，跳过 ${skippedCount} 个` : `已恢复 ${r.restored_count || 0} 个失败邮箱`);
+    loadOutlook(); loadSummary();
+  } catch(err) {
+    showToast('恢复失败邮箱失败: ' + err.message);
     updateOutlookSelectionUi();
   }
 }

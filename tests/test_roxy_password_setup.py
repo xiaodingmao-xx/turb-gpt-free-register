@@ -14,6 +14,67 @@ from core.roxy_registration import (
 
 
 class RoxyPasswordSetupTests(unittest.TestCase):
+    def test_password_setup_failure_still_saves_registration_as_success(self):
+        from core import roxy_registration as service
+        from core.roxybrowser_client import RoxyOpenResult
+
+        class FakeDriver:
+            def set_page_load_timeout(self, _timeout):
+                pass
+
+            def set_script_timeout(self, _timeout):
+                pass
+
+            def quit(self):
+                pass
+
+        class FakeClient:
+            def open_profile(self):
+                return RoxyOpenResult("profile-1", {"code": 0})
+
+            def cleanup_profile(self, _opened):
+                pass
+
+        with patch.object(service, "RoxyBrowserClient", return_value=FakeClient()), patch.object(
+            service, "_build_driver", return_value=FakeDriver()
+        ), patch.object(service, "_center_browser_window"), patch.object(service, "_safe_get"), patch.object(
+            service, "_submit_email_and_wait_next", return_value="otp"
+        ), patch.object(service, "_complete_profile_page", return_value=True), patch.object(
+            service,
+            "_fetch_chatgpt_session",
+            return_value={"accessToken": "access-token", "user": {}, "account": {}, "expires": None},
+        ), patch.object(service, "_type_otp"), patch.object(service, "_click_continue"), patch.object(
+            service, "_wait_after_email_otp_submit", return_value="accepted"
+        ), patch.object(
+            service,
+            "_run_password_setup_with_gate",
+            side_effect=RuntimeError("密码设置获取 CSRF 失败"),
+        ), patch.object(service, "detect_selenium_exit_ip", return_value="203.0.113.9"), patch.object(
+            service, "save_account_data", return_value=42
+        ) as save_account, patch.object(
+            service, "resolve_email_source", return_value="generic_api"
+        ), patch.object(service, "_check_manual_stop"), patch.object(
+            service, "human_delay"
+        ), patch.object(service._cfg, "ROXY_PASSWORD_SETUP_ENABLED", True), patch.object(
+            service._cfg, "ROXY_KEEP_BROWSER_OPEN", False
+        ), patch.object(service._twofa_cfg, "ENABLE_2FA", False), patch(
+            "config.codex.ENABLE_CODEX_AUTO", False
+        ):
+            result = service.run_roxy_registration(
+                email="user@example.com",
+                name="Test User",
+                birthday="2000-01-01",
+                otp_code="123456",
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["account_id"], 42)
+        self.assertTrue(result["password_setup_handoff"])
+        save_account.assert_called_once()
+        extra = save_account.call_args.kwargs["extra"]
+        self.assertEqual(extra["password_setup_status"], "failed")
+        self.assertIn("密码设置获取 CSRF 失败", extra["password_setup_error"])
+
     def test_password_already_set_error_is_detected_in_english_and_japanese(self):
         self.assertTrue(_password_already_set_in_text("error_code: password_already_set"))
         self.assertTrue(_password_already_set_in_text("パスワードはすでに設定済みです。"))
@@ -30,6 +91,8 @@ class RoxyPasswordSetupTests(unittest.TestCase):
         ), patch(
             "core.roxy_registration._is_email_verification_page", side_effect=[True, False]
         ), patch(
+            "core.roxy_registration.capture_otp_baseline", return_value=None
+        ), patch(
             "core.roxy_registration.wait_for_otp", return_value="123456"
         ), patch("core.roxy_registration._type_otp") as type_otp, patch(
             "core.roxy_registration._fill_password_setup_page"
@@ -44,7 +107,7 @@ class RoxyPasswordSetupTests(unittest.TestCase):
         type_otp.assert_not_called()
         fill_password.assert_called_once()
 
-    def test_password_setup_resends_and_excludes_previous_registration_otp(self):
+    def test_password_setup_first_attempt_does_not_resend_or_exclude_previous_otp(self):
         from core.roxy_registration import _run_roxy_password_setup
 
         driver = object()
@@ -55,8 +118,69 @@ class RoxyPasswordSetupTests(unittest.TestCase):
         ), patch(
             "core.roxy_registration._click_resend_email_otp"
         ) as resend, patch(
+            "core.roxy_registration.resolve_email_source", return_value="outlook"
+        ), patch(
+            "core.roxy_registration.capture_otp_baseline", return_value=None
+        ), patch(
             "core.roxy_registration.wait_for_otp", return_value="222222"
         ) as wait_otp, patch("core.roxy_registration._type_otp") as type_otp, patch(
+            "core.roxy_registration._click_continue"
+        ), patch(
+            "core.roxy_registration._wait_after_email_otp_submit", return_value="accepted"
+        ), patch("core.roxy_registration._fill_password_setup_page"):
+            result = _run_roxy_password_setup(
+                driver,
+                "user@example.com",
+                password="valid-password-123",
+                previous_otp="111111",
+        )
+
+        self.assertEqual(result, "valid-password-123")
+        resend.assert_not_called()
+        self.assertNotIn("exclude_codes", wait_otp.call_args.kwargs)
+        self.assertIn("after_ts", wait_otp.call_args.kwargs)
+        self.assertIsNone(wait_otp.call_args.kwargs["otp_baseline"])
+        type_otp.assert_called_once_with(driver, "222222")
+
+    def test_password_setup_provider_timeout_uses_fresh_baseline_before_resend_and_second_wait(self):
+        from core.roxy_registration import _run_roxy_password_setup
+        from core.generic_api_mail_client import GenericApiMailError
+
+        driver = object()
+        events = []
+        baselines = [object(), object()]
+
+        def capture_baseline(email):
+            baseline = baselines.pop(0)
+            events.append(("baseline", email, baseline))
+            return baseline
+
+        def fetch_authorize_url(*_args):
+            events.append(("authorize",))
+            return "https://auth.openai.com/email-verification"
+
+        def wait_for_password_otp(email, **kwargs):
+            events.append(("wait", email, kwargs))
+            if len([event for event in events if event[0] == "wait"]) == 1:
+                raise GenericApiMailError("等待通用 API 验证码超时")
+            return "222222"
+
+        with patch("core.roxy_registration._fetch_password_setup_authorize_url", side_effect=fetch_authorize_url), patch(
+            "core.roxy_registration._safe_get"
+        ), patch(
+            "core.roxy_registration._is_email_verification_page", return_value=True
+        ), patch(
+            "core.roxy_registration._click_resend_email_otp",
+            side_effect=lambda *_args, **_kwargs: events.append(("resend",)),
+        ), patch(
+            "core.roxy_registration.resolve_email_source", return_value="generic_api"
+        ), patch(
+            "core.roxy_registration.capture_otp_baseline", side_effect=capture_baseline
+        ), patch(
+            "core.roxy_registration.time.time", side_effect=[100.0, 200.0]
+        ), patch(
+            "core.roxy_registration.wait_for_otp", side_effect=wait_for_password_otp
+        ), patch("core.roxy_registration._type_otp") as type_otp, patch(
             "core.roxy_registration._click_continue"
         ), patch(
             "core.roxy_registration._wait_after_email_otp_submit", return_value="accepted"
@@ -69,8 +193,16 @@ class RoxyPasswordSetupTests(unittest.TestCase):
             )
 
         self.assertEqual(result, "valid-password-123")
-        resend.assert_called_once()
-        self.assertEqual(wait_otp.call_args.kwargs["exclude_codes"], {"111111"})
+        self.assertEqual([event[0] for event in events], [
+            "baseline", "authorize", "wait", "baseline", "resend", "wait",
+        ])
+        first_wait, second_wait = [event for event in events if event[0] == "wait"]
+        self.assertEqual(first_wait[2], {"after_ts": 100.0, "otp_baseline": first_wait[2]["otp_baseline"]})
+        self.assertEqual(second_wait[2], {"after_ts": 200.0, "otp_baseline": second_wait[2]["otp_baseline"]})
+        self.assertIs(first_wait[2]["otp_baseline"], events[0][2])
+        self.assertIs(second_wait[2]["otp_baseline"], events[3][2])
+        self.assertNotIn("exclude_codes", first_wait[2])
+        self.assertNotIn("exclude_codes", second_wait[2])
         type_otp.assert_called_once_with(driver, "222222")
 
     def test_add_password_request_uses_same_origin_authorize_flow(self):

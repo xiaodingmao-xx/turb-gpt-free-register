@@ -538,10 +538,14 @@ def _schedule_password_setup_retry(
     ):
         return False
 
-    def mark_retry_failed(*, reason: str, error_type: str) -> None:
+    def mark_retry_failed(*, reason: str, error_type: str) -> bool:
         safe_error = redact_password(f"{reason}: {error_type}", password)
+        updated = False
         try:
-            db.update_account_password_setup(account_id, {"ok": False, "error": safe_error})
+            updated = bool(db.update_account_password_setup(
+                account_id,
+                {"ok": False, "error": safe_error},
+            ))
         except Exception:
             logger.exception("设置密码重试失败状态写回失败 account_id=%s", account_id)
         _append_password_setup_log(
@@ -550,6 +554,7 @@ def _schedule_password_setup_retry(
             f"delay=0 next_retry_at=None error_type={error_type}",
             level="ERROR",
         )
+        return updated
 
     def arm_timer(timer_delay: int) -> bool:
         try:
@@ -564,13 +569,22 @@ def _schedule_password_setup_retry(
     def submit_retry() -> None:
         if not _QUEUE_SLOTS.acquire(blocking=False):
             deferred_at = (datetime.now() + timedelta(seconds=5)).isoformat(timespec="seconds")
-            if db.requeue_account_password_setup(
-                account_id,
-                error,
-                attempt=next_attempt,
-                max_attempts=max_attempts,
-                next_retry_at=deferred_at,
-            ):
+            try:
+                requeued = db.requeue_account_password_setup(
+                    account_id,
+                    error,
+                    attempt=next_attempt,
+                    max_attempts=max_attempts,
+                    next_retry_at=deferred_at,
+                )
+            except Exception as exc:
+                if not mark_retry_failed(
+                    reason="自动重试状态更新异常",
+                    error_type=type(exc).__name__,
+                ):
+                    arm_timer(5)
+                return
+            if requeued:
                 _append_password_setup_log(
                     email,
                     f"[设置密码] 重试等待队列槽 attempt={next_attempt}/{max_attempts} "
@@ -582,34 +596,48 @@ def _schedule_password_setup_retry(
                 mark_retry_failed(reason="自动重试状态更新失败", error_type="RequeueRejected")
             return
 
-        if not db.requeue_account_password_setup(
-            account_id,
-            error,
-            attempt=next_attempt,
-            max_attempts=max_attempts,
-            next_retry_at=None,
-        ):
-            _QUEUE_SLOTS.release()
-            return
+        slot_owned = True
         try:
-            _EXECUTOR.submit(
-                _run_task_wrapper,
-                account_id=account_id,
-                email=email,
-                mode=mode,
-                password=password,
-            )
-        except Exception as exc:
-            _QUEUE_SLOTS.release()
-            submit_error = redact_password(f"重试入队失败: {type(exc).__name__}: {exc}", password)
-            db.update_account_password_setup(account_id, {"ok": False, "error": submit_error})
-            _append_password_setup_log(
-                email,
-                f"[设置密码] 自动重试入队失败 attempt={next_attempt}/{max_attempts} "
-                f"delay=0 next_retry_at=None error={redact_password(submit_error, password)}",
-                level="ERROR",
-            )
-            return
+            try:
+                requeued = db.requeue_account_password_setup(
+                    account_id,
+                    error,
+                    attempt=next_attempt,
+                    max_attempts=max_attempts,
+                    next_retry_at=None,
+                )
+            except Exception as exc:
+                if not mark_retry_failed(
+                    reason="自动重试状态更新异常",
+                    error_type=type(exc).__name__,
+                ):
+                    arm_timer(5)
+                return
+            if not requeued:
+                mark_retry_failed(
+                    reason="自动重试状态更新失败",
+                    error_type="RequeueRejected",
+                )
+                return
+            try:
+                _EXECUTOR.submit(
+                    _run_task_wrapper,
+                    account_id=account_id,
+                    email=email,
+                    mode=mode,
+                    password=password,
+                )
+            except Exception as exc:
+                if not mark_retry_failed(
+                    reason="重试入队失败",
+                    error_type=type(exc).__name__,
+                ):
+                    arm_timer(5)
+                return
+            slot_owned = False
+        finally:
+            if slot_owned:
+                _QUEUE_SLOTS.release()
         _append_password_setup_log(
             email,
             f"[设置密码] 已提交自动重试 attempt={next_attempt}/{max_attempts} "
