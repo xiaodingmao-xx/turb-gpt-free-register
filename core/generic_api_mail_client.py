@@ -779,6 +779,11 @@ def _fetch_current_observation(account: GenericApiEmailAccount) -> GenericOtpObs
 
     response = session.get(account.code_url, headers=headers, timeout=20, verify=False)
     if response.status_code != 200:
+        if _is_empty_mailbox_response(response):
+            logger.info("[GenericAPI] 基线接口报告暂无邮件，按空基线处理")
+            return GenericOtpObservation(
+                None, "empty_mailbox", None, None, None, True, "mailbox_empty"
+            )
         raise GenericApiMailError(f"基线接口 HTTP {response.status_code}: {(response.text or '')[:160]}")
     observation = _parse_generic_api_observation(response.text or "")
     if observation.structured:
@@ -788,6 +793,26 @@ def _fetch_current_observation(account: GenericApiEmailAccount) -> GenericOtpObs
         code=_extract_code(response.text or ""),
         source="plain_text",
     )
+
+
+def _is_empty_mailbox_response(response) -> bool:
+    """识别部分取件服务用 404 表示“当前没有邮件”的响应。"""
+    if getattr(response, "status_code", None) != 404:
+        return False
+    payload = None
+    try:
+        payload = response.json()
+    except Exception:
+        try:
+            payload = json.loads(getattr(response, "text", "") or "")
+        except Exception:
+            payload = None
+    if not isinstance(payload, dict) or payload.get("found") is not False:
+        return False
+    message = str(payload.get("error") or payload.get("message") or "").strip().lower()
+    return any(marker in message for marker in (
+        "最近", "没有找到", "无邮件", "暂无邮件", "no mail", "no message", "not found",
+    ))
 
 
 def capture_otp_baseline(email: str, attempts: int = 3) -> OtpBaseline:

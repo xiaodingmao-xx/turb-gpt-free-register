@@ -15,6 +15,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from config import roxybrowser as roxy_cfg
 from core import db
+from core.roxy_account_task import profile_id_for_account, open_account_profile_with_recovery
 
 logger = logging.getLogger(__name__)
 
@@ -244,18 +245,7 @@ def format_password_setup_diagnostic(error, *, opened_profile_id: str = "", driv
 
 
 def _profile_id(account: dict) -> str:
-    raw = account.get("extra_json")
-    extra = raw if isinstance(raw, dict) else {}
-    if not extra and str(raw or "").strip():
-        try:
-            parsed = __import__("json").loads(raw)
-            extra = parsed if isinstance(parsed, dict) else {}
-        except (TypeError, ValueError):
-            extra = {}
-    roxy = extra.get("roxybrowser") if isinstance(extra, dict) else {}
-    if not isinstance(roxy, dict):
-        return ""
-    return str(roxy.get("profile_id") or "").strip()
+    return profile_id_for_account(account)
 
 
 def _is_stale_profile_open_error(exc: Exception) -> bool:
@@ -274,39 +264,13 @@ def _is_stale_profile_open_error(exc: Exception) -> bool:
 
 def _open_profile_with_recovery(client, profile_id: str, email: str):
     """打开历史 profile；失效时创建新环境，后续流程会在新环境中重新登录。"""
-    if not profile_id:
-        fresh = client.open_profile("", allow_existing_profile=True)
-        _append_password_setup_log(
-            email,
-            f"[设置密码] 已创建新 Roxy 环境，将重新登录并执行邮箱 OTP：profile_id={fresh.profile_id}",
-        )
-        return fresh
-    try:
-        return client.open_profile(profile_id, allow_existing_profile=True)
-    except Exception as original_exc:
-        if not profile_id or not _is_stale_profile_open_error(original_exc):
-            raise
-
-        _append_password_setup_log(
-            email,
-            f"[设置密码] 原 Roxy 环境不可用，准备自动创建新环境并重新登录：profile_id={profile_id} "
-            f"error={redact_password(original_exc, '')}",
-            level="WARNING",
-        )
-        try:
-            fresh_profile_id = client.create_profile()
-            fresh = client.open_profile(fresh_profile_id, allow_existing_profile=True)
-            # create_profile 已由本次任务创建；cleanup_profile 会按配置关闭/删除它。
-            fresh.created_by_run = True
-            _append_password_setup_log(
-                email,
-                f"[设置密码] 已创建新 Roxy 环境，将重新登录并执行邮箱 OTP：profile_id={fresh_profile_id}",
-            )
-            return fresh
-        except Exception as recovery_exc:
-            raise RuntimeError(
-                f"原 Roxy 环境打开失败，自动创建新环境也失败：{recovery_exc}"
-            ) from recovery_exc
+    return open_account_profile_with_recovery(
+        client,
+        profile_id,
+        progress_callback=lambda message, level="INFO": _append_password_setup_log(
+            email, f"[设置密码] {message}", level=level,
+        ),
+    )
 
 
 def _run_password_setup_task(*, account_id: int, email: str, mode: str, password: str) -> dict:

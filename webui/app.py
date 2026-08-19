@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 
 from flask import Flask, Response, jsonify, make_response, render_template, request
 
-from core import codex_retry_service, db, plan_check_service, extract_link_service, codex_agent_service, live_check_service, password_setup_task_service
+from core import codex_retry_service, db, plan_check_service, extract_link_service, codex_agent_service, live_check_service, password_setup_task_service, twofa_task_service
 from webui.auth import init_auth, register_auth_routes
 from core import registration_service as svc
 from webui import config_editor
@@ -148,6 +148,11 @@ def _compact_account_for_list(row: dict) -> dict:
         "password_setup_completed_at", "password_setup_attempt",
         "password_setup_max_attempts", "password_setup_last_error",
         "password_setup_next_retry_at",
+        "twofa_setup_status", "twofa_setup_ok", "twofa_setup_phase",
+        "twofa_setup_error", "twofa_setup_queued_at", "twofa_setup_started_at",
+        "twofa_setup_completed_at", "twofa_setup_attempt",
+        "twofa_setup_max_attempts", "twofa_setup_last_error",
+        "twofa_setup_next_retry_at",
         "live_check_backend", "live_check_failure_kind", "live_check_attempt",
         "live_check_max_attempts", "live_check_next_retry_at", "live_check_profile_source",
     ):
@@ -217,9 +222,11 @@ def _account_secret_value(row: dict, field: str) -> str:
         return str(row.get("codex_agent_token") or "")
     if field == "registration_password":
         return _registration_password_value(row)
+    if field == "totp_secret":
+        return str(row.get("totp_secret") or "")
     if field == "pickup_address":
         return _generic_api_pickup_address(row)
-    raise ValueError("field 仅支持 access_token/copy_line/codex_agent_token/registration_password/pickup_address")
+    raise ValueError("field 仅支持 access_token/copy_line/codex_agent_token/registration_password/totp_secret/pickup_address")
 
 
 def _compact_job_for_list(row: dict) -> dict:
@@ -320,6 +327,9 @@ def create_app(auth_code: str | None = None) -> Flask:
     recovered_password_setups = db.recover_interrupted_password_setups()
     if recovered_password_setups:
         logger.warning("已恢复 %s 个因 WebUI 重启中断的设置密码状态", recovered_password_setups)
+    recovered_twofa_setups = db.recover_interrupted_twofa_setups()
+    if recovered_twofa_setups:
+        logger.warning("已恢复 %s 个因 WebUI 重启中断的补设 2FA 状态", recovered_twofa_setups)
     recovered_plan_checks = db.recover_interrupted_plan_checks()
     if recovered_plan_checks:
         logger.warning("已恢复 %s 个因 WebUI 重启中断的套餐查询状态", recovered_plan_checks)
@@ -797,6 +807,85 @@ def create_app(auth_code: str | None = None) -> Flask:
             "ok": True,
             "items": _attach_password_setup_queue(items, queue),
             "queue": queue,
+        })
+
+    @app.post("/api/accounts/<int:acc_id>/2fa-setup")
+    def api_account_twofa_setup(acc_id: int):
+        """给单个已有账号提交补设 TOTP 2FA 任务。"""
+        if not db.get_account(acc_id):
+            return jsonify({"ok": False, "error": "账号不存在"}), 404
+        queued = twofa_task_service.enqueue_account_twofa(account_id=acc_id, trigger="manual")
+        safe = {key: value for key, value in queued.items() if key != "future"}
+        if queued.get("skipped"):
+            return jsonify({"ok": True, **safe}), 200
+        if queued.get("busy"):
+            return jsonify({"ok": False, **safe}), 409
+        if queued.get("queue_full"):
+            return jsonify({"ok": False, **safe}), 503
+        if not queued.get("accepted"):
+            return jsonify({"ok": False, **safe}), 503
+        return jsonify({"ok": True, **safe}), 202
+
+    @app.post("/api/accounts/2fa-setup-bulk")
+    def api_accounts_twofa_setup_bulk():
+        data = request.get_json(silent=True) or {}
+        ids = data.get("account_ids") or data.get("ids") or []
+        if not isinstance(ids, list) or not ids:
+            return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
+        if len(ids) > 500:
+            return jsonify({"ok": False, "error": "单次最多提交 500 个账号"}), 400
+        started, skipped, failed, seen = [], [], [], set()
+        for raw in ids:
+            try:
+                acc_id = int(raw)
+            except (TypeError, ValueError):
+                skipped.append({"id": raw, "reason": "ID 非法"})
+                continue
+            if acc_id in seen:
+                continue
+            seen.add(acc_id)
+            queued = twofa_task_service.enqueue_account_twofa(
+                account_id=acc_id, trigger="manual_bulk",
+            )
+            safe = {key: value for key, value in queued.items() if key != "future"}
+            if queued.get("accepted"):
+                started.append(safe)
+            elif queued.get("skipped") or queued.get("busy"):
+                skipped.append({
+                    "id": acc_id, "email": safe.get("email"),
+                    "reason": safe.get("error") or "账号不可补设 2FA",
+                })
+            else:
+                failed.append({
+                    "id": acc_id, "email": safe.get("email"),
+                    "error": safe.get("error") or "入队失败",
+                })
+        return jsonify({
+            "ok": True,
+            "started": started, "started_count": len(started),
+            "skipped": skipped, "skipped_count": len(skipped),
+            "failed": failed, "failed_count": len(failed),
+            "queue": twofa_task_service.queue_settings(),
+        }), 202
+
+    @app.get("/api/accounts/2fa-setup-status")
+    def api_accounts_twofa_setup_status():
+        raw_ids = str(request.args.get("ids") or "").strip()
+        ids = []
+        for raw in raw_ids.split(",") if raw_ids else []:
+            try:
+                ids.append(int(raw))
+            except (TypeError, ValueError):
+                continue
+        items = []
+        for acc_id in dict.fromkeys(ids):
+            row = db.get_account(acc_id)
+            if row:
+                items.append(_compact_account_for_list(row))
+        return jsonify({
+            "ok": True,
+            "items": items,
+            "queue": twofa_task_service.queue_settings(),
         })
 
     @app.post("/api/accounts/check-live-bulk")
@@ -2448,6 +2537,32 @@ def create_app(auth_code: str | None = None) -> Flask:
             content = f.read().decode("utf-8", errors="replace")
         row = db.get_account_by_email(email) or {}
         status = str(row.get("password_setup_status") or "")
+        return jsonify({
+            "ok": True,
+            "log": content,
+            "running": status in {"queued", "running"},
+        })
+
+    @app.get("/api/accounts/2fa-setup-log")
+    def api_account_twofa_setup_log():
+        """读取某邮箱最近一次补设 2FA 日志。?email=xxx"""
+        email = (request.args.get("email") or "").strip()
+        if not email:
+            return jsonify({"ok": False, "error": "email 为空"}), 400
+        row = db.get_account_by_email(email)
+        if not row:
+            return jsonify({"ok": False, "error": "账号不存在"}), 404
+        path = twofa_task_service.twofa_setup_log_path(email)
+        if not path.exists():
+            status = str(row.get("twofa_setup_status") or "")
+            return jsonify({"ok": True, "log": "", "running": status in {"queued", "running"}})
+        max_bytes = 80_000
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size > max_bytes:
+                handle.seek(size - max_bytes)
+            content = handle.read().decode("utf-8", errors="replace")
+        status = str(row.get("twofa_setup_status") or "")
         return jsonify({
             "ok": True,
             "log": content,

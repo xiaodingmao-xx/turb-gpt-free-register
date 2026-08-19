@@ -2083,6 +2083,7 @@
 
         <div class="acc-v2-btn-group">
           <span class="acc-v2-selected" id="passwordSetupQueueStatusV2" title="设置密码后台队列状态">设置密码队列：空闲</span>
+          <span class="acc-v2-selected" id="twoFASetupQueueStatusV2" title="补设 2FA 后台队列状态">2FA 队列：空闲</span>
           <label class="acc-v2-inline" title="批量补跑 Codex 的并发线程数">线程
             <span class="el-input-number">
               <input id="codexBulkWorkersV2" type="number" min="1" max="16" value="3" inputmode="numeric">
@@ -2127,6 +2128,7 @@
           <span id="accountsSelectedHintV2" class="acc-v2-selection-badge" title="当前批量操作选中的账号数量">已选择 0 个账号</span>
           <span class="acc-v2-btn-group-title">批量</span>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnPasswordSetupSelectedV2" disabled title="给选中账号批量添加或重设密码">设置密码</button>
+          <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnTwoFASetupSelectedV2" disabled title="给选中且尚未启用的账号补设 TOTP 2FA">补设2FA</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnNoteSelectedAccountsV2" disabled title="给选中的账号统一设置备注，留空可清空备注">备注</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnCopySelectedLinesV2" disabled title="复制选中账号的完整整行，每个账号一行">复制行</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnDownloadSelectedTxtV2" disabled title="把选中账号的完整整行保存为 TXT 文件，每个账号一行">下载TXT</button>
@@ -2454,6 +2456,8 @@ let ACCOUNT_PASSWORD_SETUP_IDS = [];
 let accountPasswordSetupTimer = null;
 let accountPasswordSetupPollingIds = new Set();
 let PASSWORD_SETUP_QUEUE = {};
+let accountTwoFASetupTimer = null;
+let accountTwoFASetupPollingIds = new Set();
 const ACCOUNT_SELECTED = new Set();
 const OUTLOOK_SELECTED = new Set();
 let JOBS = [];
@@ -3527,12 +3531,33 @@ function _registrationPasswordCell(r) {
   }
   return '<span class="acc-v2-muted">未设置</span>';
 }
+function _twoFACell(r) {
+  if (r.totp_enabled) return '<span class="pill status-success">已启用</span>';
+  const status = String(r.twofa_setup_status || '');
+  const phaseLabels = {login:'登录', reauth:'重认证', enroll:'创建密钥', activate:'激活'};
+  if (status === 'queued') return '<span class="pill status-running">排队中</span>';
+  if (status === 'running') {
+    const phase = phaseLabels[String(r.twofa_setup_phase || '')] || '处理中';
+    return `<span class="pill status-running">${esc(phase)}</span>`;
+  }
+  if (status === 'already_enabled_external') {
+    return '<span class="pill status-used" title="平台已启用 MFA，但本地没有可恢复的 Secret">外部已启用</span>';
+  }
+  if (status === 'failed') {
+    return `<span class="pill status-failed" title="${esc(r.twofa_setup_error || '')}">失败</span>`;
+  }
+  return '<span class="acc-v2-muted">未启用</span>';
+}
 function _accountsV2MoreMenu(r) {
   const passwordDone = Boolean(r.registration_password_set) || ['success', 'already_set'].includes(String(r.password_setup_status || ''));
+  const twofaBusy = ['queued', 'running'].includes(String(r.twofa_setup_status || ''));
   const parts = [
     `<button type="button" data-account-copy-secret="copy_line" data-account-id="${esc(r.id)}">复制整行</button>`,
     !passwordDone ? `<button type="button" data-account-password-setup="${esc(r.id)}" title="为该账号添加或重设密码">设置密码</button>` : '',
     `<button type="button" data-account-password-log="${esc(r.email)}" title="查看该账号最近一次设置密码日志">设置密码日志</button>`,
+    (!r.totp_enabled && !twofaBusy) ? `<button type="button" data-account-twofa-setup="${esc(r.id)}" title="重新登录该账号并补设 TOTP 2FA">补设2FA</button>` : '',
+    r.totp_enabled ? `<button type="button" data-account-copy-secret="totp_secret" data-account-id="${esc(r.id)}" title="复制该账号的 TOTP Secret">复制2FA密钥</button>` : '',
+    `<button type="button" data-account-twofa-log="${esc(r.email)}" title="查看该账号最近一次补设 2FA 日志">2FA日志</button>`,
     `<button type="button" data-account-pickup-address="${esc(r.id)}" title="设置该账号取件地址">取件地址</button>`,
     `<button type="button" data-account-note="${esc(r.id)}" title="设置/清空该账号备注">备注</button>`,
     `<button type="button" onclick="checkSelectedLive([Number('${esc(r.id)}')], this, 'protocol'); return false;" title="使用协议会话重新登录该账号并刷新最新 AT/accessToken">协议查活</button>`,
@@ -3586,7 +3611,7 @@ function renderAccounts() {
       <td class="col-password">${_registrationPasswordCell(r)}</td>
       <td class="col-plan">${_planCell(r)}<div class="acc-v2-sub">${_extractLinkCell(r)}</div></td>
       <td class="col-note" title="${esc(r.note || '')}">${r.note ? esc(short(r.note, 80)) : '<span class="acc-v2-muted">-</span>'}</td>
-      <td class="col-small">${r.totp_enabled ? '已启用' : '<span class="acc-v2-muted">未启用</span>'}</td>
+      <td class="col-small">${_twoFACell(r)}</td>
       <td class="col-status">${_codexCellV2(r)}</td>
       <td class="col-agent">${_codexAgentCell(r)}</td>
       <td class="col-time" title="${esc(r.created_at || '-')}">${esc(r.created_at || '-')}</td>
@@ -3632,7 +3657,7 @@ function updateAccountSelectionUi(pageRows = null) {
     'btnCheckSelectedPlansV2', 'btnExtractSelectedLinksV2',
     'btnGenerateSelectedAgentV2', 'btnDownloadSelectedAgentV2', 'btnUploadSelectedAgentSub2V2',
     'btnRetrySelectedCodexV2', 'btnDownloadSelectedCpaV2', 'btnStopSelectedCodexV2',
-    'btnPasswordSetupSelectedV2', 'btnNoteSelectedAccountsV2', 'btnCopySelectedLinesV2',
+    'btnPasswordSetupSelectedV2', 'btnTwoFASetupSelectedV2', 'btnNoteSelectedAccountsV2', 'btnCopySelectedLinesV2',
     'btnDownloadSelectedTxtV2', 'btnArchiveSelectedAccountsV2',
     'btnFloatPasswordSetupV2', 'btnFloatNoteSelectedV2', 'btnFloatCopySelectedLinesV2', 'btnFloatClearSelectedV2',
   ];
@@ -3699,10 +3724,10 @@ let liveLogEmail = null, liveLogTimer = null, liveLogKind = 'live', accountLogPe
 
 function openAccountLog(email, kind = 'live', pending = false) {
   liveLogEmail = email;
-  liveLogKind = ['password', 'plan'].includes(kind) ? kind : 'live';
+  liveLogKind = ['password', 'plan', 'twofa'].includes(kind) ? kind : 'live';
   accountLogPending = !!pending;
-  if (liveLogKind === 'plan') $('#liveLogTitle').textContent = '查套餐日志：';
-  $('#liveLogTitle').textContent = liveLogKind === 'password' ? '设置密码日志：' : '查活日志：';
+  const titles = {password:'设置密码日志：', plan:'查套餐日志：', twofa:'补设2FA日志：', live:'查活日志：'};
+  $('#liveLogTitle').textContent = titles[liveLogKind] || titles.live;
   $('#liveLogEmail').textContent = email;
   $('#liveLogPanel').classList.remove('hidden');
   updateModalScrollLock();
@@ -3714,10 +3739,13 @@ function openAccountLog(email, kind = 'live', pending = false) {
 function openLiveLog(email) { openAccountLog(email, 'live', false); }
 function openPasswordSetupLog(email, pending = false) { openAccountLog(email, 'password', pending); }
 function openPlanCheckLog(email) { openAccountLog(email, 'plan', false); }
+function openTwoFASetupLog(email, pending = false) { openAccountLog(email, 'twofa', pending); }
 async function pollAccountLog() {
   if (!liveLogEmail) return;
   try {
-    const endpoint = liveLogKind === 'password' ? 'password-setup-log' : liveLogKind === 'plan' ? 'plan-check-log' : 'live-check-log';
+    const endpoint = liveLogKind === 'password' ? 'password-setup-log'
+      : liveLogKind === 'plan' ? 'plan-check-log'
+      : liveLogKind === 'twofa' ? '2fa-setup-log' : 'live-check-log';
     const r = await api(`/api/accounts/${endpoint}?email=${encodeURIComponent(liveLogEmail)}`);
     const c = $('#liveLogContent');
     const atBottom = c.scrollTop + c.clientHeight >= c.scrollHeight - 30;
@@ -3871,6 +3899,60 @@ function startAccountPasswordSetupPolling(ids = []) {
 function setPasswordForSelectedAccounts() {
   submitPasswordSetupForIds(Array.from(ACCOUNT_SELECTED), $('#btnPasswordSetupSelectedV2'));
 }
+async function submitTwoFASetupForIds(ids, triggerBtn = null) {
+  const normalized = Array.from(new Set((ids || []).map(Number).filter(Number.isFinite)));
+  if (!normalized.length) { showToast('请先选择账号'); return; }
+  if (!confirm(`将为 ${normalized.length} 个账号打开 RoxyBrowser 补设 2FA，可能发送登录和重认证两封 OTP 邮件。是否继续？`)) return;
+  const btn = triggerBtn || $('#btnTwoFASetupSelectedV2');
+  const oldText = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '提交中…'; }
+  try {
+    const endpoint = normalized.length === 1
+      ? `/api/accounts/${encodeURIComponent(normalized[0])}/2fa-setup`
+      : '/api/accounts/2fa-setup-bulk';
+    const body = normalized.length === 1 ? {} : {account_ids: normalized};
+    const result = await api(endpoint, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    const started = Number(result.started_count ?? (result.status === 'queued' ? 1 : 0));
+    const skipped = Number(result.skipped_count ?? (result.skipped ? 1 : 0));
+    const failed = Number(result.failed_count || 0);
+    showToast(`补设2FA：已入队 ${started} 个，跳过 ${skipped} 个，失败 ${failed} 个`);
+    if (started) startAccountTwoFASetupPolling(normalized);
+    await loadAccounts();
+  } catch (err) {
+    showToast('补设2FA提交失败: ' + err.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = oldText; }
+  }
+}
+async function pollAccountTwoFASetupStatuses() {
+  const ids = Array.from(accountTwoFASetupPollingIds);
+  if (!ids.length) return;
+  try {
+    const result = await api(`/api/accounts/2fa-setup-status?ids=${encodeURIComponent(ids.join(','))}`);
+    const queue = result.queue || {};
+    const queueEl = $('#twoFASetupQueueStatusV2');
+    if (queueEl) queueEl.textContent = (Number(queue.active || 0) + Number(queue.queued || 0))
+      ? `2FA 队列：运行 ${Number(queue.active || 0)} · 排队 ${Number(queue.queued || 0)}` : '2FA 队列：空闲';
+    const byId = new Map((result.items || []).map(row => [Number(row.id), row]));
+    ACCOUNTS.forEach(row => { const next = byId.get(Number(row.id)); if (next) Object.assign(row, next); });
+    ids.forEach(id => {
+      const next = byId.get(Number(id));
+      if (!next || !['queued', 'running'].includes(String(next.twofa_setup_status || ''))) accountTwoFASetupPollingIds.delete(Number(id));
+    });
+    renderAccounts();
+    if (!accountTwoFASetupPollingIds.size && accountTwoFASetupTimer) {
+      clearInterval(accountTwoFASetupTimer); accountTwoFASetupTimer = null;
+    }
+  } catch (_) {}
+}
+function startAccountTwoFASetupPolling(ids = []) {
+  ids.map(Number).filter(Number.isFinite).forEach(id => accountTwoFASetupPollingIds.add(id));
+  if (!accountTwoFASetupTimer) accountTwoFASetupTimer = setInterval(pollAccountTwoFASetupStatuses, 2500);
+  pollAccountTwoFASetupStatuses();
+}
+function setupTwoFAForSelectedAccounts() {
+  submitTwoFASetupForIds(Array.from(ACCOUNT_SELECTED), $('#btnTwoFASetupSelectedV2'));
+}
 function toggleAccountSort(key) {
   if (ACCOUNTS_SORT_KEY === key) ACCOUNTS_SORT_ORDER = ACCOUNTS_SORT_ORDER === 'asc' ? 'desc' : 'asc';
   else { ACCOUNTS_SORT_KEY = key; ACCOUNTS_SORT_ORDER = key === 'id' || key === 'created_at' ? 'desc' : 'asc'; }
@@ -3908,6 +3990,18 @@ async function onAccountsBodyClick(e) {
   const passwordLogBtn = e.target.closest('[data-account-password-log]');
   if (passwordLogBtn) {
     openPasswordSetupLog(passwordLogBtn.dataset.accountPasswordLog);
+    return;
+  }
+
+  const twofaSetupBtn = e.target.closest('[data-account-twofa-setup]');
+  if (twofaSetupBtn) {
+    submitTwoFASetupForIds([Number(twofaSetupBtn.dataset.accountTwofaSetup)], twofaSetupBtn);
+    return;
+  }
+
+  const twofaLogBtn = e.target.closest('[data-account-twofa-log]');
+  if (twofaLogBtn) {
+    openTwoFASetupLog(twofaLogBtn.dataset.accountTwofaLog);
     return;
   }
 
@@ -4912,6 +5006,7 @@ async function copySelectedAccountTokens() {
   bind('btnDownloadSelectedCpaV2', downloadSelectedCpa);
   bind('btnStopSelectedCodexV2', stopSelectedCodex);
   bind('btnPasswordSetupSelectedV2', setPasswordForSelectedAccounts);
+  bind('btnTwoFASetupSelectedV2', setupTwoFAForSelectedAccounts);
   bind('btnNoteSelectedAccountsV2', noteSelectedAccounts);
   bind('btnCopySelectedLinesV2', copySelectedAccountLines);
   bind('btnFloatPasswordSetupV2', setPasswordForSelectedAccounts);

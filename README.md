@@ -611,6 +611,19 @@ Roxy profile，或在 profile 不存在时创建一个临时环境，通过邮�
 - 浏览器、网络、OTP 和 session 错误不会被判为废号；只有明确停用/删除/封禁信号会标记已废。
 - 查活失败保留旧 token。浏览器查活不能保证绕过第三方风控，也不会自动切换查活后端或网络出口。
 
+### 已有账号手动补设 2FA
+
+账号页可对尚未保存 TOTP Secret 的已有账号执行单个或批量“补设2FA”。后台会打开该账号保存的
+Roxy profile；历史 profile 失效时创建临时环境，通过邮箱 OTP 重新登录，再进行一次 2FA 安全设置
+重认证并完成 TOTP enroll/activate。
+
+- 一次任务通常会收到两封邮件：登录 OTP 和 2FA 重认证 OTP，系统会分别建立验证码基线，禁止复用旧码。
+- 只有 activate 明确成功后才保存 TOTP Secret；enroll 后结果不明确不会自动从头重试。
+- 平台已经启用 MFA、但本地没有 Secret 的账号会显示“外部已启用”，原 Secret 无法恢复。
+- 普通账号列表和任务日志不会返回 Secret；只有显式“复制2FA密钥”操作会调用受保护的 secret 接口。
+- 默认使用单并发队列，可通过 `TWOFA_SETUP_WORKERS`、`TWOFA_SETUP_QUEUE_LIMIT` 和
+  `TWOFA_SETUP_MAX_ATTEMPTS` 调整。
+
 ## 重要配置文件
 
 | 文件 | 说明 |

@@ -154,7 +154,12 @@ from config.email import (
 )
 
 # ---------- 2FA ----------
-from config.twofa import ENABLE_2FA
+from config.twofa import (
+    ENABLE_2FA,
+    TWOFA_SETUP_WORKERS,
+    TWOFA_SETUP_QUEUE_LIMIT,
+    TWOFA_SETUP_MAX_ATTEMPTS,
+)
 
 # ---------- Roxy 浏览器查活 ----------
 from config.roxybrowser import (
@@ -269,7 +274,7 @@ __all__ = [
     "CLOUDMAIL_AUTH_TOKEN", "CLOUDMAIL_DOMAINS",
     "CLOUDMAIL_AUTO_ADD_USER", "CLOUDMAIL_RANDOM_LOCAL_LENGTH",
     # twofa
-    "ENABLE_2FA",
+    "ENABLE_2FA", "TWOFA_SETUP_WORKERS", "TWOFA_SETUP_QUEUE_LIMIT", "TWOFA_SETUP_MAX_ATTEMPTS",
     # Roxy 浏览器查活
     "LIVE_CHECK_BROWSER_WORKERS", "LIVE_CHECK_BROWSER_QUEUE_LIMIT",
     "LIVE_CHECK_BROWSER_MAX_ATTEMPTS", "LIVE_CHECK_BROWSER_RETRY_DELAYS",

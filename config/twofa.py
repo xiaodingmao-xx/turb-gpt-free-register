@@ -11,6 +11,14 @@
 from config.env_loader import apply_env_overrides
 
 ENABLE_2FA = False
+TWOFA_SETUP_WORKERS = 1
+TWOFA_SETUP_QUEUE_LIMIT = 100
+TWOFA_SETUP_MAX_ATTEMPTS = 3
 
 # ---- .env overrides for WebUI editable fields ----
-apply_env_overrides(globals(), {'ENABLE_2FA': 'bool'})
+apply_env_overrides(globals(), {
+    'ENABLE_2FA': 'bool',
+    'TWOFA_SETUP_WORKERS': 'int',
+    'TWOFA_SETUP_QUEUE_LIMIT': 'int',
+    'TWOFA_SETUP_MAX_ATTEMPTS': 'int',
+})

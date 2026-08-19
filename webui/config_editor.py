@@ -349,6 +349,18 @@ EDITABLE_FIELDS = [
         "label": "启用 2FA(TOTP)", "help": "注册完成后自动设置动态口令（会多收一封 OTP 邮件）",
     },
     {
+        "key": "TWOFA_SETUP_WORKERS", "file": "twofa.py", "type": "int", "group": "任务并发",
+        "label": "补设 2FA 并发数", "help": "已有账号手动补设 2FA 的后台并发，建议保持 1",
+    },
+    {
+        "key": "TWOFA_SETUP_QUEUE_LIMIT", "file": "twofa.py", "type": "int", "group": "任务并发",
+        "label": "补设 2FA 队列上限", "help": "已有账号补设 2FA 的最大排队数量",
+    },
+    {
+        "key": "TWOFA_SETUP_MAX_ATTEMPTS", "file": "twofa.py", "type": "int", "group": "任务并发",
+        "label": "补设 2FA 最大尝试", "help": "仅在 enroll 前的可恢复错误中自动重试",
+    },
+    {
         "key": "ENABLE_FLOW_TRIGGER", "file": "flow_trigger.py", "type": "bool", "group": "功能开关",
         "label": "启用 Flow 触发", "help": "注册成功后自动调用内部 Flow 接口（不影响注册结果）",
     },

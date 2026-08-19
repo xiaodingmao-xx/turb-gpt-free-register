@@ -3,7 +3,7 @@ import base64
 import datetime
 import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from core.generic_api_mail_client import (
     GenericApiEmailAccount,
@@ -445,6 +445,45 @@ class GenericApiYangyangTests(unittest.TestCase):
         self.assertEqual(baseline.codes, frozenset({"174510"}))
         self.assertEqual(baseline.message_ids, frozenset({"mail-before-trigger"}))
         self.assertGreater(baseline.captured_at, 0)
+
+    def test_capture_baseline_accepts_404_empty_mailbox_as_empty_baseline(self):
+        account = GenericApiEmailAccount(
+            "user@example.com",
+            "https://mail.example/code",
+        )
+        session = MagicMock()
+        session.get.return_value = FakeResponse(
+            status_code=404,
+            data={
+                "email": account.email,
+                "found": False,
+                "error": "最近 25 封邮件中没有找到该邮箱的邮件",
+            },
+            text=json.dumps({"email": account.email, "found": False, "error": "最近 25 封邮件中没有找到该邮箱的邮件"}),
+        )
+        with patch("core.generic_api_mail_client.get_account_context", return_value=account), patch(
+            "core.generic_api_mail_client.requests.Session", return_value=session
+        ):
+            baseline = capture_otp_baseline(account.email, attempts=1)
+        self.assertEqual(baseline.codes, frozenset())
+        self.assertEqual(baseline.message_ids, frozenset())
+
+    def test_capture_baseline_keeps_unknown_404_as_failure(self):
+        account = GenericApiEmailAccount(
+            "user@example.com",
+            "https://mail.example/code",
+        )
+        session = MagicMock()
+        session.get.return_value = FakeResponse(
+            status_code=404,
+            data={"found": False, "error": "邮箱不存在或链接已失效"},
+            text=json.dumps({"found": False, "error": "邮箱不存在或链接已失效"}),
+        )
+        with patch("core.generic_api_mail_client.get_account_context", return_value=account), patch(
+            "core.generic_api_mail_client.requests.Session", return_value=session
+        ):
+            with self.assertRaisesRegex(GenericApiMailError, "基线"):
+                capture_otp_baseline(account.email, attempts=1)
 
     def test_capture_baseline_raises_after_request_failures(self):
         account = GenericApiEmailAccount(

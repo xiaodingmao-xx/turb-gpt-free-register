@@ -1397,7 +1397,8 @@ def claim_account_password_setup(
             return False
         if bool(row.get("archived")):
             return False
-        if str(row.get("password_setup_status") or "") in {"queued", "running"}:
+        if str(row.get("password_setup_status") or "") in {"queued", "running"} or \
+                str(row.get("twofa_setup_status") or "") in {"queued", "running"}:
             return False
         now = _now()
         row["password_setup_status"] = "queued"
@@ -1522,6 +1523,159 @@ def recover_interrupted_password_setups() -> int:
         return recovered
 
 
+def claim_account_twofa_setup(
+    acc_id: int,
+    *,
+    trigger: str = "manual",
+    max_attempts: int = 3,
+) -> bool:
+    """原子占用已有账号补设 2FA 任务。"""
+    with _LOCK:
+        rows = _load_accounts()
+        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        if row is None or bool(row.get("archived")) or str(row.get("totp_secret") or "").strip():
+            return False
+        if any(str(row.get(key) or "").lower() in {"queued", "running"} for key in (
+            "twofa_setup_status", "password_setup_status", "live_check_status",
+        )):
+            return False
+        now = _now()
+        row.update({
+            "twofa_setup_status": "queued",
+            "twofa_setup_ok": None,
+            "twofa_setup_phase": "login",
+            "twofa_setup_attempt": 1,
+            "twofa_setup_max_attempts": max(1, int(max_attempts)),
+            "twofa_setup_last_error": None,
+            "twofa_setup_error": None,
+            "twofa_setup_trigger": str(trigger or "manual"),
+            "twofa_setup_queued_at": now,
+            "twofa_setup_started_at": None,
+            "twofa_setup_completed_at": None,
+            "twofa_setup_next_retry_at": None,
+            "updated_at": now,
+        })
+        _save_accounts(rows)
+        return True
+
+
+def mark_account_twofa_setup_running(acc_id: int) -> bool:
+    with _LOCK:
+        rows = _load_accounts()
+        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        if row is None or str(row.get("twofa_setup_status") or "") != "queued":
+            return False
+        row["twofa_setup_status"] = "running"
+        row["twofa_setup_started_at"] = _now()
+        row["twofa_setup_next_retry_at"] = None
+        row["updated_at"] = _now()
+        _save_accounts(rows)
+        return True
+
+
+def update_account_twofa_setup_phase(acc_id: int, phase: str) -> bool:
+    with _LOCK:
+        rows = _load_accounts()
+        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        if row is None or str(row.get("twofa_setup_status") or "") != "running":
+            return False
+        row["twofa_setup_phase"] = str(phase or "")[:40]
+        row["updated_at"] = _now()
+        _save_accounts(rows)
+        return True
+
+
+def requeue_account_twofa_setup(
+    acc_id: int,
+    error: str,
+    *,
+    attempt: int,
+    max_attempts: int,
+    next_retry_at: str | None = None,
+) -> bool:
+    with _LOCK:
+        rows = _load_accounts()
+        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        if row is None:
+            return False
+        row.update({
+            "twofa_setup_status": "queued",
+            "twofa_setup_ok": None,
+            "twofa_setup_attempt": max(1, int(attempt)),
+            "twofa_setup_max_attempts": max(1, int(max_attempts)),
+            "twofa_setup_last_error": str(error or "")[:500],
+            "twofa_setup_error": None,
+            "twofa_setup_queued_at": _now(),
+            "twofa_setup_started_at": None,
+            "twofa_setup_completed_at": None,
+            "twofa_setup_next_retry_at": str(next_retry_at or "").strip() or None,
+            "updated_at": _now(),
+        })
+        _save_accounts(rows)
+        return True
+
+
+def update_account_twofa_setup(acc_id: int, result: dict | None = None) -> bool:
+    """写回补设 2FA 结果；仅明确成功时保存并同步 Secret。"""
+    result = result or {}
+    with _LOCK:
+        rows = _load_accounts()
+        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        if row is None:
+            return False
+        external = bool(result.get("already_enabled_external"))
+        secret = str(result.get("totp_secret") or "").strip()
+        ok = bool(result.get("ok")) and bool(secret)
+        status = "already_enabled_external" if external else ("success" if ok else "failed")
+        error = None if (ok or external) else str(result.get("error") or "补设 2FA 失败")[:500]
+        row.update({
+            "twofa_setup_status": status,
+            "twofa_setup_ok": True if ok else (None if external else False),
+            "twofa_setup_phase": "complete" if (ok or external) else str(result.get("phase") or row.get("twofa_setup_phase") or "")[:40],
+            "twofa_setup_error": error,
+            "twofa_setup_last_error": error,
+            "twofa_setup_completed_at": result.get("completed_at") or _now(),
+            "twofa_setup_next_retry_at": None,
+            "updated_at": _now(),
+        })
+        if ok:
+            row["totp_secret"] = secret
+            row["copy_line"] = _account_line(row)
+            email = str(row.get("email") or "").strip().lower()
+            outlook_rows = _load_outlook()
+            generic_rows = _load_generic_api_emails()
+            for pool_row in outlook_rows:
+                if str(pool_row.get("email") or "").strip().lower() == email:
+                    pool_row["totp_secret"] = secret
+            for pool_row in generic_rows:
+                if str(pool_row.get("email") or "").strip().lower() == email:
+                    pool_row["totp_secret"] = secret
+            _save_outlook(outlook_rows)
+            _save_generic_api_emails(generic_rows)
+        _save_accounts(rows)
+        return True
+
+
+def recover_interrupted_twofa_setups() -> int:
+    with _LOCK:
+        rows = _load_accounts()
+        recovered = 0
+        for row in rows:
+            if str(row.get("twofa_setup_status") or "") not in {"queued", "running"}:
+                continue
+            row["twofa_setup_status"] = "failed"
+            row["twofa_setup_ok"] = False
+            row["twofa_setup_error"] = "WebUI 重启导致 2FA 任务中断，请手动重新提交"
+            row["twofa_setup_last_error"] = row["twofa_setup_error"]
+            row["twofa_setup_next_retry_at"] = None
+            row["twofa_setup_completed_at"] = _now()
+            row["updated_at"] = _now()
+            recovered += 1
+        if recovered:
+            _save_accounts(rows)
+        return recovered
+
+
 def update_account_note(acc_id: int, note: str) -> bool:
     """更新单个已注册账号备注。note 为空字符串时表示清空备注。"""
     with _LOCK:
@@ -1619,6 +1773,8 @@ def claim_account_live_check(
         if row is None:
             return False
         if bool(row.get("archived")):
+            return False
+        if str(row.get("twofa_setup_status") or "") in {"queued", "running"}:
             return False
         if row.get("live_check_status") in {"queued", "running"}:
             try:
@@ -1808,6 +1964,7 @@ def has_running_account_task(row: dict | None) -> bool:
         "plan_check_status",
         "extract_link_status",
         "codex_agent_status",
+        "twofa_setup_status",
     )
     return any(str(row.get(key) or "").lower() in {"queued", "running"} for key in task_statuses) or (
         str(row.get("codex_status") or "").lower() == "retrying"
