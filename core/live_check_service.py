@@ -384,3 +384,76 @@ def queue_settings(mode: str = "protocol") -> dict:
             "retry_delays": _browser_retry_delays(),
         }
     return {"workers": _WORKERS, "queue_limit": _QUEUE_LIMIT}
+
+
+def _is_future_retry(value: object, now: datetime) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            parsed = parsed.replace(tzinfo=None)
+        return parsed > now
+    except (TypeError, ValueError):
+        return False
+
+
+def queue_status(mode: str = "browser") -> dict:
+    """返回指定查活后端的容量、当前执行和排队快照。"""
+    normalized = normalize_live_check_mode(mode)
+    settings = queue_settings(normalized)
+    rows = db.list_accounts(
+        limit=5000,
+        offset=0,
+        archived="all",
+        sort_key="id",
+        sort_order="asc",
+    )
+    active_rows = [
+        row for row in rows
+        if str(row.get("live_check_backend") or "") == normalized
+        and str(row.get("live_check_status") or "") == "running"
+    ]
+    queued_rows = [
+        row for row in rows
+        if str(row.get("live_check_backend") or "") == normalized
+        and str(row.get("live_check_status") or "") == "queued"
+    ]
+    now = datetime.now()
+    delayed_rows = [
+        row for row in queued_rows
+        if _is_future_retry(row.get("live_check_next_retry_at"), now)
+    ]
+    delayed_ids = {id(row) for row in delayed_rows}
+    waiting_rows = [row for row in queued_rows if id(row) not in delayed_ids]
+    waiting_rows.sort(
+        key=lambda row: (
+            str(row.get("live_check_queued_at") or ""),
+            int(row.get("id") or 0),
+        )
+    )
+    running_accounts = [
+        {
+            "id": row.get("id"),
+            "email": row.get("email"),
+            "started_at": row.get("live_check_started_at"),
+            "attempt": row.get("live_check_attempt") or 1,
+            "max_attempts": row.get("live_check_max_attempts") or settings.get("max_attempts", 1),
+        }
+        for row in sorted(active_rows, key=lambda item: int(item.get("id") or 0))
+    ]
+    return {
+        "backend": normalized,
+        **settings,
+        "active": len(running_accounts),
+        "queued": len(queued_rows),
+        "waiting": len(waiting_rows),
+        "delayed": len(delayed_rows),
+        "available_workers": max(0, int(settings["workers"]) - len(running_accounts)),
+        "running_accounts": running_accounts,
+        "positions": {
+            str(row.get("id")): index
+            for index, row in enumerate(waiting_rows, 1)
+        },
+    }

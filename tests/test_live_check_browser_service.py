@@ -88,6 +88,66 @@ def test_normalize_live_check_mode_accepts_two_modes_and_defaults_protocol():
         normalize_live_check_mode("auto")
 
 
+def test_browser_queue_status_reports_running_waiting_delayed_and_positions():
+    from core import live_check_service as service
+
+    rows = [
+        {
+            "id": 146, "email": "running@example.com", "live_check_backend": "browser",
+            "live_check_status": "running", "live_check_started_at": "2026-08-21T12:00:00",
+            "live_check_attempt": 1, "live_check_max_attempts": 3,
+        },
+        {
+            "id": 147, "email": "waiting@example.com", "live_check_backend": "browser",
+            "live_check_status": "queued", "live_check_queued_at": "2026-08-21T12:00:01",
+            "live_check_next_retry_at": None, "live_check_attempt": 1, "live_check_max_attempts": 3,
+        },
+        {
+            "id": 148, "email": "delayed@example.com", "live_check_backend": "browser",
+            "live_check_status": "queued", "live_check_queued_at": "2026-08-21T12:00:02",
+            "live_check_next_retry_at": "2099-01-01T00:00:00", "live_check_attempt": 2,
+            "live_check_max_attempts": 3,
+        },
+        {
+            "id": 149, "email": "protocol@example.com", "live_check_backend": "protocol",
+            "live_check_status": "queued", "live_check_queued_at": "2026-08-21T12:00:03",
+        },
+    ]
+    with patch.object(service.db, "list_accounts", return_value=rows), \
+         patch.object(service, "_BROWSER_WORKERS", 2), \
+         patch.object(service, "_BROWSER_QUEUE_LIMIT", 100):
+        snapshot = service.queue_status("browser")
+
+    assert snapshot["active"] == 1
+    assert snapshot["queued"] == 2
+    assert snapshot["waiting"] == 1
+    assert snapshot["delayed"] == 1
+    assert snapshot["available_workers"] == 1
+    assert snapshot["running_accounts"] == [{
+        "id": 146,
+        "email": "running@example.com",
+        "started_at": "2026-08-21T12:00:00",
+        "attempt": 1,
+        "max_attempts": 3,
+    }]
+    assert snapshot["positions"] == {"147": 1}
+    assert "access_token" not in str(snapshot)
+
+
+def test_browser_queue_status_orders_waiting_accounts_by_queue_time_then_id():
+    from core import live_check_service as service
+
+    rows = [
+        {"id": 12, "email": "b@example.com", "live_check_backend": "browser",
+         "live_check_status": "queued", "live_check_queued_at": "2026-08-21T12:00:01"},
+        {"id": 11, "email": "a@example.com", "live_check_backend": "browser",
+         "live_check_status": "queued", "live_check_queued_at": "2026-08-21T12:00:01"},
+    ]
+    with patch.object(service.db, "list_accounts", return_value=rows):
+        snapshot = service.queue_status("browser")
+    assert snapshot["positions"] == {"11": 1, "12": 2}
+
+
 def test_browser_mode_dispatches_only_to_roxy_backend():
     from core import live_check_service as service
 
