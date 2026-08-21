@@ -2084,6 +2084,7 @@
         <div class="acc-v2-btn-group">
           <span class="acc-v2-selected" id="passwordSetupQueueStatusV2" title="设置密码后台队列状态">设置密码队列：空闲</span>
           <span class="acc-v2-selected" id="twoFASetupQueueStatusV2" title="补设 2FA 后台队列状态">2FA 队列：空闲</span>
+          <span class="acc-v2-selected" id="browserLiveCheckQueueStatusV2" title="Roxy 浏览器查活队列状态">浏览器查活：空闲</span>
           <label class="acc-v2-inline" title="批量补跑 Codex 的并发线程数">线程
             <span class="el-input-number">
               <input id="codexBulkWorkersV2" type="number" min="1" max="16" value="3" inputmode="numeric">
@@ -2458,6 +2459,9 @@ let accountPasswordSetupPollingIds = new Set();
 let PASSWORD_SETUP_QUEUE = {};
 let accountTwoFASetupTimer = null;
 let accountTwoFASetupPollingIds = new Set();
+let browserLiveCheckTimer = null;
+let browserLiveCheckPollingIds = new Set();
+let browserLiveCheckPollInFlight = false;
 const ACCOUNT_SELECTED = new Set();
 const OUTLOOK_SELECTED = new Set();
 let JOBS = [];
@@ -3604,6 +3608,7 @@ function renderAccounts() {
       <td class="col-email" title="${esc(r.email || '')}">
         <div class="acc-v2-email">${esc(r.email)}${r.archived ? ' <span class="pill status-used" title="该账号已归档">归档</span>' : ''}</div>
         <div class="acc-v2-sub">${esc(r.user_name || '-')}</div>
+        <button type="button" class="acc-v2-email-copy" data-account-copy-email="${esc(r.id)}">复制邮箱名称</button>
         ${r.pickup_address_available ? `<button type="button" class="acc-v2-pickup-copy" data-account-copy-pickup-address="${esc(r.id)}">复制取件地址</button>` : '<div class="acc-v2-pickup acc-v2-muted">未设置取件地址</div>'}
       </td>
       <td class="col-source">${esc(r.email_source || '-')}</td>
@@ -3953,6 +3958,50 @@ function startAccountTwoFASetupPolling(ids = []) {
 function setupTwoFAForSelectedAccounts() {
   submitTwoFASetupForIds(Array.from(ACCOUNT_SELECTED), $('#btnTwoFASetupSelectedV2'));
 }
+function renderBrowserLiveCheckQueue(queue = {}) {
+  const el = $('#browserLiveCheckQueueStatusV2');
+  if (!el) return;
+  const running = (queue.running_accounts || []).map(row => row.email).filter(Boolean);
+  const current = running.length ? `执行 ${running.join('、')}` : '执行 空闲';
+  el.textContent = `浏览器查活：${current} · 排队 ${Number(queue.queued || 0)}`;
+  el.title = `等待 ${Number(queue.waiting || 0)} · 延迟 ${Number(queue.delayed || 0)} · 可用 worker ${Number(queue.available_workers || 0)}`;
+}
+async function pollBrowserLiveCheckStatuses() {
+  if (browserLiveCheckPollInFlight || !browserLiveCheckPollingIds.size) return;
+  browserLiveCheckPollInFlight = true;
+  const ids = Array.from(browserLiveCheckPollingIds);
+  try {
+    const result = await api(`/api/accounts/live-check-status?ids=${encodeURIComponent(ids.join(','))}&mode=browser`);
+    renderBrowserLiveCheckQueue(result.queue || {});
+    const byId = new Map((result.items || []).map(row => [Number(row.id), row]));
+    ACCOUNTS.forEach(row => {
+      const next = byId.get(Number(row.id));
+      if (next) Object.assign(row, next);
+    });
+    ids.forEach(id => {
+      const next = byId.get(Number(id));
+      if (!next || !['queued', 'running'].includes(String(next.live_check_status || ''))) {
+        browserLiveCheckPollingIds.delete(Number(id));
+      }
+    });
+    renderAccounts();
+  } catch (_) {
+    // 下一轮继续请求，保留当前页面状态。
+  } finally {
+    browserLiveCheckPollInFlight = false;
+    if (!browserLiveCheckPollingIds.size && browserLiveCheckTimer) {
+      clearInterval(browserLiveCheckTimer);
+      browserLiveCheckTimer = null;
+      renderBrowserLiveCheckQueue({});
+    }
+  }
+}
+function startBrowserLiveCheckPolling(ids = []) {
+  ids.map(Number).filter(Number.isFinite).forEach(id => browserLiveCheckPollingIds.add(id));
+  if (!browserLiveCheckPollingIds.size) return;
+  if (!browserLiveCheckTimer) browserLiveCheckTimer = setInterval(pollBrowserLiveCheckStatuses, 2000);
+  pollBrowserLiveCheckStatuses();
+}
 function toggleAccountSort(key) {
   if (ACCOUNTS_SORT_KEY === key) ACCOUNTS_SORT_ORDER = ACCOUNTS_SORT_ORDER === 'asc' ? 'desc' : 'asc';
   else { ACCOUNTS_SORT_KEY = key; ACCOUNTS_SORT_ORDER = key === 'id' || key === 'created_at' ? 'desc' : 'asc'; }
@@ -4027,6 +4076,24 @@ async function onAccountsBodyClick(e) {
       showToast('读取密码失败: ' + err.message);
     } finally {
       passwordToggle.disabled = false;
+    }
+    return;
+  }
+
+  const emailCopyBtn = e.target.closest('[data-account-copy-email]');
+  if (emailCopyBtn) {
+    const id = Number(emailCopyBtn.dataset.accountCopyEmail);
+    const account = ACCOUNTS.find(row => Number(row.id) === id);
+    const email = account?.email || '';
+    emailCopyBtn.disabled = true;
+    try {
+      if (!email) { showToast('该账号没有邮箱名称'); return; }
+      await copyText(email);
+      showToast('邮箱名称已复制');
+    } catch(err) {
+      showToast('复制邮箱名称失败: ' + err.message);
+    } finally {
+      emailCopyBtn.disabled = false;
     }
     return;
   }
@@ -4704,6 +4771,10 @@ ${detail}`;
   });
     const skipped = (r.skipped || []).length;
     showToast(`${modeLabel}已入队 ${r.started_count || 0} 个，忙碌 ${r.busy_count || 0} 个，失败 ${r.failed_count || 0}${skipped ? `，跳过 ${skipped}` : ''}`);
+    if (normalizedMode === 'browser') {
+      renderBrowserLiveCheckQueue(r.queue || {});
+      startBrowserLiveCheckPolling((r.started || []).map(item => item.id));
+    }
     const firstStarted = (r.started || [])[0];
     if (firstStarted?.email) openLiveLog(firstStarted.email);
     else if (firstAcc && firstAcc.email) openLiveLog(firstAcc.email);
@@ -5135,6 +5206,7 @@ function renderOutlook() {
       <td class="col-email" title="${email}">
         <div class="acc-v2-email">${email || '-'}</div>
         <div class="acc-v2-sub" title="${esc(r.copy_line || '')}">${esc(short(r.copy_line, 70))}</div>
+        <button type="button" class="acc-v2-email-copy" data-pool-copy-email="${email}">复制邮箱名称</button>
       </td>
       <td class="col-source">${esc(poolLabel(r.source))}</td>
       <td class="col-status">${pill(r.status)}</td>
@@ -5220,6 +5292,22 @@ async function onOutlookBodyClick(e) {
     return;
   }
   if (e.target.closest('.acc-v2-more-menu')) closeOutlookV2MoreMenus();
+
+  const poolCopyEmailBtn = e.target.closest('[data-pool-copy-email]');
+  if (poolCopyEmailBtn) {
+    const email = poolCopyEmailBtn.dataset.poolCopyEmail || '';
+    poolCopyEmailBtn.disabled = true;
+    try {
+      if (!email) { showToast('邮箱名称为空'); return; }
+      await copyText(email);
+      showToast('邮箱名称已复制');
+    } catch(err) {
+      showToast('复制邮箱名称失败: ' + err.message);
+    } finally {
+      poolCopyEmailBtn.disabled = false;
+    }
+    return;
+  }
 
   const t = e.target.closest('[data-pool-act]');
   if (!t) return;

@@ -2,6 +2,7 @@
 """Roxy 真实浏览器查活的认证、身份校验和生命周期工具。"""
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 import json
@@ -67,6 +68,37 @@ def safe_error_text(value: object) -> str:
         text,
     )
     return text[:500]
+
+
+def safe_profile_hint(value: object) -> str:
+    """返回不可逆的 profile 摘要，避免日志暴露 Roxy profile 原始 ID。"""
+    raw = str(value or "").strip()
+    if not raw:
+        return "-"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+
+
+def safe_response_summary(value: object, limit: int = 160) -> str:
+    """把响应/异常摘要压缩为可展示文本，并再次移除 HTML 和认证字段。"""
+    text = safe_error_text(value)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max(1, int(limit))]
+
+
+def format_browser_phase(phase: str, **fields) -> str:
+    """生成统一的浏览器查活阶段日志行。"""
+    normalized_phase = str(phase or "unknown").strip() or "unknown"
+    parts = [f"[浏览器查活] phase={normalized_phase}"]
+    for key, value in fields.items():
+        if value is None or value == "":
+            continue
+        if isinstance(value, bool):
+            rendered = "true" if value else "false"
+        else:
+            rendered = safe_response_summary(value, limit=160)
+        parts.append(f"{key}={rendered}")
+    return " ".join(parts)
 
 
 def validate_browser_session(
@@ -210,7 +242,21 @@ def check_account_liveness_with_roxy(
 ) -> dict:
     """在 Roxy 真实浏览器中验证目标账号并返回统一查活结果。"""
     progress = progress_callback or (lambda message: None)
+
+    def emit(phase: str, **fields) -> None:
+        try:
+            progress(format_browser_phase(phase, **fields))
+        except Exception as exc:
+            logger.debug("[浏览器查活] 阶段日志写入失败 phase=%s error=%s", phase, safe_error_text(exc))
+
+    def relay(message: object) -> None:
+        try:
+            progress(safe_error_text(message))
+        except Exception as exc:
+            logger.debug("[浏览器查活] 进度日志写入失败 error=%s", safe_error_text(exc))
+
     target_email = str(email or "").strip()
+    emit("queue", account_id=account_id, email=target_email, status="started")
     checked_at = datetime.now().isoformat(timespec="seconds")
     account = db.get_account(int(account_id))
     if not account:
@@ -228,24 +274,52 @@ def check_account_liveness_with_roxy(
     result = None
     try:
         saved_profile_id = _profile_id(account)
-        opened, profile_source = _open_for_live_check(client, saved_profile_id, progress)
+        emit(
+            "profile_open",
+            account_id=account_id,
+            profile_source="saved" if saved_profile_id else "temporary",
+            profile_hint=safe_profile_hint(saved_profile_id),
+            status="started",
+        )
+        opened, profile_source = _open_for_live_check(client, saved_profile_id, relay)
         profile_id = str(getattr(opened, "profile_id", "") or "").strip() or None
         proxy_used = _masked_proxy(opened)
-        progress(
-            f"[浏览器查活] 已打开 profile={profile_id or '-'} source={profile_source} "
-            f"proxy={proxy_used or '-'}"
+        emit(
+            "profile_open",
+            account_id=account_id,
+            profile_source=profile_source,
+            profile_hint=safe_profile_hint(profile_id),
+            route="proxy" if proxy_used else "direct",
+            proxy=proxy_used or "-",
+            status="completed",
         )
+        emit("driver_start", account_id=account_id, status="started")
         driver = _build_driver(opened)
         try:
             driver.set_page_load_timeout(int(getattr(roxy_cfg, "ROXY_SELENIUM_TIMEOUT", 90) or 90))
         except Exception:
             pass
+        emit("driver_start", account_id=account_id, status="completed")
+        emit(
+            "page_load",
+            account_id=account_id,
+            request="GET https://chatgpt.com/auth/login",
+            host="chatgpt.com",
+            path="/auth/login",
+            route="proxy" if proxy_used else "direct",
+            proxy=proxy_used or "-",
+            status="started",
+        )
+        emit("login_start", account_id=account_id, status="started")
         session_info = login_existing_account_with_otp(
             driver,
             target_email,
-            progress_callback=progress,
+            progress_callback=relay,
         )
+        emit("page_load", account_id=account_id, path="/auth/login", status="completed")
+        emit("session_validate", account_id=account_id, status="started")
         validated = validate_browser_session(session_info, account, target_email)
+        emit("session_validate", account_id=account_id, status="completed")
         result = {
             "ok": True,
             "status": "live",
@@ -259,7 +333,7 @@ def check_account_liveness_with_roxy(
             "profile_source": profile_source,
             "proxy_used": proxy_used,
         }
-        progress("[浏览器查活] session 身份校验通过，已取得最新登录态")
+        emit("terminal", account_id=account_id, status="live", retryable=False)
         return result
     except RoxyExistingLoginError as exc:
         result = _failed_result(
@@ -269,6 +343,14 @@ def check_account_liveness_with_roxy(
             profile_id=profile_id,
             profile_source=profile_source,
             proxy_used=proxy_used,
+        )
+        emit(
+            "terminal",
+            account_id=account_id,
+            status=result.get("status"),
+            failure_kind=result.get("failure_kind"),
+            retryable=result.get("retryable"),
+            error=result.get("error"),
         )
         return result
     except RoxyLiveCheckFailure as exc:
@@ -280,6 +362,14 @@ def check_account_liveness_with_roxy(
             profile_id=profile_id,
             profile_source=profile_source,
             proxy_used=proxy_used,
+        )
+        emit(
+            "terminal",
+            account_id=account_id,
+            status=result.get("status"),
+            failure_kind=result.get("failure_kind"),
+            retryable=result.get("retryable"),
+            error=result.get("error"),
         )
         return result
     except Exception as exc:
@@ -304,18 +394,34 @@ def check_account_liveness_with_roxy(
                 profile_source=profile_source,
                 proxy_used=proxy_used,
             )
-        logger.warning("[浏览器查活] 失败 email=%s kind=%s error=%s", target_email, result["failure_kind"], result["error"])
+        emit(
+            "terminal",
+            account_id=account_id,
+            status=result.get("status"),
+            failure_kind=result.get("failure_kind"),
+            retryable=result.get("retryable"),
+            error=result.get("error"),
+        )
+        logger.warning(
+            "[浏览器查活] 失败 email=%s kind=%s error=%s",
+            target_email,
+            result["failure_kind"],
+            result["error"],
+        )
         return result
     finally:
+        cleanup_errors = []
         if driver is not None:
             try:
                 driver.quit()
             except Exception as exc:
+                cleanup_errors.append(f"driver:{type(exc).__name__}")
                 logger.warning("[浏览器查活] 关闭 driver 失败：%s", safe_error_text(exc))
         if opened is not None and profile_id:
             try:
                 client.close_profile(profile_id)
             except Exception as exc:
+                cleanup_errors.append(f"profile:{type(exc).__name__}")
                 logger.warning("[浏览器查活] 关闭 profile 失败：%s", safe_error_text(exc))
             if (
                 profile_source == "temporary"
@@ -325,4 +431,13 @@ def check_account_liveness_with_roxy(
                 try:
                     client.delete_profile(profile_id)
                 except Exception as exc:
+                    cleanup_errors.append(f"delete_profile:{type(exc).__name__}")
                     logger.warning("[浏览器查活] 删除临时 profile 失败：%s", safe_error_text(exc))
+        emit(
+            "cleanup",
+            account_id=account_id,
+            profile_source=profile_source or "-",
+            profile_hint=safe_profile_hint(profile_id),
+            status="failed" if cleanup_errors else "completed",
+            error=", ".join(cleanup_errors) if cleanup_errors else None,
+        )

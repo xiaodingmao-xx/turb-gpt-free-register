@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 import string
 import time
 import uuid
@@ -2252,6 +2253,8 @@ def _existing_login_is_incomplete(driver) -> bool:
 def login_existing_account_with_otp(driver, email: str, *, progress_callback=None) -> dict:
     """登录已注册账号并返回 ChatGPT session，不执行注册、资料补全或设置密码。"""
     progress = progress_callback or (lambda message: None)
+    progress("[浏览器查活] phase=login_start status=started")
+    progress("[浏览器查活] phase=page_load host=chatgpt.com path=/auth/login status=started")
     _safe_get(
         driver,
         "https://chatgpt.com/auth/login",
@@ -2259,8 +2262,9 @@ def login_existing_account_with_otp(driver, email: str, *, progress_callback=Non
         attempts=2,
         accept_hosts=("chatgpt.com", "auth.openai.com"),
     )
+    progress("[浏览器查活] phase=page_load host=chatgpt.com path=/auth/login status=completed")
     _maybe_accept(driver)
-    existing = _read_chatgpt_session_once(driver)
+    existing = _read_chatgpt_session_once(driver, progress_callback=progress)
     if existing:
         progress("[浏览器查活] 已检测到现有 ChatGPT session")
         return existing
@@ -2280,7 +2284,7 @@ def login_existing_account_with_otp(driver, email: str, *, progress_callback=Non
             raise RoxyExistingLoginError(
                 "account_incomplete", "账号登录进入未完成注册资料页", retryable=False
             )
-        progress(f"[浏览器查活] 等待邮箱 OTP attempt={attempt}/3")
+        progress(f"[浏览器查活] phase=otp_wait attempt={attempt}/3 status=started")
         try:
             code = wait_for_otp(email, after_ts=otp_after_ts, otp_baseline=otp_baseline)
         except Exception as exc:
@@ -2293,12 +2297,14 @@ def login_existing_account_with_otp(driver, email: str, *, progress_callback=Non
 
         _clear_otp_inputs(driver)
         _type_otp(driver, code)
+        progress(f"[浏览器查活] phase=otp_wait attempt={attempt}/3 status=received")
         try:
             _click_continue(driver)
         except Exception:
             logger.info("%s 浏览器查活 OTP 页面没有显式提交按钮，继续观察页面状态", _log_prefix(driver))
         outcome = _wait_after_email_otp_submit(driver, timeout=12)
         if outcome == "accepted":
+            progress(f"[浏览器查活] phase=otp_wait attempt={attempt}/3 status=accepted")
             break
         if attempt >= 3:
             raise RoxyExistingLoginError("otp_invalid", "邮箱验证码连续无效或过期", retryable=True)
@@ -2308,21 +2314,65 @@ def login_existing_account_with_otp(driver, email: str, *, progress_callback=Non
 
     if _existing_login_is_incomplete(driver):
         raise RoxyExistingLoginError("account_incomplete", "账号登录进入未完成注册资料页", retryable=False)
-    progress("[浏览器查活] OTP 已验证，等待 ChatGPT session")
-    return _fetch_chatgpt_session(driver, timeout=90)
+    progress("[浏览器查活] phase=callback status=waiting")
+    return _fetch_chatgpt_session(driver, timeout=90, progress_callback=progress)
 
 
-def _read_chatgpt_session_once(driver) -> dict | None:
+def _safe_session_probe_summary(value: object) -> str:
+    text = str(value or "")
+    text = re.sub(r"https?://[^\s]+", "<url>", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(
+        r'(?i)(["\']?(?:accessToken|authorization|cookie|proxyUserName|proxyPassword|password|passwd|token|secret|otp|code|state)["\']?\s*[:=]\s*)(["\'][^"\']*["\']|[^,\s}]+)',
+        r'\1<redacted>',
+        text,
+    )
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:160]
+
+
+def _read_chatgpt_session_once(
+    driver, *, progress_callback=None, probe_callback=None,
+) -> dict | None:
     """当前页面必须在 chatgpt.com；读取 /api/auth/session，拿不到 token 返回 None。"""
     script = r"""
     const done = arguments[0];
     fetch('/api/auth/session', {credentials: 'include'})
-      .then(r => r.json())
-      .then(j => done({ok: true, data: j}))
-      .catch(e => done({ok: false, error: String(e)}));
+      .then(async r => {
+        const raw = await r.text();
+        let data = {};
+        try { data = raw ? JSON.parse(raw) : {}; } catch (_) {}
+        done({
+          ok: r.ok,
+          http_status: r.status,
+          content_type: r.headers.get('content-type') || '',
+          title: document.title || '',
+          summary: raw.slice(0, 160),
+          data,
+        });
+      })
+      .catch(e => done({ok: false, http_status: 0, summary: String(e)}));
     """
     result = driver.execute_async_script(script)
-    if result and result.get("ok"):
+    if not isinstance(result, dict):
+        result = {"ok": False, "http_status": 0, "summary": "driver returned no result"}
+    if probe_callback:
+        probe_callback(result)
+    http_status = int(result.get("http_status") or 0)
+    if progress_callback:
+        data = result.get("data") if isinstance(result.get("data"), dict) else {}
+        if data.get("accessToken"):
+            summary = "session payload contains accessToken"
+        else:
+            summary = _safe_session_probe_summary(result.get("summary") or result.get("title"))
+            if data:
+                summary = f"{summary or 'session payload'} keys={','.join(sorted(str(k) for k in data.keys())[:20])}"
+        progress_callback(
+            "[浏览器查活] phase=session_probe request=GET /api/auth/session "
+            f"http_status={http_status or 'unknown'} content_type={result.get('content_type') or '-'} "
+            f"response_summary={summary or '-'} retryable=true"
+        )
+    if result.get("ok"):
         data = result.get("data") or {}
         if data.get("accessToken"):
             logger.info("%s /api/auth/session 已返回 accessToken", _log_prefix(driver))
@@ -2357,7 +2407,13 @@ def _switch_to_chatgpt_window_if_any(driver) -> bool:
     return False
 
 
-def _fetch_chatgpt_session(driver, timeout: int = 90, auto_jump_wait: int = 15) -> dict:
+def _fetch_chatgpt_session(
+    driver,
+    timeout: int = 90,
+    auto_jump_wait: int = 15,
+    *,
+    progress_callback=None,
+) -> dict:
     """等待页面完成跳转并从 ChatGPT 页面内读取登录 session/accessToken。
 
     旧逻辑会在 auth.openai.com 上一直等到总超时，Cloak/部分 Chromium 场景下
@@ -2367,7 +2423,16 @@ def _fetch_chatgpt_session(driver, timeout: int = 90, auto_jump_wait: int = 15) 
     end = time.time() + timeout
     auto_jump_end = time.time() + max(3, int(auto_jump_wait or 15))
     last_data = None
+    last_probe = {"http_status": None, "summary": "session 暂无 accessToken"}
     forced_chatgpt_open = False
+    last_callback_location = None
+
+    def remember_probe(value):
+        if isinstance(value, dict):
+            last_probe.update({
+                "http_status": value.get("http_status"),
+                "summary": value.get("summary") or value.get("title") or "session 暂无 accessToken",
+            })
 
     while time.time() < end:
         try:
@@ -2381,8 +2446,12 @@ def _fetch_chatgpt_session(driver, timeout: int = 90, auto_jump_wait: int = 15) 
             elif time.time() >= auto_jump_end and not forced_chatgpt_open:
                 try:
                     logger.info("%s 未在 %ss 内观察到当前窗口跳转 chatgpt.com，主动打开 ChatGPT 内读取 session", _log_prefix(driver), int(auto_jump_wait or 15))
+                    if progress_callback:
+                        progress_callback("[浏览器查活] phase=page_load host=chatgpt.com path=/ status=started")
                     _safe_get(driver, "https://chatgpt.com/", timeout=35, attempts=2, accept_hosts=("chatgpt.com",))
                     forced_chatgpt_open = True
+                    if progress_callback:
+                        progress_callback("[浏览器查活] phase=page_load host=chatgpt.com path=/ status=completed")
                     time.sleep(3)
                     current = str(getattr(driver, "current_url", "") or "")
                 except Exception as exc:
@@ -2392,8 +2461,21 @@ def _fetch_chatgpt_session(driver, timeout: int = 90, auto_jump_wait: int = 15) 
                 continue
 
         if 'chatgpt.com' in current:
+            if progress_callback:
+                parsed = urlparse(current)
+                location = (parsed.hostname or "", parsed.path or "/")
+                if location != last_callback_location:
+                    progress_callback(
+                        "[浏览器查活] phase=callback "
+                        f"host={location[0] or '-'} path={location[1]} status=observed"
+                    )
+                    last_callback_location = location
             try:
-                data = _read_chatgpt_session_once(driver)
+                data = _read_chatgpt_session_once(
+                    driver,
+                    progress_callback=progress_callback,
+                    probe_callback=remember_probe,
+                )
                 if data:
                     return data
                 last_data = "session 暂无 accessToken"
@@ -2401,7 +2483,23 @@ def _fetch_chatgpt_session(driver, timeout: int = 90, auto_jump_wait: int = 15) 
                 last_data = f"{type(exc).__name__}: {exc}"
         time.sleep(2)
 
-    raise RuntimeError(f"等待 /api/auth/session accessToken 超时，最后响应: {str(last_data)[:800]}")
+    if int(last_probe.get("http_status") or 0) == 403:
+        probe_text = str(last_probe.get("summary") or "").lower()
+        failure_kind = (
+            "cloudflare_blocked"
+            if any(marker in probe_text for marker in ("cloudflare", "challenge", "verify"))
+            else "access_denied"
+        )
+        raise RoxyExistingLoginError(
+            failure_kind,
+            "session_probe http_status=403，登录态接口被拒绝："
+            f"{_safe_session_probe_summary(last_probe.get('summary'))}",
+            retryable=True,
+        )
+    raise RuntimeError(
+        "等待 /api/auth/session accessToken 超时，最后响应: "
+        f"{_safe_session_probe_summary(last_data or last_probe.get('summary'))}"
+    )
 
 
 def _check_manual_stop() -> None:
