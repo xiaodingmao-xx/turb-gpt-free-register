@@ -126,6 +126,27 @@ class WebUiAccountFeatureTests(unittest.TestCase):
         self.assertIn("live_check_failure_kind", html)
         self.assertIn("浏览器查活默认单并发", html)
 
+    def test_account_template_contains_browser_queue_and_token_polling(self):
+        template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"
+        html = template.read_text(encoding="utf-8")
+
+        self.assertIn('id="browserLiveCheckQueueStatusV2"', html)
+        self.assertIn("/api/accounts/live-check-status?ids=", html)
+        self.assertIn("function pollBrowserLiveCheckStatuses", html)
+        self.assertIn("function startBrowserLiveCheckPolling", html)
+        self.assertIn("setInterval(pollBrowserLiveCheckStatuses, 2000)", html)
+        self.assertIn("browserLiveCheckPollingIds.delete", html)
+        self.assertIn("clearInterval(browserLiveCheckTimer)", html)
+        self.assertIn("renderBrowserLiveCheckQueue", html)
+
+    def test_account_template_uses_started_ids_for_browser_polling(self):
+        template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"
+        html = template.read_text(encoding="utf-8")
+        self.assertIn("startBrowserLiveCheckPolling((r.started || []).map(item => item.id))", html)
+        self.assertIn("Object.assign(row, next)", html)
+        self.assertIn("live_check_status", html)
+        self.assertIn("has_access_token", html)
+
     @patch("webui.app.db.list_generic_api_email_pool")
     def test_pool_search_failure_only_matches_failed_status(self, list_pool):
         list_pool.return_value = [
