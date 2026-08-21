@@ -157,6 +157,13 @@ class WebUiAccountFeatureTests(unittest.TestCase):
         self.assertIn("复制取件地址", html)
         self.assertIn("复制整行", html)
 
+    def test_copy_email_name_actions_use_pickup_address_button_style(self):
+        template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"
+        html = template.read_text(encoding="utf-8")
+
+        self.assertIn('class="acc-v2-pickup-copy" data-account-copy-email=', html)
+        self.assertIn('class="acc-v2-pickup-copy" data-pool-copy-email=', html)
+
     def test_pool_template_keeps_full_line_copy_action(self):
         template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"
         html = template.read_text(encoding="utf-8")

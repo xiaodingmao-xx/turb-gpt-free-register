@@ -3608,7 +3608,7 @@ function renderAccounts() {
       <td class="col-email" title="${esc(r.email || '')}">
         <div class="acc-v2-email">${esc(r.email)}${r.archived ? ' <span class="pill status-used" title="该账号已归档">归档</span>' : ''}</div>
         <div class="acc-v2-sub">${esc(r.user_name || '-')}</div>
-        <button type="button" class="acc-v2-email-copy" data-account-copy-email="${esc(r.id)}">复制邮箱名称</button>
+        <button type="button" class="acc-v2-pickup-copy" data-account-copy-email="${esc(r.id)}">复制邮箱名称</button>
         ${r.pickup_address_available ? `<button type="button" class="acc-v2-pickup-copy" data-account-copy-pickup-address="${esc(r.id)}">复制取件地址</button>` : '<div class="acc-v2-pickup acc-v2-muted">未设置取件地址</div>'}
       </td>
       <td class="col-source">${esc(r.email_source || '-')}</td>
@@ -5206,7 +5206,7 @@ function renderOutlook() {
       <td class="col-email" title="${email}">
         <div class="acc-v2-email">${email || '-'}</div>
         <div class="acc-v2-sub" title="${esc(r.copy_line || '')}">${esc(short(r.copy_line, 70))}</div>
-        <button type="button" class="acc-v2-email-copy" data-pool-copy-email="${email}">复制邮箱名称</button>
+        <button type="button" class="acc-v2-pickup-copy" data-pool-copy-email="${email}">复制邮箱名称</button>
       </td>
       <td class="col-source">${esc(poolLabel(r.source))}</td>
       <td class="col-status">${pill(r.status)}</td>
