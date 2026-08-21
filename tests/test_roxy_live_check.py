@@ -82,6 +82,64 @@ def test_safe_diagnostics_remove_proxy_credentials():
     assert "json-token" not in json_safe
 
 
+def test_safe_response_summary_removes_html_and_session_secrets():
+    from core.roxy_live_check import safe_response_summary
+
+    summary = safe_response_summary(
+        '<html><title>Cloudflare</title><body>accessToken=secret-token '
+        'code=secret-code state=secret-state</body></html>'
+    )
+
+    assert len(summary) <= 160
+    assert "Cloudflare" in summary
+    assert "secret-token" not in summary
+    assert "secret-code" not in summary
+    assert "secret-state" not in summary
+    assert "<html>" not in summary
+
+
+def test_browser_phase_formatter_contains_403_diagnostics_without_profile_id():
+    from core.roxy_live_check import format_browser_phase, safe_profile_hint
+
+    line = format_browser_phase(
+        "session_probe", request="GET /api/auth/session", host="chatgpt.com",
+        http_status=403, route="proxy", proxy="socks5://proxy.example:1080",
+        profile_hint=safe_profile_hint("saved-profile"),
+        response_summary="Cloudflare challenge", retryable=True,
+    )
+
+    assert "phase=session_probe" in line
+    assert "request=GET /api/auth/session" in line
+    assert "http_status=403" in line
+    assert "route=proxy" in line
+    assert "saved-profile" not in line
+    assert "retryable=true" in line
+
+
+def test_session_probe_progress_reports_http_403_without_secret_text():
+    from core import roxy_registration
+
+    driver = Mock()
+    driver.execute_async_script.return_value = {
+        "ok": False,
+        "http_status": 403,
+        "content_type": "text/html",
+        "title": "Cloudflare",
+        "summary": "Cloudflare challenge accessToken=secret-token",
+    }
+    messages = []
+
+    result = roxy_registration._read_chatgpt_session_once(
+        driver, progress_callback=messages.append,
+    )
+
+    assert result is None
+    rendered = "\n".join(messages)
+    assert "phase=session_probe" in rendered
+    assert "http_status=403" in rendered
+    assert "secret-token" not in rendered
+
+
 def test_existing_account_login_returns_current_session_without_otp():
     from core.roxy_registration import login_existing_account_with_otp
 
@@ -267,3 +325,8 @@ def test_browser_live_check_progress_never_contains_session_secrets():
     assert sensitive_session["accessToken"] not in rendered
     assert "secret-code" not in rendered
     assert "secret-state" not in rendered
+    assert "phase=profile_open" in rendered
+    assert "phase=driver_start" in rendered
+    assert "phase=session_validate" in rendered
+    assert "phase=cleanup" in rendered
+    assert "saved-profile" not in rendered

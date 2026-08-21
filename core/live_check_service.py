@@ -12,7 +12,7 @@ from config import roxybrowser as roxy_cfg
 from core import db
 from core.account_liveness import check_account_liveness, log_path
 from core.chatgpt_plan import resolve_plan_check_route
-from core.roxy_live_check import check_account_liveness_with_roxy
+from core.roxy_live_check import check_account_liveness_with_roxy, safe_error_text
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +152,7 @@ def _browser_failure_result(error: object, *, failure_kind: str = "unknown", att
         "failure_kind": failure_kind,
         "retryable": True,
         "checked_at": datetime.now().isoformat(timespec="seconds"),
-        "error": f"{type(error).__name__}: {str(error)[:500]}",
+        "error": f"{type(error).__name__}: {safe_error_text(error)}",
         "attempt": max(1, int(attempt or 1)),
         "max_attempts": max(1, int(max_attempts or _browser_max_attempts())),
     }
@@ -172,7 +172,8 @@ def _run_browser_live_check(*, account_id: int, email: str, trigger: str) -> dic
     max_attempts = max(1, int(account.get("live_check_max_attempts") or _browser_max_attempts()))
     _append_log(
         email,
-        f"[浏览器查活] 开始执行 trigger={trigger} attempt={attempt}/{max_attempts}",
+        f"[浏览器查活] phase=driver_start account_id={account_id} status=started "
+        f"trigger={trigger} attempt={attempt}/{max_attempts}",
     )
     try:
         result = check_account_liveness_with_roxy(
@@ -198,17 +199,43 @@ def _run_browser_live_check(*, account_id: int, email: str, trigger: str) -> dic
 
 
 def _mark_browser_terminal(account_id: int, email: str, result: dict) -> None:
+    persisted = False
+    _append_log(
+        email,
+        f"[浏览器查活] phase=token_persist account_id={account_id} status=started "
+        f"fields=access_token,session result_ok={bool(result.get('ok'))}",
+    )
     try:
-        db.update_account_liveness(account_id, result)
+        persisted = bool(db.update_account_liveness(account_id, result))
     except Exception as exc:
         logger.exception("[浏览器查活] 写入终态失败 account_id=%s: %s", account_id, exc)
+    _append_log(
+        email,
+        f"[浏览器查活] phase=token_persist account_id={account_id} "
+        f"status={'success' if persisted else 'failed'} fields=access_token,session",
+    )
     try:
         if result.get("ok"):
-            _append_log(email, "[浏览器查活] 完成：账号正常，已刷新最新 AT/accessToken")
+            _append_log(
+                email,
+                f"[浏览器查活] phase=terminal account_id={account_id} status=live "
+                "failure_kind=- retryable=false message=账号正常，已刷新 Token",
+            )
         elif result.get("status") == "deactivated":
-            _append_log(email, f"[浏览器查活] 完成：账号已废 {result.get('error') or ''}")
+            _append_log(
+                email,
+                f"[浏览器查活] phase=terminal account_id={account_id} status=deactivated "
+                f"failure_kind={result.get('failure_kind') or 'unknown'} retryable=false "
+                f"message={safe_error_text(result.get('error') or '')}",
+            )
         else:
-            _append_log(email, f"[浏览器查活] 完成：失败 {result.get('failure_kind') or ''} {result.get('error') or ''}")
+            _append_log(
+                email,
+                f"[浏览器查活] phase=terminal account_id={account_id} status=failed "
+                f"failure_kind={result.get('failure_kind') or 'unknown'} "
+                f"retryable={bool(result.get('retryable'))} "
+                f"message={safe_error_text(result.get('error') or '')}",
+            )
     except Exception:
         pass
 
@@ -231,8 +258,9 @@ def _schedule_browser_retry(*, account_id: int, email: str, trigger: str, result
         return False
     _append_log(
         email,
-        f"[浏览器查活] 可重试失败，已安排第 {attempt + 1}/{max_attempts} 次，等待 {delay}s "
-        f"failure_kind={result.get('failure_kind') or 'unknown'}",
+        f"[浏览器查活] phase=retry account_id={account_id} status=scheduled "
+        f"attempt={attempt + 1}/{max_attempts} delay={delay}s next_retry_at={next_retry_at} "
+        f"failure_kind={result.get('failure_kind') or 'unknown'} retryable=true",
     )
 
     def arm_timer(seconds: float) -> bool:
@@ -331,7 +359,13 @@ def enqueue_account_live_check(
         slots.release()
         return {"accepted": False, "busy": True, "error": "该账号正在查活"}
 
-    _append_log(email, f"[查活] 已入队 account_id={account_id} trigger={trigger} mode={normalized_mode}", clear=True)
+    log_prefix = "[浏览器查活]" if normalized_mode == "browser" else "[查活]"
+    _append_log(
+        email,
+        f"{log_prefix} phase=queue account_id={account_id} status=queued "
+        f"trigger={trigger} mode={normalized_mode}",
+        clear=True,
+    )
     try:
         if normalized_mode == "browser":
             executor.submit(
