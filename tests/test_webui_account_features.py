@@ -147,6 +147,22 @@ class WebUiAccountFeatureTests(unittest.TestCase):
         self.assertIn("live_check_status", html)
         self.assertIn("has_access_token", html)
 
+    def test_account_and_pool_templates_expose_copy_email_name_actions(self):
+        template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"
+        html = template.read_text(encoding="utf-8")
+
+        self.assertIn("data-account-copy-email", html)
+        self.assertIn("data-pool-copy-email", html)
+        self.assertGreaterEqual(html.count("复制邮箱名称"), 2)
+        self.assertIn("复制取件地址", html)
+        self.assertIn("复制整行", html)
+
+    def test_pool_template_keeps_full_line_copy_action(self):
+        template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"
+        html = template.read_text(encoding="utf-8")
+        self.assertIn("cbtn('复制邮箱', r.copy_line", html)
+        self.assertIn("copyText(email)", html)
+
     @patch("webui.app.db.list_generic_api_email_pool")
     def test_pool_search_failure_only_matches_failed_status(self, list_pool):
         list_pool.return_value = [

@@ -3608,6 +3608,7 @@ function renderAccounts() {
       <td class="col-email" title="${esc(r.email || '')}">
         <div class="acc-v2-email">${esc(r.email)}${r.archived ? ' <span class="pill status-used" title="该账号已归档">归档</span>' : ''}</div>
         <div class="acc-v2-sub">${esc(r.user_name || '-')}</div>
+        <button type="button" class="acc-v2-email-copy" data-account-copy-email="${esc(r.id)}">复制邮箱名称</button>
         ${r.pickup_address_available ? `<button type="button" class="acc-v2-pickup-copy" data-account-copy-pickup-address="${esc(r.id)}">复制取件地址</button>` : '<div class="acc-v2-pickup acc-v2-muted">未设置取件地址</div>'}
       </td>
       <td class="col-source">${esc(r.email_source || '-')}</td>
@@ -4075,6 +4076,24 @@ async function onAccountsBodyClick(e) {
       showToast('读取密码失败: ' + err.message);
     } finally {
       passwordToggle.disabled = false;
+    }
+    return;
+  }
+
+  const emailCopyBtn = e.target.closest('[data-account-copy-email]');
+  if (emailCopyBtn) {
+    const id = Number(emailCopyBtn.dataset.accountCopyEmail);
+    const account = ACCOUNTS.find(row => Number(row.id) === id);
+    const email = account?.email || '';
+    emailCopyBtn.disabled = true;
+    try {
+      if (!email) { showToast('该账号没有邮箱名称'); return; }
+      await copyText(email);
+      showToast('邮箱名称已复制');
+    } catch(err) {
+      showToast('复制邮箱名称失败: ' + err.message);
+    } finally {
+      emailCopyBtn.disabled = false;
     }
     return;
   }
@@ -5187,6 +5206,7 @@ function renderOutlook() {
       <td class="col-email" title="${email}">
         <div class="acc-v2-email">${email || '-'}</div>
         <div class="acc-v2-sub" title="${esc(r.copy_line || '')}">${esc(short(r.copy_line, 70))}</div>
+        <button type="button" class="acc-v2-email-copy" data-pool-copy-email="${email}">复制邮箱名称</button>
       </td>
       <td class="col-source">${esc(poolLabel(r.source))}</td>
       <td class="col-status">${pill(r.status)}</td>
@@ -5272,6 +5292,22 @@ async function onOutlookBodyClick(e) {
     return;
   }
   if (e.target.closest('.acc-v2-more-menu')) closeOutlookV2MoreMenus();
+
+  const poolCopyEmailBtn = e.target.closest('[data-pool-copy-email]');
+  if (poolCopyEmailBtn) {
+    const email = poolCopyEmailBtn.dataset.poolCopyEmail || '';
+    poolCopyEmailBtn.disabled = true;
+    try {
+      if (!email) { showToast('邮箱名称为空'); return; }
+      await copyText(email);
+      showToast('邮箱名称已复制');
+    } catch(err) {
+      showToast('复制邮箱名称失败: ' + err.message);
+    } finally {
+      poolCopyEmailBtn.disabled = false;
+    }
+    return;
+  }
 
   const t = e.target.closest('[data-pool-act]');
   if (!t) return;
