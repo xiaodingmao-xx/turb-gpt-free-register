@@ -13,11 +13,11 @@ class WebUiAccountFeatureTests(unittest.TestCase):
         self.client.environ_base["HTTP_X_AUTH_CODE"] = "test-auth"
 
     @patch("webui.app.live_check_service.enqueue_account_live_check")
-    @patch("webui.app.live_check_service.queue_settings")
+    @patch("webui.app.live_check_service.queue_status")
     @patch("webui.app.db.get_account")
-    def test_browser_live_check_bulk_forwards_explicit_mode(self, get_account, queue_settings, enqueue):
+    def test_browser_live_check_bulk_forwards_explicit_mode(self, get_account, queue_status, enqueue):
         get_account.return_value = {"id": 7, "email": "user@example.com"}
-        queue_settings.return_value = {"backend": "browser", "workers": 1, "queue_limit": 100}
+        queue_status.return_value = {"backend": "browser", "workers": 1, "queue_limit": 100}
         enqueue.return_value = {
             "accepted": True,
             "account_id": 7,
@@ -42,7 +42,7 @@ class WebUiAccountFeatureTests(unittest.TestCase):
             proxy=None,
             mode="browser",
         )
-        queue_settings.assert_called_once_with("browser")
+        queue_status.assert_called_once_with("browser")
 
     @patch("webui.app.live_check_service.enqueue_account_live_check")
     def test_live_check_bulk_rejects_auto_mode_before_enqueue(self, enqueue):
@@ -64,6 +64,56 @@ class WebUiAccountFeatureTests(unittest.TestCase):
         response = self.client.post("/api/accounts/check-live-bulk", json={"account_ids": [7]})
         self.assertEqual(response.status_code, 202)
         self.assertEqual(response.get_json()["mode"], "protocol")
+
+    @patch("webui.app.live_check_service.queue_status")
+    @patch("webui.app.db.get_account")
+    def test_live_check_status_returns_compact_account_state_and_queue(self, get_account, queue_status):
+        get_account.return_value = {
+            "id": 146,
+            "email": "user@example.com",
+            "access_token": "secret-token",
+            "live_check_status": "running",
+            "live_check_backend": "browser",
+            "live_check_attempt": 1,
+            "live_check_max_attempts": 3,
+        }
+        queue_status.return_value = {
+            "backend": "browser", "active": 1, "queued": 5, "waiting": 4,
+            "delayed": 1, "available_workers": 0,
+            "running_accounts": [{"id": 146, "email": "user@example.com"}],
+            "positions": {"147": 1},
+        }
+
+        response = self.client.get("/api/accounts/live-check-status?ids=146&mode=browser")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["items"][0]["live_check_status"], "running")
+        self.assertTrue(payload["items"][0]["has_access_token"])
+        self.assertNotIn("access_token", payload["items"][0])
+        self.assertEqual(payload["queue"]["queued"], 5)
+        queue_status.assert_called_once_with("browser")
+
+    def test_live_check_status_rejects_invalid_mode(self):
+        response = self.client.get("/api/accounts/live-check-status?mode=auto")
+        self.assertEqual(response.status_code, 400)
+
+    @patch("webui.app.live_check_service.queue_status")
+    @patch("webui.app.live_check_service.enqueue_account_live_check")
+    @patch("webui.app.db.get_account")
+    def test_browser_live_check_bulk_returns_queue_snapshot(self, get_account, enqueue, queue_status):
+        get_account.return_value = {"id": 7, "email": "user@example.com"}
+        enqueue.return_value = {"accepted": True, "account_id": 7, "email": "user@example.com"}
+        queue_status.return_value = {"backend": "browser", "active": 1, "queued": 1}
+
+        response = self.client.post(
+            "/api/accounts/check-live-bulk",
+            json={"account_ids": [7], "mode": "browser"},
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.get_json()["queue"]["queued"], 1)
+        queue_status.assert_called_once_with("browser")
 
     def test_account_template_exposes_protocol_and_browser_live_check_actions(self):
         template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"

@@ -153,8 +153,10 @@ def _compact_account_for_list(row: dict) -> dict:
         "twofa_setup_completed_at", "twofa_setup_attempt",
         "twofa_setup_max_attempts", "twofa_setup_last_error",
         "twofa_setup_next_retry_at",
-        "live_check_backend", "live_check_failure_kind", "live_check_attempt",
+        "live_check_ok", "live_check_backend", "live_check_failure_kind", "live_check_attempt",
         "live_check_max_attempts", "live_check_next_retry_at", "live_check_profile_source",
+        "live_check_trigger", "live_check_queued_at", "live_check_started_at",
+        "live_check_completed_at",
     ):
         if key in row:
             out[key] = row.get(key)
@@ -888,6 +890,36 @@ def create_app(auth_code: str | None = None) -> Flask:
             "queue": twofa_task_service.queue_settings(),
         })
 
+    @app.get("/api/accounts/live-check-status")
+    def api_accounts_live_check_status():
+        """返回账号页轮询所需的查活状态和指定后端队列，不返回 Token。"""
+        try:
+            mode = live_check_service.normalize_live_check_mode(
+                request.args.get("mode") or "browser"
+            )
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+
+        raw_ids = str(request.args.get("ids") or "").strip()
+        ids = []
+        for raw in raw_ids.split(",") if raw_ids else []:
+            try:
+                ids.append(int(raw))
+            except (TypeError, ValueError):
+                continue
+
+        items = []
+        for acc_id in dict.fromkeys(ids):
+            row = db.get_account(acc_id)
+            if row:
+                items.append(_compact_account_for_list(row))
+        return jsonify({
+            "ok": True,
+            "mode": mode,
+            "items": items,
+            "queue": live_check_service.queue_status(mode),
+        })
+
     @app.post("/api/accounts/check-live-bulk")
     def api_accounts_check_live_bulk():
         """批量查活：按显式 mode 加入协议或 Roxy 浏览器后台队列。"""
@@ -962,7 +994,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             "failed_count": len(failed),
             "skipped": skipped,
             "mode": mode,
-            "queue": live_check_service.queue_settings(mode),
+            "queue": live_check_service.queue_status(mode),
         }), 202
 
 
