@@ -12,7 +12,7 @@ from pathlib import Path
 
 from config import proxy as proxy_cfg
 from core import db
-from core.chatgpt_plan import check_account_plan
+from core.chatgpt_plan import check_account_plan, format_plan_phase, safe_plan_log_text
 
 logger = logging.getLogger(__name__)
 
@@ -88,12 +88,25 @@ def _run_plan_check(
         if not db.mark_account_plan_check_running(account_id):
             return {"ok": False, "error": "账号已删除或套餐查询状态已被重置"}
 
-        _append_log(email, f"[Plan] 开始后台查询 trigger={trigger}")
+        _append_log(
+            email,
+            format_plan_phase(
+                "worker_start",
+                account_id=account_id,
+                trigger=trigger,
+                status="started",
+            ),
+        )
         _wait_for_rate_slot()
+
+        def progress(message: object) -> None:
+            _append_log(email, safe_plan_log_text(message, 500))
+
         result = check_account_plan(
             access_token,
             proxy=proxy,
             timezone_offset_min=timezone_offset_min,
+            progress_callback=progress,
         )
 
         recheck_delay = _registration_recheck_delay()
@@ -105,6 +118,15 @@ def _run_plan_check(
             and not bool(result.get("plus_trial_eligible"))
         )
         if should_recheck:
+            _append_log(
+                email,
+                format_plan_phase(
+                    "recheck",
+                    status="scheduled",
+                    delay=f"{recheck_delay}s",
+                    reason="registration_free_without_plus_trial",
+                ),
+            )
             logger.info("[Plan] 新账号暂未发现 Plus 试用资格，%.1fs 后复查一次: %s", recheck_delay, email)
             time.sleep(recheck_delay)
             _wait_for_rate_slot()
@@ -113,10 +135,19 @@ def _run_plan_check(
                 proxy=proxy,
                 timezone_offset_min=timezone_offset_min,
                 max_attempts=1,
+                progress_callback=progress,
             )
             if recheck_result.get("ok"):
                 result = recheck_result
             else:
+                _append_log(
+                    email,
+                    format_plan_phase(
+                        "recheck",
+                        status="failed",
+                        error=safe_plan_log_text(recheck_result.get("error") or "unknown"),
+                    ),
+                )
                 logger.warning(
                     "[Plan] 新账号资格复查失败，保留首次成功结果: %s, %s",
                     email,
@@ -125,16 +156,41 @@ def _run_plan_check(
 
         _append_log(
             email,
-            "[Plan] 请求完成 "
-            f"ok={bool(result.get('ok'))} "
-            f"http_status={result.get('http_status') or '-'} "
-            f"network_route={result.get('network_route') or '-'} "
-            f"proxy_mode={result.get('proxy_mode') or '-'} "
-            f"proxy_used={result.get('proxy_used') or '-'} "
-            f"attempt={result.get('attempt_count') or '-'} "
-            f"error={str(result.get('error') or '-')[:300]}"
+            format_plan_phase(
+                "result",
+                status="success" if result.get("ok") else "failed",
+                ok=bool(result.get("ok")),
+                http_status=result.get("http_status") or "-",
+                network_route=result.get("network_route") or "-",
+                proxy_mode=result.get("proxy_mode") or "-",
+                proxy_used=result.get("proxy_used") or "-",
+                proxy_ip=result.get("proxy_ip") or "-",
+                exit_ip=result.get("plan_exit_ip") or "-",
+                exit_country=result.get("plan_exit_country") or "-",
+                plan=result.get("current_plan_type") or "-",
+                plus_trial_eligible=bool(result.get("plus_trial_eligible")),
+                attempt=f"{result.get('attempt_count') or '-'}/{result.get('max_attempts') or '-'}",
+                retryable=bool(result.get("retryable")),
+                error=safe_plan_log_text(result.get("error") or "-"),
+            ),
         )
-        db.update_account_plan_check(acc_id=account_id, result=result)
+        _append_log(
+            email,
+            format_plan_phase(
+                "persist",
+                status="started",
+                fields="plan_check_status,current_plan_type,plus_trial_eligible",
+            ),
+        )
+        persisted = bool(db.update_account_plan_check(acc_id=account_id, result=result))
+        _append_log(
+            email,
+            format_plan_phase(
+                "persist",
+                status="success" if persisted else "failed",
+                fields="plan_check_status,current_plan_type,plus_trial_eligible",
+            ),
+        )
         if result.get("ok"):
             logger.info(
                 "[Plan] 后台查询成功: %s, plan=%s, plus_trial=%s, trigger=%s",
@@ -152,12 +208,22 @@ def _run_plan_check(
             )
         return result
     except Exception as exc:
+        safe_error = safe_plan_log_text(exc, 300)
         result = {
             "ok": False,
             "checked_at": datetime.now().isoformat(timespec="seconds"),
-            "error": f"{type(exc).__name__}: {str(exc)[:180]}",
+            "error": f"{type(exc).__name__}: {safe_error}",
         }
-        _append_log(email, f"[Plan] 后台异常 {result['error']}")
+        _append_log(
+            email,
+            format_plan_phase(
+                "terminal",
+                status="failed",
+                failure_kind=type(exc).__name__,
+                retryable=True,
+                error=result["error"],
+            ),
+        )
         try:
             db.update_account_plan_check(acc_id=account_id, result=result)
         except Exception:
@@ -190,7 +256,16 @@ def enqueue_account_plan_check(
         _QUEUE_SLOTS.release()
         return {"accepted": False, "busy": True, "error": "该账号正在查询套餐"}
 
-    _append_log(email, f"[Plan] 已入队 account_id={account_id} trigger={trigger}", clear=True)
+    _append_log(
+        email,
+        format_plan_phase(
+            "queue",
+            account_id=account_id,
+            trigger=trigger,
+            status="queued",
+        ),
+        clear=True,
+    )
     try:
         _EXECUTOR.submit(
             _run_plan_check,
@@ -206,9 +281,18 @@ def enqueue_account_plan_check(
         result = {
             "ok": False,
             "checked_at": datetime.now().isoformat(timespec="seconds"),
-            "error": f"套餐查询入队失败: {type(exc).__name__}: {str(exc)[:160]}",
+            "error": f"套餐查询入队失败: {type(exc).__name__}: {safe_plan_log_text(exc, 160)}",
         }
         db.update_account_plan_check(acc_id=account_id, result=result)
+        _append_log(
+            email,
+            format_plan_phase(
+                "queue",
+                account_id=account_id,
+                status="failed",
+                error=result["error"],
+            ),
+        )
         return {"accepted": False, "busy": False, "error": result["error"]}
 
     return {

@@ -6,6 +6,7 @@ import base64
 import ipaddress
 import json
 import logging
+import re
 import socket
 import time
 from datetime import datetime, timezone
@@ -47,6 +48,67 @@ def _mask_proxy(proxy: str) -> str:
         return f"{scheme}{auth}{host}{port}" or "***"
     except Exception:
         return "***"
+
+
+def safe_plan_log_text(value: object, limit: int = 240) -> str:
+    """压缩并脱敏套餐查询日志文本，不写入 Token/凭据/完整响应。"""
+    text = str(value or "")
+
+    def strip_url(match):
+        try:
+            parsed = urlparse(match.group(0))
+            host = parsed.hostname or ""
+            port = f":{parsed.port}" if parsed.port else ""
+            return f"{parsed.scheme}://{host}{port}{parsed.path or ''}"
+        except Exception:
+            return "<url>"
+
+    text = re.sub(r"https?://[^\s]+", strip_url, text)
+    sensitive_keys = (
+        "accessToken|access_token|authorization|cookie|proxyUserName|proxyPassword|"
+        "password|passwd|refreshToken|refresh_token|token|secret|otp|code|state"
+    )
+    text = re.sub(
+        rf'(?i)(["\']?(?:{sensitive_keys})["\']?\s*[:=]\s*)(["\'][^"\']*["\']|[^,\s}}]+)',
+        r'\1<redacted>',
+        text,
+    )
+    text = re.sub(
+        r"\b(eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+)\b",
+        "<jwt-redacted>",
+        text,
+    )
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:max(1, int(limit))]
+
+
+def format_plan_phase(phase: str, **fields) -> str:
+    """生成统一的套餐查询阶段日志行。"""
+    parts = [f"[Plan] phase={str(phase or 'unknown').strip() or 'unknown'}"]
+    for key, value in fields.items():
+        if value is None or value == "":
+            continue
+        rendered = "true" if value is True else "false" if value is False else safe_plan_log_text(value)
+        parts.append(f"{key}={rendered}")
+    return " ".join(parts)
+
+
+def _proxy_log_fields(proxy: str) -> dict[str, str]:
+    """提取代理 IP/端口；不返回代理用户名和密码。"""
+    value = str(proxy or "").strip()
+    if not value:
+        return {}
+    try:
+        parsed = urlparse(value if "://" in value else f"//{value}")
+        fields = {}
+        if parsed.hostname:
+            fields["proxy_ip"] = parsed.hostname
+        if parsed.port:
+            fields["proxy_port"] = str(parsed.port)
+        return fields
+    except Exception:
+        return {}
 
 
 def _local_proxy_status(proxy: str) -> tuple[bool, bool, str | None]:
@@ -403,8 +465,18 @@ def check_account_plan(
     timeout: float | None = None,
     max_attempts: int | None = None,
     retry_delay: float | None = None,
+    progress_callback=None,
 ) -> dict:
     token = normalize_token(token)
+
+    def emit(phase: str, **fields) -> None:
+        if not progress_callback:
+            return
+        try:
+            progress_callback(format_plan_phase(phase, **fields))
+        except Exception as exc:
+            logger.debug("套餐查询阶段日志写入失败 phase=%s error=%s", phase, safe_plan_log_text(exc))
+
     if not token:
         return {"ok": False, "checked_at": now_iso(), "error": "token 为空"}
     claims = token_claims(token)
@@ -421,6 +493,7 @@ def check_account_plan(
     try:
         route = resolve_plan_check_route(proxy)
     except Exception as exc:
+        emit("route", status="failed", error=safe_plan_log_text(exc), retryable=False)
         return {
             "ok": False,
             "checked_at": now_iso(),
@@ -429,10 +502,22 @@ def check_account_plan(
             **{k: v for k, v in claims.items() if k != "payload"},
         }
     route_meta = {k: v for k, v in route.items() if k != "proxy"}
+    proxy_fields = _proxy_log_fields(route.get("proxy") or route.get("proxy_used") or "")
+    route_meta.update(proxy_fields)
+    emit(
+        "route",
+        status="resolved",
+        network_route=route.get("network_route"),
+        proxy_mode=route.get("proxy_mode"),
+        proxy_used=route.get("proxy_used") or "-",
+        fallback_reason=route.get("proxy_fallback_reason") or "-",
+        **proxy_fields,
+    )
     url = f"https://chatgpt.com{ACCOUNTS_CHECK_PATH}?timezone_offset_min={quote(str(timezone_offset_min))}"
     try:
         timeout_seconds, attempts, base_delay = _plan_check_settings(timeout, max_attempts, retry_delay)
     except Exception as exc:
+        emit("settings", status="failed", error=safe_plan_log_text(exc), retryable=False)
         return {
             "ok": False,
             "checked_at": now_iso(),
@@ -449,6 +534,17 @@ def check_account_plan(
         resp = None
         exit_geo: dict[str, str] = {}
         try:
+            emit(
+                "request_start",
+                method="GET",
+                host="chatgpt.com",
+                path=ACCOUNTS_CHECK_PATH,
+                attempt=f"{attempt}/{attempts}",
+                timeout=f"{timeout_seconds}s",
+                network_route=route.get("network_route"),
+                proxy_ip=proxy_fields.get("proxy_ip"),
+                proxy_port=proxy_fields.get("proxy_port"),
+            )
             # 套餐查询只需要稳定的请求头，不需要额外访问 IP 地理信息接口。
             env = BrowserSession(proxy=route["proxy"], detect_exit_geo=False)
             exit_geo = _detect_plan_exit_geo(env.session)
@@ -462,18 +558,33 @@ def check_account_plan(
             http_status = int(resp.status_code)
             if not (200 <= http_status < 300):
                 is_auth_expired = http_status == 401
+                retryable = _retryable_plan_error(http_status)
+                emit(
+                    "response",
+                    http_status=http_status,
+                    content_type=(getattr(resp, "headers", {}) or {}).get("content-type") or "-",
+                    response_summary=safe_plan_log_text(response_text, 180) or "-",
+                    retryable=retryable,
+                )
                 last_result = {
                     "ok": False,
                     "checked_at": now_iso(),
                     "http_status": http_status,
                     "error": "AT已过期/失效，请手动查活刷新" if is_auth_expired else f"HTTP {http_status}",
-                    "response_preview": response_text[:500],
-                    "retryable": _retryable_plan_error(http_status),
+                    "response_preview": safe_plan_log_text(response_text, 500),
+                    "retryable": retryable,
                     "token_expired": True if is_auth_expired else claims.get("token_expired"),
                     "needs_live_check": True if is_auth_expired else False,
                     **exit_geo,
                 }
             else:
+                emit(
+                    "response",
+                    http_status=http_status,
+                    content_type=(getattr(resp, "headers", {}) or {}).get("content-type") or "-",
+                    response_summary=safe_plan_log_text(response_text, 180) or "-",
+                    retryable=False,
+                )
                 try:
                     data: Any = resp.json()
                 except Exception:
@@ -484,7 +595,7 @@ def check_account_plan(
                         "checked_at": now_iso(),
                         "http_status": http_status,
                         "error": "响应不是 JSON 对象",
-                        "response_preview": response_text[:500],
+                        "response_preview": safe_plan_log_text(response_text, 500),
                         "retryable": True,
                         **exit_geo,
                     }
@@ -497,14 +608,32 @@ def check_account_plan(
                     parsed["retryable"] = False
                     parsed.update(route_meta)
                     parsed.update(exit_geo)
+                    emit(
+                        "result",
+                        status="success",
+                        plan=parsed.get("current_plan_type") or "unknown",
+                        plus_trial_eligible=bool(parsed.get("plus_trial_eligible")),
+                        subscription=parsed.get("subscription_plan") or "none",
+                        eligibility_country=parsed.get("plan_eligibility_country") or "-",
+                        exit_ip=parsed.get("plan_exit_ip") or "-",
+                        exit_country=parsed.get("plan_exit_country") or "-",
+                        attempt=f"{attempt}/{attempts}",
+                    )
                     return parsed
         except Exception as exc:
             logger.debug("套餐查询失败: %s: %s", type(exc).__name__, exc, exc_info=True)
+            http_status = int(resp.status_code) if resp is not None and getattr(resp, "status_code", None) else None
+            emit(
+                "response",
+                http_status=http_status or "unknown",
+                response_summary=safe_plan_log_text(exc, 180) or type(exc).__name__,
+                retryable=True,
+            )
             last_result = {
                 "ok": False,
                 "checked_at": now_iso(),
-                "http_status": int(resp.status_code) if resp is not None and getattr(resp, "status_code", None) else None,
-                "error": f"{type(exc).__name__}: {exc}",
+                "http_status": http_status,
+                "error": f"{type(exc).__name__}: {safe_plan_log_text(exc, 300)}",
                 "retryable": True,
                 **exit_geo,
             }
@@ -525,6 +654,13 @@ def check_account_plan(
             **{k: v for k, v in claims.items() if k != "payload"},
         })
         if not last_result.get("retryable") or attempt >= attempts:
+            emit(
+                "retry",
+                status="not_scheduled",
+                attempt=f"{attempt}/{attempts}",
+                retryable=bool(last_result.get("retryable")),
+                reason=safe_plan_log_text(last_result.get("error") or "final attempt"),
+            )
             return last_result
 
         wait_seconds = _retry_wait_seconds(resp, base_delay, attempt)
@@ -534,6 +670,15 @@ def check_account_plan(
             attempts,
             wait_seconds,
             last_result.get("error"),
+        )
+        emit(
+            "retry",
+            status="scheduled",
+            attempt=f"{attempt}/{attempts}",
+            next_attempt=attempt + 1,
+            wait_seconds=wait_seconds,
+            retryable=True,
+            reason=safe_plan_log_text(last_result.get("error") or "temporary failure"),
         )
         if wait_seconds > 0:
             time.sleep(wait_seconds)
