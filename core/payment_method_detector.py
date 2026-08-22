@@ -37,6 +37,8 @@ def normalize_payment_method_token(value: Any) -> str:
         "kakao": "kakao_pay",
         "card_payment": "card",
         "direct_card": "card",
+        "external_gcash": "gcash",
+        "external_momo": "momo",
         "go_pay": "gopay",
         "grab_pay": "grabpay",
     }

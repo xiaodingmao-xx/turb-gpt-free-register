@@ -139,6 +139,108 @@ class WebUiAccountFeatureTests(unittest.TestCase):
         self.assertIn("clearInterval(browserLiveCheckTimer)", html)
         self.assertIn("renderBrowserLiveCheckQueue", html)
 
+    @patch("webui.app.gcash_check_service.queue_status")
+    @patch("webui.app.gcash_check_service.enqueue_account_gcash_check")
+    @patch("webui.app.db.get_account")
+    def test_gcash_check_single_forwards_only_stored_token(self, get_account, enqueue, queue_status):
+        get_account.return_value = {
+            "id": 7,
+            "email": "user@example.com",
+            "access_token": "secret-token",
+        }
+        enqueue.return_value = {
+            "accepted": True,
+            "account_id": 7,
+            "email": "user@example.com",
+            "status": "queued",
+        }
+        queue_status.return_value = {"running_count": 0, "queued_count": 1}
+
+        response = self.client.post("/api/accounts/7/gcash-check", json={})
+
+        self.assertEqual(response.status_code, 202)
+        self.assertTrue(response.get_json()["started"])
+        self.assertNotIn("secret-token", response.get_data(as_text=True))
+        enqueue.assert_called_once_with(7, "user@example.com", "secret-token", trigger="manual")
+
+    @patch("webui.app.gcash_check_service.queue_status")
+    @patch("webui.app.gcash_check_service.enqueue_account_gcash_check")
+    @patch("webui.app.db.get_account")
+    def test_gcash_check_bulk_returns_queue_snapshot(self, get_account, enqueue, queue_status):
+        get_account.side_effect = lambda account_id: {
+            "id": int(account_id),
+            "email": f"{account_id}@example.com",
+            "access_token": "stored-token",
+        }
+        enqueue.side_effect = lambda account_id, email, access_token, *, trigger: {
+            "accepted": True,
+            "account_id": account_id,
+            "email": email,
+            "status": "queued",
+        }
+        queue_status.return_value = {"running_count": 1, "queued_count": 2}
+
+        response = self.client.post("/api/accounts/gcash-check-bulk", json={"account_ids": [1, 2]})
+
+        self.assertEqual(response.status_code, 202)
+        payload = response.get_json()
+        self.assertEqual(payload["started_count"], 2)
+        self.assertEqual(payload["queue"]["queued_count"], 2)
+
+    @patch("webui.app.gcash_check_service.queue_status")
+    @patch("webui.app.db.get_account")
+    def test_gcash_check_status_returns_compact_state_without_token(self, get_account, queue_status):
+        get_account.return_value = {
+            "id": 7,
+            "email": "user@example.com",
+            "access_token": "secret-token",
+            "gcash_check_status": "running",
+            "gcash_check_decision": "unknown",
+        }
+        queue_status.return_value = {
+            "running_count": 1,
+            "queued_count": 0,
+            "running": [{"account_id": 7, "email": "user@example.com"}],
+            "queued": [],
+        }
+
+        response = self.client.get("/api/accounts/gcash-check-status?ids=7")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["items"][0]["gcash_check_status"], "running")
+        self.assertNotIn("access_token", payload["items"][0])
+        self.assertEqual(payload["queue"]["running_count"], 1)
+
+    @patch("webui.app.gcash_check_service.log_path")
+    @patch("webui.app.db.get_account_by_email")
+    def test_gcash_check_log_endpoint_returns_log_and_running_state(self, get_account, log_path):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "gcash-check-user.log"
+            path.write_text("13:00:00 [INFO] [GCash] phase=result decision=available\n", encoding="utf-8")
+            log_path.return_value = path
+            get_account.return_value = {
+                "id": 7,
+                "email": "user@example.com",
+                "gcash_check_status": "running",
+            }
+            response = self.client.get("/api/accounts/gcash-check-log?email=user%40example.com")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["running"])
+        self.assertIn("decision=available", payload["log"])
+
+    def test_account_template_exposes_gcash_check_queue_polling_and_log_action(self):
+        template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"
+        html = template.read_text(encoding="utf-8")
+        self.assertIn("查 GCash 资格", html)
+        self.assertIn("/api/accounts/gcash-check-status?ids=", html)
+        self.assertIn("function pollGcashCheckStatuses", html)
+        self.assertIn("gcash-check-log", html)
+        self.assertIn("running_count", html)
+        self.assertNotIn("index_legacy.html", html)
+
     def test_account_template_uses_started_ids_for_browser_polling(self):
         template = Path(__file__).resolve().parents[1] / "webui" / "templates" / "index.html"
         html = template.read_text(encoding="utf-8")

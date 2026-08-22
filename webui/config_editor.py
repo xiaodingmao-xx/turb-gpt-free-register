@@ -583,6 +583,43 @@ EDITABLE_FIELDS = [
         "key": "PLAN_CHECK_JITTER", "file": "proxy.py", "type": "float", "group": "代理池",
         "label": "套餐/Agent请求随机抖动(秒)", "help": "在查套餐和生成 Agent Token 的最小间隔上增加随机延迟，避免请求过于规律",
     },
+    # ---- GCash 资格查询 ----
+    {
+        "key": "GCASH_CHECK_ENABLED", "file": "gcash.py", "type": "bool", "group": "GCash资格",
+        "label": "GCash资格自动检测", "help": "默认关闭自动触发；新版账号页的“查 GCash 资格”按钮仍可手动执行",
+    },
+    {
+        "key": "GCASH_CHECK_COUNTRY", "file": "gcash.py", "type": "str", "group": "GCash资格",
+        "label": "检测国家", "help": "默认 PH；Checkout billing_details.country 使用该国家代码",
+    },
+    {
+        "key": "GCASH_CHECK_CURRENCY", "file": "gcash.py", "type": "str", "group": "GCash资格",
+        "label": "检测币种", "help": "默认 PHP；Checkout billing_details.currency 使用该币种",
+    },
+    {
+        "key": "GCASH_CHECK_TRIAL_DAYS", "file": "gcash.py", "type": "int", "group": "GCash资格",
+        "label": "试用天数", "help": "默认 0，只检查支付方式；大于 0 时同时记录 Checkout 是否实际应用试用",
+    },
+    {
+        "key": "GCASH_CHECK_TIMEOUT", "file": "gcash.py", "type": "float", "group": "GCash资格",
+        "label": "请求超时(秒)", "help": "GCash Checkout/Stripe init 单次请求超时，默认 20 秒",
+    },
+    {
+        "key": "GCASH_CHECK_MAX_ATTEMPTS", "file": "gcash.py", "type": "int", "group": "GCash资格",
+        "label": "最大尝试次数", "help": "网络失败时的最大尝试次数，默认 2；不会确认付款",
+    },
+    {
+        "key": "GCASH_CHECK_RETRY_DELAY", "file": "gcash.py", "type": "float", "group": "GCash资格",
+        "label": "重试间隔(秒)", "help": "网络失败重试前等待时间，默认 2 秒",
+    },
+    {
+        "key": "GCASH_CHECK_WORKERS", "file": "gcash.py", "type": "int", "group": "GCash资格",
+        "label": "查询并发数", "help": "GCash 后台查询线程数，默认 1",
+    },
+    {
+        "key": "GCASH_CHECK_QUEUE_LIMIT", "file": "gcash.py", "type": "int", "group": "GCash资格",
+        "label": "查询队列容量", "help": "GCash 查询最多同时排队/运行的任务数，默认 100",
+    },
     # ---- 提链 ----
     {
         "key": "EXTRACT_LINK_API_BASE", "file": "extract_link.py", "type": "str", "group": "提链",

@@ -611,6 +611,22 @@ Roxy profile，或在 profile 不存在时创建一个临时环境，通过邮�
 - 浏览器、网络、OTP 和 session 错误不会被判为废号；只有明确停用/删除/封禁信号会标记已废。
 - 查活失败保留旧 token。浏览器查活不能保证绕过第三方风控，也不会自动切换查活后端或网络出口。
 
+### GCash 支付资格查询
+
+新版账号页提供“查 GCash 资格”单账号/批量任务。任务会使用账号当前
+`access_token`，创建一个未确认的 PH/PHP Checkout Session，再读取 Stripe 初始化返回的支付方式，
+从而区分“GCash 可用”“GCash 不可用”和“未知/网络失败”。页面会显示当前执行账号、排队数量、
+检测状态和详细阶段日志。
+
+- `GCASH_CHECK_ENABLED` 默认关闭自动检测；手动点击按钮仍可显式执行，避免后台批量请求。
+- `GCASH_CHECK_COUNTRY` / `GCASH_CHECK_CURRENCY` 默认是 `PH` / `PHP`；
+  `GCASH_CHECK_TRIAL_DAYS=0` 时只检查支付方式，不把 GCash 可用误认为试用资格。
+- 网络、Cloudflare、429、Checkout 或 Stripe init 异常显示为“未知”，不会误判成不可用；
+  失败时保留上一次明确结果。
+- 流程不会确认付款、创建 PaymentMethod 或提交付款；不会读取或使用 Google Play `purchaseToken`。
+- Token、Cookie、完整 Checkout 响应、Stripe publishable key、Checkout Session ID 只在内存中短暂使用，
+  日志和账号数据只保存脱敏后的派生字段。
+
 ### 已有账号手动补设 2FA
 
 账号页可对尚未保存 TOTP Secret 的已有账号执行单个或批量“补设2FA”。后台会打开该账号保存的

@@ -2085,6 +2085,7 @@
           <span class="acc-v2-selected" id="passwordSetupQueueStatusV2" title="设置密码后台队列状态">设置密码队列：空闲</span>
           <span class="acc-v2-selected" id="twoFASetupQueueStatusV2" title="补设 2FA 后台队列状态">2FA 队列：空闲</span>
           <span class="acc-v2-selected" id="browserLiveCheckQueueStatusV2" title="Roxy 浏览器查活队列状态">浏览器查活：空闲</span>
+          <span class="acc-v2-selected" id="gcashCheckQueueStatusV2" title="GCash 资格查询后台队列状态">GCash：空闲</span>
           <label class="acc-v2-inline" title="批量补跑 Codex 的并发线程数">线程
             <span class="el-input-number">
               <input id="codexBulkWorkersV2" type="number" min="1" max="16" value="3" inputmode="numeric">
@@ -2111,6 +2112,7 @@
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedLiveV2" onclick="checkSelectedLive(null, this, 'protocol')" title="使用协议会话重新登录选中账号并刷新最新 AT/accessToken">协议查活</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedBrowserV2" onclick="checkSelectedLive(null, this, 'browser')" title="使用 Roxy 真实浏览器重新登录；浏览器查活默认单并发">浏览器查活</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedPlansV2" disabled title="查询选中账号当前套餐；free 账号会检查 Plus 试用资格">查套餐</button>
+          <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedGcashV2" disabled title="检查选中账号在 PH/PHP Checkout 中是否提供 GCash；不会确认支付">查 GCash 资格</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnExtractSelectedLinksV2" disabled title="给选中的 free(可Plus试用) 账号批量提链，类型按配置 PIX/UPI/KAKAO_PAY/IDEAL">提链</button>
         </div>
         <div class="acc-v2-btn-group">
@@ -2462,6 +2464,9 @@ let accountTwoFASetupPollingIds = new Set();
 let browserLiveCheckTimer = null;
 let browserLiveCheckPollingIds = new Set();
 let browserLiveCheckPollInFlight = false;
+let gcashCheckTimer = null;
+let gcashCheckPollingIds = new Set();
+let gcashCheckPollInFlight = false;
 const ACCOUNT_SELECTED = new Set();
 const OUTLOOK_SELECTED = new Set();
 let JOBS = [];
@@ -3212,6 +3217,11 @@ async function loadAccounts() {
     const totalPages = Math.max(1, Math.ceil(ACCOUNTS_TOTAL / p.size));
     if (p.page > totalPages) { p.page = totalPages; accountsLoading = false; return loadAccounts(); }
     renderAccounts();
+    const activeGcashIds = ACCOUNTS
+      .filter(row => ['queued', 'running'].includes(String(row.gcash_check_status || '')))
+      .map(row => Number(row.id))
+      .filter(Number.isFinite);
+    if (activeGcashIds.length) startGcashCheckPolling(activeGcashIds);
     const activePasswordSetupIds = ACCOUNTS
       .filter(row => ['queued', 'running'].includes(row.password_setup_status))
       .map(row => Number(row.id))
@@ -3338,6 +3348,22 @@ function _planRegionDetail(r) {
   const registrationIp = r.registration_ip ? `注册IP: ${esc(r.registration_ip)}` : '';
   return `<div class="plan-region-detail" title="${title}"><div>\u8d44\u683c\u5730\u533a: ${esc(eligibility)}</div><div>\u51fa\u53e3\u5730\u533a: ${esc(exit)}</div>${registrationIp ? `<div>${registrationIp}</div>` : ''}</div>`;
 }
+function _gcashCell(r) {
+  const status = String(r.gcash_check_status || '');
+  const decision = String(r.gcash_check_decision || '').toLowerCase();
+  const error = r.gcash_check_error || '';
+  const title = [error, r.gcash_checked_at ? `检测时间: ${r.gcash_checked_at}` : '', r.gcash_proxy_ip ? `代理IP: ${r.gcash_proxy_ip}` : '']
+    .filter(Boolean).join('；');
+  if (status === 'queued') return `<div class="acc-v2-sub"><span class="pill status-running" title="${esc(title)}">GCash：排队中</span></div>`;
+  if (status === 'running') return `<div class="acc-v2-sub"><span class="pill status-running" title="${esc(title)}">GCash：检测中</span></div>`;
+  if (decision === 'available' || r.gcash_available === true) return `<div class="acc-v2-sub"><span class="pill status-success" title="${esc(title)}">GCash：可用</span>${r.gcash_currency ? ` <span class="muted">${esc(r.gcash_currency)}</span>` : ''}</div>`;
+  if (decision === 'unavailable' || r.gcash_available === false) return `<div class="acc-v2-sub"><span class="pill status-used" title="${esc(title)}">GCash：不可用</span></div>`;
+  if (decision === 'trial_ineligible') return `<div class="acc-v2-sub"><span class="pill status-used" title="${esc(title)}">试用不符合</span></div>`;
+  if (decision === 'credential_invalid') return `<div class="acc-v2-sub"><span class="pill status-failed" title="${esc(title)}">凭据失效</span></div>`;
+  if (decision === 'already_paid') return `<div class="acc-v2-sub"><span class="pill status-used" title="${esc(title)}">已订阅</span></div>`;
+  if (status === 'failed' || decision === 'unknown') return `<div class="acc-v2-sub"><span class="pill status-failed" title="${esc(title || '网络失败，未能确定 GCash 资格')}">GCash：未知</span></div>`;
+  return '';
+}
 function _planCell(r) {
   const ok = r.plan_check_ok;
   const err = r.plan_check_error || '';
@@ -3354,7 +3380,7 @@ function _planCell(r) {
     const label = automatic ? (queued ? '自动查询排队中' : '自动查询中') : (queued ? '查询排队中' : '查询中');
     const stamp = queued ? r.plan_check_queued_at : r.plan_check_started_at;
     const detail = stamp ? `${queued ? '入队' : '开始'}: ${esc(stamp)}` : '';
-    return `<span class="pill status-running" title="${detail}">${label}</span>`;
+    return `<div class="plan-cell-detail"><span class="pill status-running" title="${detail}">${label}</span>${_gcashCell(r)}</div>`;
   }
   if (err || r.plan_check_status === 'failed') {
     const reason = err || '套餐查询失败，未返回具体原因';
@@ -3362,19 +3388,19 @@ function _planCell(r) {
     const lastPlan = hasLastSuccess ? `${plan}${r.plus_trial_eligible ? '/可Plus试用' : ''}` : '';
     const lastText = lastPlan ? `（上次: ${lastPlan}）` : '';
     const lastTitle = hasLastSuccess ? `上次成功: ${esc(r.plan_last_success_at)}` : '';
-    return `<div class="extract-link-cell"><span class="pill status-failed" title="${[esc(reason), lastTitle].filter(Boolean).join('；')}">查询失败${esc(lastText)}</span><div class="extract-link-error" title="${esc(reason)}">${esc(reason)}</div></div>`;
+    return `<div class="extract-link-cell"><span class="pill status-failed" title="${[esc(reason), lastTitle].filter(Boolean).join('；')}">查询失败${esc(lastText)}</span><div class="extract-link-error" title="${esc(reason)}">${esc(reason)}</div>${_gcashCell(r)}</div>`;
   }
   const lower = plan.toLowerCase();
 
   if (lower === 'free') {
     const checkedOk = ok === true || r.plan_check_status === 'success';
     if (!checkedOk) {
-      return `<span class="pill status-running" title="${title}">${esc(plan)}（待查资格）</span>`;
+      return `<div class="plan-cell-detail"><span class="pill status-running" title="${title}">${esc(plan)}（待查资格）</span>${_gcashCell(r)}</div>`;
     }
     const text = r.plus_trial_eligible ? 'free(可Plus试用)' : 'free';
     const cls = r.plus_trial_eligible ? 'status-success' : 'status-used';
     const t = r.plus_trial_eligible ? `${title}；Plus 试用资格可用` : title;
-    return `<div class="plan-cell-detail"><span class="pill ${cls}" title="${t}">${esc(text)}</span>${_planRegionDetail(r)}</div>`;
+    return `<div class="plan-cell-detail"><span class="pill ${cls}" title="${t}">${esc(text)}</span>${_planRegionDetail(r)}${_gcashCell(r)}</div>`;
   }
 
   const cls = 'status-success';
@@ -3393,7 +3419,7 @@ function _planCell(r) {
   if (r.plan_renews_at) detail.push(`续费时间: ${r.plan_renews_at}`);
   if (r.discount_expires_at) detail.push(`折扣结束: ${r.discount_expires_at}`);
   if (r.discount_promo_campaign_id) detail.push(`优惠: ${r.discount_promo_campaign_id}`);
-  return `<span class="pill ${cls}" title="${esc(detail.join('；'))}">${esc(text)}</span>`;
+  return `<div class="plan-cell-detail"><span class="pill ${cls}" title="${esc(detail.join('；'))}">${esc(text)}</span>${_gcashCell(r)}</div>`;
 }
 function _planAction(r) {
   if (['queued','running'].includes(r.plan_check_status)) {
@@ -3569,6 +3595,8 @@ function _accountsV2MoreMenu(r) {
     `<button type="button" data-account-live-log="${esc(r.email)}" title="查看该账号最近一次查活日志">查活日志</button>`,
     `<button type="button" data-account-plan-log="${esc(r.email)}" title="查看该账号最近一次查套餐日志">查套餐日志</button>`,
     _planAction(r),
+    `<button type="button" data-account-gcash-check="${esc(r.id)}" title="检查 PH/PHP Checkout 是否提供 GCash；不会确认支付">${['queued','running'].includes(String(r.gcash_check_status || '')) ? 'GCash检测中…' : '查 GCash 资格'}</button>`,
+    `<button type="button" data-account-gcash-log="${esc(r.email)}" title="查看该账号最近一次 GCash 资格查询日志">GCash日志</button>`,
     _extractLinkAction(r),
     _codexAction(r),
     `<button type="button" data-codex-log="${esc(r.email)}" title="查看该账号最近一次 Codex 补跑日志">补跑日志</button>`,
@@ -3659,7 +3687,7 @@ function updateAccountSelectionUi(pageRows = null) {
   const archiveLabel = SHOW_ARCHIVED_ACCOUNTS ? '恢复选中' : '归档选中';
   const archiveTitle = SHOW_ARCHIVED_ACCOUNTS ? '把选中的归档账号恢复到默认账号列表' : '归档选中的账号；默认账号列表将不再查询/显示这些账号';
   const v2Ids = [
-    'btnCheckSelectedPlansV2', 'btnExtractSelectedLinksV2',
+    'btnCheckSelectedPlansV2', 'btnCheckSelectedGcashV2', 'btnExtractSelectedLinksV2',
     'btnGenerateSelectedAgentV2', 'btnDownloadSelectedAgentV2', 'btnUploadSelectedAgentSub2V2',
     'btnRetrySelectedCodexV2', 'btnDownloadSelectedCpaV2', 'btnStopSelectedCodexV2',
     'btnPasswordSetupSelectedV2', 'btnTwoFASetupSelectedV2', 'btnNoteSelectedAccountsV2', 'btnCopySelectedLinesV2',
@@ -3729,9 +3757,9 @@ let liveLogEmail = null, liveLogTimer = null, liveLogKind = 'live', accountLogPe
 
 function openAccountLog(email, kind = 'live', pending = false) {
   liveLogEmail = email;
-  liveLogKind = ['password', 'plan', 'twofa'].includes(kind) ? kind : 'live';
+  liveLogKind = ['password', 'plan', 'twofa', 'gcash'].includes(kind) ? kind : 'live';
   accountLogPending = !!pending;
-  const titles = {password:'设置密码日志：', plan:'查套餐日志：', twofa:'补设2FA日志：', live:'查活日志：'};
+  const titles = {password:'设置密码日志：', plan:'查套餐日志：', twofa:'补设2FA日志：', gcash:'查 GCash 资格日志：', live:'查活日志：'};
   $('#liveLogTitle').textContent = titles[liveLogKind] || titles.live;
   $('#liveLogEmail').textContent = email;
   $('#liveLogPanel').classList.remove('hidden');
@@ -3744,12 +3772,14 @@ function openAccountLog(email, kind = 'live', pending = false) {
 function openLiveLog(email) { openAccountLog(email, 'live', false); }
 function openPasswordSetupLog(email, pending = false) { openAccountLog(email, 'password', pending); }
 function openPlanCheckLog(email) { openAccountLog(email, 'plan', false); }
+function openGcashLog(email) { openAccountLog(email, 'gcash', false); }
 function openTwoFASetupLog(email, pending = false) { openAccountLog(email, 'twofa', pending); }
 async function pollAccountLog() {
   if (!liveLogEmail) return;
   try {
     const endpoint = liveLogKind === 'password' ? 'password-setup-log'
       : liveLogKind === 'plan' ? 'plan-check-log'
+      : liveLogKind === 'gcash' ? 'gcash-check-log'
       : liveLogKind === 'twofa' ? '2fa-setup-log' : 'live-check-log';
     const r = await api(`/api/accounts/${endpoint}?email=${encodeURIComponent(liveLogEmail)}`);
     const c = $('#liveLogContent');
@@ -4002,6 +4032,52 @@ function startBrowserLiveCheckPolling(ids = []) {
   if (!browserLiveCheckTimer) browserLiveCheckTimer = setInterval(pollBrowserLiveCheckStatuses, 2000);
   pollBrowserLiveCheckStatuses();
 }
+function renderGcashCheckQueue(queue = {}) {
+  const el = $('#gcashCheckQueueStatusV2');
+  if (!el) return;
+  const runningRows = Array.isArray(queue.running) ? queue.running : [];
+  const running = runningRows.map(row => row.email).filter(Boolean);
+  const runningCount = Number(queue.running_count ?? running.length ?? 0);
+  const queuedCount = Number(queue.queued_count ?? queue.queued ?? 0);
+  const current = running.length ? running.join('、') : '空闲';
+  el.textContent = `GCash：执行 ${current} · 排队 ${queuedCount}`;
+  el.title = `当前执行 ${runningCount} 个账号，排队 ${queuedCount} 个账号`;
+}
+async function pollGcashCheckStatuses() {
+  if (gcashCheckPollInFlight || !gcashCheckPollingIds.size) return;
+  gcashCheckPollInFlight = true;
+  const ids = Array.from(gcashCheckPollingIds);
+  try {
+    const result = await api(`/api/accounts/gcash-check-status?ids=${encodeURIComponent(ids.join(','))}`);
+    renderGcashCheckQueue(result.queue || {});
+    const byId = new Map((result.items || []).map(row => [Number(row.id), row]));
+    ACCOUNTS.forEach(row => {
+      const next = byId.get(Number(row.id));
+      if (next) Object.assign(row, next);
+    });
+    ids.forEach(id => {
+      const next = byId.get(Number(id));
+      if (!next || !['queued', 'running'].includes(String(next.gcash_check_status || ''))) {
+        gcashCheckPollingIds.delete(Number(id));
+      }
+    });
+    renderAccounts();
+  } catch (_) {
+    // 下一轮继续请求，保留当前页面状态。
+  } finally {
+    gcashCheckPollInFlight = false;
+    if (!gcashCheckPollingIds.size && gcashCheckTimer) {
+      clearInterval(gcashCheckTimer);
+      gcashCheckTimer = null;
+    }
+  }
+}
+function startGcashCheckPolling(ids = []) {
+  ids.map(Number).filter(Number.isFinite).forEach(id => gcashCheckPollingIds.add(id));
+  if (!gcashCheckPollingIds.size) return;
+  if (!gcashCheckTimer) gcashCheckTimer = setInterval(pollGcashCheckStatuses, 2000);
+  pollGcashCheckStatuses();
+}
 function toggleAccountSort(key) {
   if (ACCOUNTS_SORT_KEY === key) ACCOUNTS_SORT_ORDER = ACCOUNTS_SORT_ORDER === 'asc' ? 'desc' : 'asc';
   else { ACCOUNTS_SORT_KEY = key; ACCOUNTS_SORT_ORDER = key === 'id' || key === 'created_at' ? 'desc' : 'asc'; }
@@ -4139,6 +4215,12 @@ async function onAccountsBodyClick(e) {
     return;
   }
 
+  const gcashBtn = e.target.closest('[data-account-gcash-check]');
+  if (gcashBtn) {
+    await checkOneGcash(Number(gcashBtn.dataset.accountGcashCheck), gcashBtn);
+    return;
+  }
+
   const liveBtn = e.target.closest('[data-account-live-check]');
   if (liveBtn) {
     await checkSelectedLive([Number(liveBtn.dataset.accountLiveCheck)], liveBtn);
@@ -4154,6 +4236,12 @@ async function onAccountsBodyClick(e) {
   const planLogBtn = e.target.closest('[data-account-plan-log]');
   if (planLogBtn) {
     openPlanCheckLog(planLogBtn.dataset.accountPlanLog);
+    return;
+  }
+
+  const gcashLogBtn = e.target.closest('[data-account-gcash-log]');
+  if (gcashLogBtn) {
+    openGcashLog(gcashLogBtn.dataset.accountGcashLog);
     return;
   }
 
@@ -4717,6 +4805,53 @@ function downloadSelectedCodexAgents() {
   }
 }
 
+async function checkOneGcash(id, btnArg = null) {
+  const account = ACCOUNTS.find(row => Number(row.id) === Number(id));
+  if (!account) { showToast('账号不在当前页'); return; }
+  const btn = btnArg;
+  const old = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '提交中…'; }
+  try {
+    const result = await api(`/api/accounts/${encodeURIComponent(id)}/gcash-check`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}',
+    });
+    renderGcashCheckQueue(result.queue || {});
+    startGcashCheckPolling([id]);
+    if (account.email) openGcashLog(account.email);
+    showToast('GCash 资格查询已入队');
+    await loadAccounts();
+  } catch (err) {
+    showToast('GCash 资格查询失败: ' + err.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = old; }
+  }
+}
+
+async function checkSelectedGcash() {
+  const ids = Array.from(ACCOUNT_SELECTED);
+  if (!ids.length) { showToast('请先选择账号'); return; }
+  const btn = $('#btnCheckSelectedGcashV2');
+  const old = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '提交中…'; }
+  try {
+    const result = await api('/api/accounts/gcash-check-bulk', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({account_ids: ids}),
+    });
+    renderGcashCheckQueue(result.queue || {});
+    const startedIds = (result.started || []).map(item => Number(item.id ?? item.account_id)).filter(Number.isFinite);
+    startGcashCheckPolling(startedIds);
+    const first = (result.started || [])[0];
+    if (first?.email) openGcashLog(first.email);
+    showToast(`GCash 资格：已入队 ${result.started_count || 0} 个，忙碌 ${result.busy_count || 0} 个，失败 ${result.failed_count || 0}`);
+    await loadAccounts();
+  } catch (err) {
+    showToast('批量 GCash 资格查询失败: ' + err.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = old; }
+  }
+}
+
 async function checkSelectedPlans() {
   const ids = Array.from(ACCOUNT_SELECTED);
   if (ids.length === 0) { showToast('请先选择账号'); return; }
@@ -5069,6 +5204,7 @@ async function copySelectedAccountTokens() {
     if (el) el.addEventListener('click', fn);
   };
   bind('btnCheckSelectedPlansV2', checkSelectedPlans);
+  bind('btnCheckSelectedGcashV2', checkSelectedGcash);
   bind('btnExtractSelectedLinksV2', extractSelectedLinks);
   bind('btnGenerateSelectedAgentV2', generateSelectedCodexAgents);
   bind('btnDownloadSelectedAgentV2', downloadSelectedCodexAgents);

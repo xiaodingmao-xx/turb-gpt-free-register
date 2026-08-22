@@ -32,6 +32,18 @@ class PaymentMethodDetectorTests(unittest.TestCase):
         self.assertEqual(result["method_status"], "available")
         self.assertEqual(result["offer_state"], "zero_due")
 
+    def test_external_gcash_is_normalized_to_gcash(self):
+        result = detect_oaics(
+            {"id": "cs_test_gcash"},
+            {"payment_method_types": ["card", "external_gcash"]},
+            billing_country="PH",
+            fallback_currency="PHP",
+            expected_method="gcash",
+        )
+        self.assertEqual(result["method_status"], "available")
+        self.assertTrue(result["method_available"])
+        self.assertEqual(result["payment_method_types"], ["card", "gcash"])
+
     def test_nested_extract_result_without_supported_session_is_not_detected(self):
         result = detect_extract_payment_session(
             {"result": {"id": "job-123", "payment_method": "pix"}}

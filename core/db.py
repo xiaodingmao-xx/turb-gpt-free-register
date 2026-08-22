@@ -1008,6 +1008,177 @@ def update_account_plan_check(acc_id: int | None = None, email: str | None = Non
         return True
 
 
+def claim_account_gcash_check(
+    acc_id: int | None = None,
+    email: str | None = None,
+    trigger: str = "manual",
+) -> bool:
+    """原子占用账号的 GCash 资格查询；已有未超时任务时返回 False。"""
+    with _LOCK:
+        accounts = _load_accounts()
+        target_email = (email or "").lower()
+        row = next((
+            item for item in accounts
+            if (acc_id is not None and int(item.get("id") or 0) == int(acc_id))
+            or (target_email and (item.get("email") or "").lower() == target_email)
+        ), None)
+        if row is None or bool(row.get("archived")):
+            return False
+
+        current_status = row.get("gcash_check_status")
+        if current_status in {"queued", "running"}:
+            try:
+                stamp_key = "gcash_check_queued_at" if current_status == "queued" else "gcash_check_started_at"
+                stale_after = _PLAN_CHECK_QUEUE_STALE_SECONDS if current_status == "queued" else _PLAN_CHECK_STALE_SECONDS
+                started_at = datetime.fromisoformat(str(row.get(stamp_key) or ""))
+                if (datetime.now() - started_at).total_seconds() < stale_after:
+                    return False
+            except (TypeError, ValueError):
+                pass
+
+        now = _now()
+        row["gcash_check_status"] = "queued"
+        row["gcash_check_trigger"] = str(trigger or "manual")
+        row["gcash_check_queued_at"] = now
+        row["gcash_check_started_at"] = None
+        row["gcash_check_completed_at"] = None
+        row["gcash_check_error"] = None
+        row["updated_at"] = now
+        _save_accounts(accounts)
+        return True
+
+
+def mark_account_gcash_check_running(acc_id: int) -> bool:
+    """把已排队的 GCash 资格查询标记为执行中。"""
+    with _LOCK:
+        accounts = _load_accounts()
+        row = next((item for item in accounts if int(item.get("id") or 0) == int(acc_id)), None)
+        if row is None or row.get("gcash_check_status") not in {"queued", "running"}:
+            return False
+        row["gcash_check_status"] = "running"
+        row["gcash_check_started_at"] = _now()
+        row["gcash_check_error"] = None
+        row["updated_at"] = _now()
+        _save_accounts(accounts)
+        return True
+
+
+def recover_interrupted_gcash_checks() -> int:
+    """服务重启时把遗留的 GCash 资格查询恢复为失败，允许用户重新触发。"""
+    with _LOCK:
+        accounts = _load_accounts()
+        recovered = 0
+        now = _now()
+        for row in accounts:
+            if row.get("gcash_check_status") not in {"queued", "running"}:
+                continue
+            row["gcash_check_status"] = "failed"
+            row["gcash_check_ok"] = None
+            row["gcash_check_error"] = "WebUI 重启导致 GCash 资格查询中断，请重新查询"
+            row["gcash_check_completed_at"] = now
+            row["updated_at"] = now
+            recovered += 1
+        if recovered:
+            _save_accounts(accounts)
+        return recovered
+
+
+_GCASH_RESULT_FIELDS = (
+    "decision",
+    "gcash_available",
+    "trial_eligible",
+    "actual_trial",
+    "payment_methods",
+    "payment_method_status",
+    "currency",
+    "amount_due",
+    "stripe_mode",
+    "http_status",
+    "network_route",
+    "proxy_used",
+    "proxy_ip",
+    "attempt_count",
+    "max_attempts",
+    "retryable",
+)
+
+
+def _gcash_derived_result(result: dict) -> dict:
+    """只保留可展示的派生字段，禁止把 Token/原始响应写入 JSON。"""
+    derived = {}
+    for key in _GCASH_RESULT_FIELDS:
+        value = result.get(key)
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            derived[key] = value
+        elif key == "payment_methods" and isinstance(value, (list, tuple)):
+            derived[key] = [str(item) for item in value[:30]]
+    return derived
+
+
+def update_account_gcash_check(
+    acc_id: int | None = None,
+    email: str | None = None,
+    result: dict | None = None,
+) -> bool:
+    """更新 GCash 资格查询；网络未知时保留上一次确定的资格结果。"""
+    result = result or {}
+    with _LOCK:
+        accounts = _load_accounts()
+        target_email = (email or "").lower()
+        row = next((
+            item for item in accounts
+            if (acc_id is not None and int(item.get("id") or 0) == int(acc_id))
+            or (target_email and (item.get("email") or "").lower() == target_email)
+        ), None)
+        if row is None:
+            return False
+
+        conclusive = bool(result.get("conclusive"))
+        ok = bool(result.get("ok"))
+        now = _now()
+        row["gcash_check_status"] = "success" if ok else "failed"
+        row["gcash_check_ok"] = bool(ok) if conclusive else None
+        row["gcash_checked_at"] = result.get("checked_at") or now
+        row["gcash_check_completed_at"] = now
+        row["gcash_check_error"] = None if ok else result.get("error")
+        row["gcash_check_decision"] = result.get("decision") or "unknown"
+
+        # unknown/网络失败不覆盖上一次明确的 GCash 资格字段。
+        if conclusive:
+            for source_key, target_key in (
+                ("gcash_available", "gcash_available"),
+                ("trial_eligible", "gcash_trial_eligible"),
+                ("actual_trial", "gcash_actual_trial"),
+                ("payment_methods", "gcash_payment_methods"),
+                ("payment_method_status", "gcash_payment_method_status"),
+                ("currency", "gcash_currency"),
+                ("amount_due", "gcash_amount_due"),
+                ("stripe_mode", "gcash_stripe_mode"),
+                ("http_status", "gcash_http_status"),
+                ("network_route", "gcash_network_route"),
+                ("proxy_used", "gcash_proxy_used"),
+                ("proxy_ip", "gcash_proxy_ip"),
+            ):
+                value = result.get(source_key)
+                if value is not None:
+                    row[target_key] = list(value) if source_key == "payment_methods" and isinstance(value, (list, tuple)) else value
+        else:
+            if result.get("http_status") is not None:
+                row["gcash_http_status"] = result.get("http_status")
+            for source_key, target_key in (
+                ("network_route", "gcash_network_route"),
+                ("proxy_used", "gcash_proxy_used"),
+                ("proxy_ip", "gcash_proxy_ip"),
+            ):
+                if result.get(source_key) is not None:
+                    row[target_key] = result.get(source_key)
+
+        row["gcash_check_result_json"] = json.dumps(_gcash_derived_result(result), ensure_ascii=False)
+        row["updated_at"] = now
+        _save_accounts(accounts)
+        return True
+
+
 def claim_account_extract(acc_id: int, trigger: str = "manual", link_type: str = "pix") -> bool:
     """原子占用账号提链任务；已有未超时任务时返回 False。"""
     with _LOCK:
@@ -1216,6 +1387,77 @@ def _filtered_decorated_accounts(
         key=lambda x: (_account_sort_value(x, normalized_key), int(x.get("id") or 0)),
         reverse=descending,
     )
+
+
+def list_account_gcash_check_statuses(
+    limit: int = 5000,
+    offset: int = 0,
+    archived: str | bool | None = False,
+    q: str | None = None,
+    email_filter: str | None = None,
+    source_filter: str | None = None,
+    sort_key: str = "id",
+    sort_order: str = "desc",
+) -> dict:
+    """返回不含 Token/邮箱密码的 GCash 查询轻量状态快照。"""
+    fields = (
+        "id", "email", "archived",
+        "gcash_check_status", "gcash_check_ok", "gcash_check_error",
+        "gcash_check_decision", "gcash_check_trigger", "gcash_check_queued_at",
+        "gcash_check_started_at", "gcash_check_completed_at", "gcash_checked_at",
+        "gcash_available", "gcash_trial_eligible", "gcash_actual_trial",
+        "gcash_payment_methods", "gcash_payment_method_status", "gcash_currency",
+        "gcash_amount_due", "gcash_stripe_mode", "gcash_http_status",
+        "gcash_network_route", "gcash_proxy_used", "gcash_proxy_ip",
+    )
+    with _LOCK:
+        all_rows = _filtered_decorated_accounts(
+            archived=archived,
+            q=q,
+            email_filter=email_filter,
+            source_filter=source_filter,
+            sort_key=sort_key,
+            sort_order=sort_order,
+        )
+        total = len(all_rows)
+        limit = max(1, int(limit))
+        offset = max(0, int(offset or 0))
+        rows = all_rows[offset: offset + limit]
+        items = []
+        for row in rows:
+            item = {"id": row.get("id"), "email": row.get("email")}
+            for key in fields:
+                if key in {"id", "email"}:
+                    continue
+                value = row.get(key)
+                if value is not None and value != "":
+                    item[key] = value
+            items.append(item)
+        latest = max((str(row.get("updated_at") or "") for row in all_rows), default="")
+        revision_payload = json.dumps(
+            [
+                {
+                    "id": row.get("id"),
+                    "updated_at": row.get("updated_at"),
+                    "gcash_check_status": row.get("gcash_check_status"),
+                    "gcash_check_ok": row.get("gcash_check_ok"),
+                    "gcash_check_decision": row.get("gcash_check_decision"),
+                    "gcash_available": row.get("gcash_available"),
+                }
+                for row in all_rows
+            ],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        revision_sig = hashlib.sha1(revision_payload.encode("utf-8")).hexdigest()[:12]
+        return {
+            "items": items,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "revision": f"{total}:{latest}:{revision_sig}",
+        }
 
 
 def list_account_plan_check_statuses(

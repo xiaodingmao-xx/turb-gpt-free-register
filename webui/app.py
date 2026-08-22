@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 
 from flask import Flask, Response, jsonify, make_response, render_template, request
 
-from core import codex_retry_service, db, plan_check_service, extract_link_service, codex_agent_service, live_check_service, password_setup_task_service, twofa_task_service
+from core import codex_retry_service, db, plan_check_service, gcash_check_service, extract_link_service, codex_agent_service, live_check_service, password_setup_task_service, twofa_task_service
 from webui.auth import init_auth, register_auth_routes
 from core import registration_service as svc
 from webui import config_editor
@@ -157,6 +157,13 @@ def _compact_account_for_list(row: dict) -> dict:
         "live_check_max_attempts", "live_check_next_retry_at", "live_check_profile_source",
         "live_check_trigger", "live_check_queued_at", "live_check_started_at",
         "live_check_completed_at",
+        "gcash_check_status", "gcash_check_ok", "gcash_check_decision",
+        "gcash_check_trigger", "gcash_check_queued_at", "gcash_check_started_at",
+        "gcash_check_completed_at", "gcash_checked_at", "gcash_available",
+        "gcash_trial_eligible", "gcash_actual_trial", "gcash_payment_methods",
+        "gcash_payment_method_status", "gcash_currency", "gcash_amount_due",
+        "gcash_stripe_mode", "gcash_http_status", "gcash_network_route",
+        "gcash_proxy_used", "gcash_proxy_ip",
     ):
         if key in row:
             out[key] = row.get(key)
@@ -177,6 +184,8 @@ def _compact_account_for_list(row: dict) -> dict:
         "token_expired", "token_expires_at",
         # 查活状态。
         "live_check_status", "live_check_error", "live_checked_at",
+        # GCash 资格查询状态与详细错误。
+        "gcash_check_error",
         # 提链成功/失败时才需要。
         "extract_link_status", "extract_link_type", "extract_link_message", "extract_link_error",
         "extract_link_long_url", "extract_link_copy_paste", "extract_link_image_url_png",
@@ -335,6 +344,9 @@ def create_app(auth_code: str | None = None) -> Flask:
     recovered_plan_checks = db.recover_interrupted_plan_checks()
     if recovered_plan_checks:
         logger.warning("已恢复 %s 个因 WebUI 重启中断的套餐查询状态", recovered_plan_checks)
+    recovered_gcash_checks = db.recover_interrupted_gcash_checks()
+    if recovered_gcash_checks:
+        logger.warning("已恢复 %s 个因 WebUI 重启中断的 GCash 资格查询状态", recovered_gcash_checks)
     recovered_extract_links = db.recover_interrupted_extract_links()
     if recovered_extract_links:
         logger.warning("已恢复 %s 个因 WebUI 重启中断的提链状态", recovered_extract_links)
@@ -480,6 +492,117 @@ def create_app(auth_code: str | None = None) -> Flask:
             snapshot = db.list_account_plan_check_statuses(limit=max(1, min(5000, limit)), archived=archived, plan_filter=plan_filter, q=q)
         snapshot["queue"] = plan_check_service.queue_settings()
         return jsonify(snapshot)
+
+
+    @app.post("/api/accounts/<int:acc_id>/gcash-check")
+    def api_account_gcash_check(acc_id: int):
+        """把单账号 GCash 资格查询加入后台队列。"""
+        acc = db.get_account(acc_id)
+        if not acc:
+            return jsonify({"ok": False, "error": "账号不存在"}), 404
+        email = str(acc.get("email") or "").strip()
+        token = str(acc.get("access_token") or "").strip()
+        if not token:
+            return jsonify({"ok": False, "error": "该账号没有 access_token"}), 400
+        if not email:
+            return jsonify({"ok": False, "error": "该账号没有邮箱"}), 400
+        queued = gcash_check_service.enqueue_account_gcash_check(
+            acc_id,
+            email,
+            token,
+            trigger="manual",
+        )
+        if queued.get("busy"):
+            return jsonify({"ok": False, **queued}), 409
+        if queued.get("queue_full"):
+            return jsonify({"ok": False, **queued}), 503
+        if not queued.get("accepted"):
+            return jsonify({"ok": False, **queued}), 503
+        return jsonify({
+            "ok": True,
+            "started": True,
+            **queued,
+            "queue": gcash_check_service.queue_status(),
+        }), 202
+
+
+    @app.post("/api/accounts/gcash-check-bulk")
+    def api_accounts_gcash_check_bulk():
+        """批量把 GCash 资格查询加入后台队列。"""
+        data = request.get_json(silent=True) or {}
+        ids = data.get("account_ids") or data.get("ids") or []
+        if not isinstance(ids, list) or not ids:
+            return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
+        if len(ids) > 500:
+            return jsonify({"ok": False, "error": "单次最多查询 500 个账号"}), 400
+
+        started, busy, failed, skipped = [], [], [], []
+        seen = set()
+        for raw in ids:
+            try:
+                account_id = int(raw)
+            except (TypeError, ValueError):
+                skipped.append({"id": raw, "reason": "ID 非法"})
+                continue
+            if account_id in seen:
+                continue
+            seen.add(account_id)
+            acc = db.get_account(account_id)
+            if not acc:
+                skipped.append({"id": account_id, "reason": "账号不存在"})
+                continue
+            email = str(acc.get("email") or "").strip()
+            token = str(acc.get("access_token") or "").strip()
+            if not token:
+                skipped.append({"id": account_id, "email": email, "reason": "缺少 access_token"})
+                continue
+            queued = gcash_check_service.enqueue_account_gcash_check(
+                account_id,
+                email,
+                token,
+                trigger="manual_bulk",
+            )
+            item = {"id": account_id, "email": email, **queued}
+            if queued.get("accepted"):
+                started.append(item)
+            elif queued.get("busy"):
+                busy.append(item)
+            else:
+                failed.append(item)
+        return jsonify({
+            "ok": True,
+            "started": started,
+            "started_count": len(started),
+            "busy": busy,
+            "busy_count": len(busy),
+            "failed": failed,
+            "failed_count": len(failed),
+            "skipped": skipped,
+            "skipped_count": len(skipped),
+            "queue": gcash_check_service.queue_status(),
+        }), 202
+
+
+    @app.get("/api/accounts/gcash-check-status")
+    def api_accounts_gcash_check_status():
+        """返回 GCash 资格轮询状态，不返回 access_token。"""
+        raw_ids = str(request.args.get("ids") or "").strip()
+        ids = []
+        for raw in raw_ids.split(",") if raw_ids else []:
+            try:
+                ids.append(int(raw))
+            except (TypeError, ValueError):
+                continue
+        items = []
+        for account_id in dict.fromkeys(ids):
+            row = db.get_account(account_id)
+            if row:
+                items.append(_compact_account_for_list(row))
+        return jsonify({
+            "ok": True,
+            "items": items,
+            "queue": gcash_check_service.queue_status(),
+        })
 
 
     @app.get("/api/accounts/<int:acc_id>/secret")
@@ -2544,6 +2667,29 @@ def create_app(auth_code: str | None = None) -> Flask:
             content = f.read().decode("utf-8", errors="replace")
         row = db.get_account_by_email(email) or {}
         status = str(row.get("plan_check_status") or "")
+        return jsonify({
+            "ok": True,
+            "log": content,
+            "running": status in {"queued", "running"},
+        })
+
+    @app.get("/api/accounts/gcash-check-log")
+    def api_account_gcash_check_log():
+        """读取某邮箱最近一次 GCash 资格查询日志。"""
+        email = (request.args.get("email") or "").strip()
+        if not email:
+            return jsonify({"ok": False, "error": "email 为空"}), 400
+        path = gcash_check_service.log_path(email)
+        row = db.get_account_by_email(email) or {}
+        status = str(row.get("gcash_check_status") or "")
+        if not path.exists():
+            return jsonify({"ok": True, "log": "", "running": status in {"queued", "running"}})
+        max_bytes = 80_000
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size > max_bytes:
+                handle.seek(size - max_bytes)
+            content = handle.read().decode("utf-8", errors="replace")
         return jsonify({
             "ok": True,
             "log": content,
